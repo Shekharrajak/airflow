@@ -27,6 +27,48 @@
 Changelog
 ---------
 
+3.14.1
+......
+
+Misc
+~~~~
+
+* ``Add Python 3.14 Support (#63520)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add *.iml to .gitignore in all distributions (#63636)``
+
+3.14.0
+......
+
+Features
+~~~~~~~~
+
+* ``Made WinRMOperator deferrable (#60651)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add 'lifecycle' field to provider.yaml schema and all providers per AIP-95 (#62190)``
+
+3.13.3
+......
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Add connection-types to provider configuration (#60028)``
+* ``Add missing hook class attributes (#60009)``
+
+Misc
+~~~~
+
+* ``New year means updated Copyright notices (#60344)``
+* ``Updated conf import for std,es,os,ms providers (#60030)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
 3.13.2
 ......
 

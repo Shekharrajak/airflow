@@ -18,10 +18,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from starlette import status
-from starlette.exceptions import HTTPException
+from fastapi import HTTPException, status
 
-from airflow.configuration import conf
+from airflow.providers.common.compat.sdk import conf
 from airflow.providers.fab.auth_manager.api_fastapi.datamodels.login import LoginResponse
 from airflow.providers.fab.www.utils import get_fab_auth_manager
 

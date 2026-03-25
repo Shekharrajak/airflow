@@ -29,8 +29,9 @@ import {
   UseGridServiceGetGridRunsKeyFn,
 } from "openapi/queries";
 import type { TriggerDagRunResponse } from "openapi/requests/types.gen";
-import type { DagRunTriggerParams } from "src/components/TriggerDag/TriggerDAGForm";
+import type { DagRunTriggerParams } from "src/components/TriggerDag/types";
 import { toaster } from "src/components/ui";
+import { createErrorToaster } from "src/utils";
 
 export const useTrigger = ({ dagId, onSuccessConfirm }: { dagId: string; onSuccessConfirm: () => void }) => {
   const queryClient = useQueryClient();
@@ -58,17 +59,13 @@ export const useTrigger = ({ dagId, onSuccessConfirm }: { dagId: string; onSucce
 
     // Only redirect if we're already on the dag page
     if (selectedDagId === dagRun.dag_id) {
-      navigate(`/dags/${dagRun.dag_id}/runs/${dagRun.dag_run_id}`);
+      void Promise.resolve(navigate(`/dags/${dagRun.dag_id}/runs/${dagRun.dag_run_id}`));
     }
   };
 
-  const onError = (_error: Error) => {
-    toaster.create({
-      description: _error.message,
-      title: translate("triggerDag.toaster.error.title"),
-      type: "error",
-    });
-    setError(_error);
+  const onError = (apiError: unknown) => {
+    createErrorToaster(apiError, { titleKey: "components:triggerDag.toaster.error.title" }, translate);
+    setError(apiError);
   };
 
   const { isPending, mutate } = useDagRunServiceTriggerDagRun({
