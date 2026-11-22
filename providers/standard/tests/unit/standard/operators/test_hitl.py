@@ -20,7 +20,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_2_PLUS
+from tests_common.test_utils.version_compat import (
+    AIRFLOW_V_3_1_PLUS,
+    AIRFLOW_V_3_2_PLUS,
+    AIRFLOW_V_3_3_PLUS,
+)
 
 if not AIRFLOW_V_3_1_PLUS:
     pytest.skip("Human in the loop is only compatible with Airflow >= 3.1.0", allow_module_level=True)
@@ -47,9 +51,13 @@ from airflow.providers.standard.operators.hitl import (
 from airflow.sdk import Param, timezone
 from airflow.sdk.definitions.param import ParamsDict
 from airflow.sdk.execution_time.hitl import HITLUser
+from airflow.utils.state import TaskInstanceState
 
 from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_3_PLUS
+
+if AIRFLOW_V_3_3_PLUS:
+    from airflow.sdk.exceptions import TaskAwaitingInput
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -63,6 +71,23 @@ pytestmark = pytest.mark.db_test
 
 DEFAULT_DATE = timezone.datetime(2016, 1, 1)
 INTERVAL = datetime.timedelta(hours=12)
+
+
+def _run_execute_until_park(op: HITLOperator, context: Any) -> None:
+    """
+    Run ``execute()`` through the HITL pause point.
+
+    Tolerates both the Airflow 3.3+ behavior (raises ``TaskAwaitingInput`` to park the task in
+    AWAITING_INPUT) and the < 3.3 fallback (calls ``self.defer()``, mocked here), so the
+    ``hitl_summary`` enriched just before the pause can be asserted afterwards.
+    """
+    with patch("airflow.providers.standard.operators.hitl.upsert_hitl_detail"):
+        if AIRFLOW_V_3_3_PLUS:
+            with pytest.raises(TaskAwaitingInput):
+                op.execute(context)
+        else:
+            with patch.object(op, "defer"):
+                op.execute(context)
 
 
 @pytest.fixture
@@ -139,27 +164,9 @@ class TestHITLOperator:
                 params=ParamsDict({"input_1": 1}),
             )
 
-    @pytest.mark.parametrize(
-        ("params", "exc", "error_msg"),
-        (
-            (ParamsDict({"_options": 1}), ValueError, '"_options" is not allowed in params'),
-            (
-                ParamsDict({"param": Param("", type="integer")}),
-                ParamValidationError,
-                (
-                    "Invalid input for param param: '' is not of type 'integer'\n\n"
-                    "Failed validating 'type' in schema:\n"
-                    "    {'type': 'integer'}\n\n"
-                    "On instance:\n    ''"
-                ),
-            ),
-        ),
-    )
-    def test_validate_params(
-        self, params: ParamsDict, exc: type[ValueError | ParamValidationError], error_msg: str
-    ) -> None:
-        # validate_params is called during initialization
-        with pytest.raises(exc, match=error_msg):
+    def test_validate_params_rejects_options_key(self) -> None:
+        """_options is a reserved key and must not be allowed in params."""
+        with pytest.raises(ValueError, match='"_options" is not allowed in params'):
             HITLOperator(
                 task_id="hitl_test",
                 subject="This is subject",
@@ -167,8 +174,46 @@ class TestHITLOperator:
                 body="This is body",
                 defaults=["1"],
                 multiple=False,
-                params=params,
+                params=ParamsDict({"_options": 1}),
             )
+
+    @pytest.mark.parametrize(
+        ("params", "expected_key"),
+        [
+            pytest.param(
+                {"my_param": Param(type="string")},
+                "my_param",
+                id="no_default",
+            ),
+            pytest.param(
+                {"my_param": Param("hello", type="string")},
+                "my_param",
+                id="with_default",
+            ),
+            pytest.param(
+                {"param": Param("", type="integer")},
+                "param",
+                id="wrong_value_type",
+            ),
+        ],
+    )
+    def test_param_value_validation_deferred_to_runtime(self, params: dict, expected_key: str) -> None:
+        """Regression test for #59551.
+
+        HITLOperator params are form fields filled by a human at runtime.
+        Value validation (required, schema) must NOT happen in __init__ — it is
+        deferred to ``validate_params_input`` after the human submits the form.
+        """
+        op = HITLOperator(
+            task_id="hitl_test",
+            subject="This is subject",
+            options=["1", "2"],
+            body="This is body",
+            defaults=["1"],
+            multiple=False,
+            params=params,
+        )
+        assert expected_key in op.params
 
     def test_validate_defaults(self) -> None:
         hitl_op = HITLOperator(
@@ -264,21 +309,33 @@ class TestHITLOperator:
         else:
             expected_params_in_trigger_kwargs = {"input_1": {"value": 1, "description": None, "schema": {}}}
 
-        registered_trigger = session.scalar(
-            select(Trigger).where(Trigger.classpath == "airflow.providers.standard.triggers.hitl.HITLTrigger")
-        )
-        assert registered_trigger is not None
-        assert registered_trigger.kwargs == {
-            "ti_id": expected_ti_id,
-            "options": ["1", "2", "3", "4", "5"],
-            "defaults": ["1"],
-            "params": expected_params_in_trigger_kwargs,
-            "multiple": False,
-            "timeout_datetime": None,
-            "poke_interval": 5.0,
-        }
+        if AIRFLOW_V_3_3_PLUS:
+            # On Airflow 3.3+ the task parks in AWAITING_INPUT with no trigger / triggerer.
+            assert ti.state == TaskInstanceState.AWAITING_INPUT
+            registered_trigger = session.scalar(
+                select(Trigger).where(
+                    Trigger.classpath == "airflow.providers.standard.triggers.hitl.HITLTrigger"
+                )
+            )
+            assert registered_trigger is None
+        else:
+            registered_trigger = session.scalar(
+                select(Trigger).where(
+                    Trigger.classpath == "airflow.providers.standard.triggers.hitl.HITLTrigger"
+                )
+            )
+            assert registered_trigger is not None
+            assert registered_trigger.kwargs == {
+                "ti_id": expected_ti_id,
+                "options": ["1", "2", "3", "4", "5"],
+                "defaults": ["1"],
+                "params": expected_params_in_trigger_kwargs,
+                "multiple": False,
+                "timeout_datetime": None,
+                "poke_interval": 5.0,
+            }
 
-    @pytest.mark.skipif(not AIRFLOW_V_3_1_3_PLUS, reason="This only works in airflow-core >= 3.1.3")
+    @pytest.mark.skipif(not AIRFLOW_V_3_1_3_PLUS, reason="This only works on Airflow >= 3.1.3")
     @pytest.mark.parametrize(
         ("input_params", "expected_params"),
         [
@@ -336,7 +393,7 @@ class TestHITLOperator:
 
     @pytest.mark.skipif(
         AIRFLOW_V_3_1_3_PLUS,
-        reason="Preserve the old behavior if airflow-core < 3.1.3. Otherwise the UI will break.",
+        reason="Preserve the old behavior on Airflow versions < 3.1.3. Otherwise the UI will break.",
     )
     def test_serialzed_params_legacy(self) -> None:
         hitl_op = HITLOperator(
@@ -917,6 +974,32 @@ class TestHITLSummaryForListeners:
             "serialized_params": None,
         }
 
+    def test_summary_reflects_rendered_subject_body(self) -> None:
+        """The summary reads subject/body live, so it reflects rendered values (guards #70296)."""
+        op = HITLOperator(
+            task_id="test",
+            subject="Review for {{ ds }}",
+            body="Deploy {{ ds }}?",
+            options=["Yes", "No"],
+        )
+        # Airflow renders template fields in place before execute.
+        op.subject = "Review for 2020-01-01"
+        op.body = "Deploy 2020-01-01?"
+
+        assert op.hitl_summary["subject"] == "Review for 2020-01-01"
+        assert op.hitl_summary["body"] == "Deploy 2020-01-01?"
+
+    def test_summary_extension_via_hitl_summary_extra(self) -> None:
+        """Subclasses and runtime code extend the summary through the public hitl_summary_extra dict."""
+        op = HITLOperator(
+            task_id="test",
+            subject="Review",
+            options=["A", "B"],
+        )
+        op.hitl_summary_extra["team"] = "data-eng"
+
+        assert op.hitl_summary["team"] == "data-eng"
+
     def test_approval_operator_init_summary(self) -> None:
         """ApprovalOperator hitl_summary includes base + approval-specific fields."""
         op = ApprovalOperator(
@@ -1038,11 +1121,7 @@ class TestHITLSummaryForListeners:
             response_timeout=datetime.timedelta(minutes=10),
         )
 
-        with (
-            patch("airflow.providers.standard.operators.hitl.upsert_hitl_detail"),
-            patch.object(op, "defer"),
-        ):
-            op.execute({"task_instance": MagicMock(id=uuid4())})  # type: ignore[arg-type]
+        _run_execute_until_park(op, {"task_instance": MagicMock(id=uuid4())})
 
         s = op.hitl_summary
         # Validate the timeout value is a parseable ISO string
@@ -1068,11 +1147,7 @@ class TestHITLSummaryForListeners:
             options=["OK"],
         )
 
-        with (
-            patch("airflow.providers.standard.operators.hitl.upsert_hitl_detail"),
-            patch.object(op, "defer"),
-        ):
-            op.execute({"task_instance": MagicMock(id=uuid4())})  # type: ignore[arg-type]
+        _run_execute_until_park(op, {"task_instance": MagicMock(id=uuid4())})
 
         assert op.hitl_summary == {
             "subject": "Review",
@@ -1301,11 +1376,7 @@ class TestHITLSummaryForListeners:
         }
 
         # -- After execute (mocked defer): timeout_datetime added --
-        with (
-            patch("airflow.providers.standard.operators.hitl.upsert_hitl_detail"),
-            patch.object(op, "defer"),
-        ):
-            op.execute({"task_instance": MagicMock(id=uuid4())})  # type: ignore[arg-type]
+        _run_execute_until_park(op, {"task_instance": MagicMock(id=uuid4())})
 
         s = op.hitl_summary
         timeout_dt_str = s["timeout_datetime"]
@@ -1337,7 +1408,8 @@ class TestHITLSummaryForListeners:
             },
         )
 
-        assert s == {
+        # hitl_summary is a property, so re-read it to see the execute_complete additions.
+        assert op.hitl_summary == {
             "subject": "Release v2.0?",
             "body": "Please approve the production deployment.",
             "options": ["Approve", "Reject"],

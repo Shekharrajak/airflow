@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "rich>=13.6.0",
 # ]
@@ -48,6 +48,11 @@ IGNORE = {
     "data_interval_start",
     "prev_data_interval_start_success",
     "prev_data_interval_end_success",
+    # AIP-103: task_state_store/asset_state_store aren't documented in templates-ref yet. Will be done in a later PR.
+    "task_state_store",
+    "asset_state_store",
+    # Only available inside private loop groups.
+    "loop",
 }
 
 
@@ -75,26 +80,37 @@ def _iter_template_context_keys_from_original_return() -> typing.Iterator[str]:
                 raise ValueError("Key in dictionary is not a string literal")
             yield key.value
 
-    # Extract keys from the main `context` dictionary assignment
-    context_assignment: ast.AnnAssign = next(
+    # Extract keys from the `if self._cached_template_context is None: self._cached_template_context = {...}` block
+    guard_stmt: ast.If = next(
         stmt
         for stmt in fn_get_template_context.body
-        if isinstance(stmt, ast.AnnAssign)
-        and isinstance(stmt.target, ast.Attribute)
-        and isinstance(stmt.target.value, ast.Name)
-        and stmt.target.value.id == "self"
-        and stmt.target.attr == "_cached_template_context"
+        if isinstance(stmt, ast.If)
+        and isinstance(stmt.test, ast.Compare)
+        and isinstance(stmt.test.left, ast.Attribute)
+        and isinstance(stmt.test.left.value, ast.Name)
+        and stmt.test.left.value.id == "self"
+        and stmt.test.left.attr == "_cached_template_context"
+        and len(stmt.test.ops) == 1
+        and isinstance(stmt.test.ops[0], ast.Is)
+        and len(stmt.test.comparators) == 1
+        and isinstance(stmt.test.comparators[0], ast.Constant)
+        and stmt.test.comparators[0].value is None
     )
-
-    if not isinstance(context_assignment.value, ast.BoolOp):
-        raise TypeError("Expected a BoolOp like 'self._cached_template_context or {...}'.")
-
-    context_assignment_op = context_assignment.value
-    _, context_assignment_value = context_assignment_op.values
-
-    if not isinstance(context_assignment_value, ast.Dict):
-        raise ValueError("'context' is not assigned a dictionary literal")
-    yield from extract_keys_from_dict(context_assignment_value)
+    context_assignment: ast.Assign = next(
+        s
+        for s in guard_stmt.body
+        if isinstance(s, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute)
+            and isinstance(t.value, ast.Name)
+            and t.value.id == "self"
+            and t.attr == "_cached_template_context"
+            for t in s.targets
+        )
+    )
+    if not isinstance(context_assignment.value, ast.Dict):
+        raise ValueError("'_cached_template_context' is not assigned a dictionary literal")
+    yield from extract_keys_from_dict(context_assignment.value)
 
     # Handle keys added conditionally in `if from_server`
     for stmt in fn_get_template_context.body:
@@ -147,8 +163,8 @@ def _compare_keys(retn_keys: set[str], hint_keys: set[str], docs_keys: set[str])
     retn_keys.add("test_mode")
 
     # Only present in callbacks. Not listed in templates-ref (that doc is for task execution).
-    retn_keys.update(("exception", "reason", "try_number"))
-    docs_keys.update(("exception", "reason", "try_number"))
+    retn_keys.update(("callback", "exception", "reason", "try_number"))
+    docs_keys.update(("callback", "exception", "reason", "try_number"))
 
     # Airflow 3 added:
     retn_keys.add("task_reschedule_count")

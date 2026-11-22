@@ -42,6 +42,20 @@ def get_provider_info():
             "keycloak_auth_manager": {
                 "description": "This section contains settings for Keycloak auth manager integration.",
                 "options": {
+                    "cache_ttl_seconds": {
+                        "description": "Time (in seconds) to cache auth decisions in bulk ``is_authorized_{resource}`` methods.\n",
+                        "type": "integer",
+                        "version_added": "0.9.0",
+                        "example": None,
+                        "default": "30",
+                    },
+                    "cache_timeout_seconds": {
+                        "description": "Timeout (in seconds) to cache auth decisions in bulk ``is_authorized_{resource}`` methods.\n",
+                        "type": "integer",
+                        "version_added": "0.9.0",
+                        "example": None,
+                        "default": "60",
+                    },
                     "client_id": {
                         "description": "Client ID configured in Keycloak to integrate with Airflow.\nThis client must follow the standard OpenID Connect authentication flow.\n",
                         "type": "string",
@@ -55,6 +69,20 @@ def get_provider_info():
                         "sensitive": True,
                         "version_added": "0.0.1",
                         "example": None,
+                        "default": None,
+                    },
+                    "cli_authorization_code_enabled": {
+                        "description": "Let command-line clients such as ``airflowctl`` log in through the browser\n(authorization code flow with PKCE). Add ``http://127.0.0.1/callback`` and\n``http://[::1]/callback`` to the valid redirect URIs of the Keycloak client. Clients\ndiscover this login on Airflow 3.5 and later.\n",
+                        "type": "boolean",
+                        "version_added": "0.14.0",
+                        "example": None,
+                        "default": "False",
+                    },
+                    "jwt_federated_client_ids": {
+                        "description": "Comma-separated allow-list of Keycloak client ids (``azp`` claim) permitted to\nexchange a Keycloak-issued access token for an Airflow token via the\n``urn:ietf:params:oauth:grant-type:jwt-bearer`` grant at ``/auth/token``. Unset\nor empty denies every caller.\n",
+                        "type": "string",
+                        "version_added": "0.10.0",
+                        "example": "team-platform-admin-sa,other-team-sa",
                         "default": None,
                     },
                     "realm": {
@@ -84,6 +112,13 @@ def get_provider_info():
                         "version_added": "0.4.0",
                         "example": "3",
                         "default": "3",
+                    },
+                    "team_level_authorization": {
+                        "description": "Whether one authorization decision holds for every resource of a type within a team.\nBy default the auth manager asks Keycloak once per Dag, asset, connection, pool or variable\nwhen listing them, because a Keycloak policy can read the id of the resource. When no policy\nof the realm does, set this to ``True``: the auth manager then asks once per team (once in\ntotal for assets, and for every type when multi-team is disabled) and applies the answer to\nall resources of that type. Do not enable it when a policy grants access per resource.\n",
+                        "type": "boolean",
+                        "version_added": "0.13.0",
+                        "example": None,
+                        "default": "False",
                     },
                 },
             }

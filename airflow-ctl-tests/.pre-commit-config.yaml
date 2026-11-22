@@ -16,7 +16,7 @@
 # under the License.
 ---
 default_stages: [pre-commit, pre-push]
-minimum_prek_version: '0.2.0'
+minimum_prek_version: '0.3.4'
 default_language_version:
   python: python3
 repos:
@@ -24,9 +24,20 @@ repos:
     hooks:
       - id: check-airflowctl-command-coverage
         name: Check airflowctl CLI command test coverage
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         entry: ../scripts/ci/prek/check_airflowctl_command_coverage.py
         language: python
         pass_filenames: false
         files:
           (?x)
           ^tests/airflowctl_tests/.*\.py$
+      - id: mypy-airflow-ctl-tests
+        name: Run mypy for airflow-ctl-tests
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ../scripts/ci/prek/run_mypy_full_dist_local_venv_or_breeze_in_ci.py airflow-ctl-tests
+        pass_filenames: false
+        files: ^.*\.py$
+        require_serial: true

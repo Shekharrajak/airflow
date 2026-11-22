@@ -49,6 +49,7 @@ def get_provider_info():
         "connection-types": [
             {
                 "hook-class-name": "airflow.providers.smtp.hooks.smtp.SmtpHook",
+                "hook-name": "SMTP",
                 "connection-type": "smtp",
                 "conn-fields": {
                     "from_email": {"label": "From email", "schema": {"type": ["string", "null"]}},
@@ -99,4 +100,5 @@ def get_provider_info():
             }
         ],
         "notifications": ["airflow.providers.smtp.notifications.smtp.SmtpNotifier"],
+        "email-backends": ["airflow.providers.smtp.utils.emailer.send_email_smtp"],
     }

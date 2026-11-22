@@ -16,20 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import type { JSX, ReactNode } from "react";
+import { Fragment } from "react";
+
 import { chakra, Code, Link } from "@chakra-ui/react";
 import type { TFunction } from "i18next";
-import type { JSX } from "react";
-import * as React from "react";
 import { Link as RouterLink } from "react-router-dom";
 
-import type { StructuredLogMessage } from "openapi/requests/types.gen";
+import type { StructuredLogMessage, TaskInstancesLogResponse } from "openapi/requests/types.gen";
+
 import AnsiRenderer from "src/components/AnsiRenderer";
 import Time from "src/components/Time";
+
 import { urlRegex } from "src/constants/urlRegex";
-import { LogLevel, logLevelColorMapping } from "src/utils/logs";
+import { isUserCodeFrame, LogLevel, logLevelColorMapping } from "src/utils/logs";
 
 type Frame = {
   filename: string;
+  line?: string;
   lineno: number;
   name: string;
 };
@@ -49,6 +53,7 @@ type RenderStructuredLogProps = {
   logLink: string;
   logMessage: string | StructuredLogMessage;
   renderingMode?: "jsx" | "text";
+  showLogLevel?: boolean;
   showSource?: boolean;
   showTimestamp?: boolean;
   sourceFilters?: Array<string>;
@@ -63,7 +68,7 @@ const addAnsiWithLinks = (line: string) => {
   }
 
   let currentIndex = 0;
-  const elements: Array<React.ReactNode> = [];
+  const elements: Array<ReactNode> = [];
 
   urlMatches.forEach((match) => {
     const { index: startIndex } = match;
@@ -109,12 +114,77 @@ const addAnsiWithLinks = (line: string) => {
 
 const sourceFields = ["logger", "chan", "lineno", "filename", "loc"];
 
+// Fields bound once per task-instance process via bind_contextvars — identical on every log line,
+// so we strip them from per-line rendering and show them once as a preamble instead.
+export const tiContextFields = ["ti_id", "dag_id", "task_id", "run_id", "try_number", "map_index"];
+
+export const renderTIContextPreamble = (
+  context: Record<string, unknown>,
+  renderingMode: "jsx" | "text" = "jsx",
+  label?: string,
+): JSX.Element | string => {
+  const fields = tiContextFields.filter((field) => field in context);
+
+  if (renderingMode === "text") {
+    const prefix = label === undefined ? "" : `${label} `;
+
+    return prefix + fields.map((field) => `${field}=${String(context[field])}`).join(" ");
+  }
+
+  return (
+    <chakra.span lineHeight={1.5} opacity={0.7}>
+      {label === undefined ? undefined : <chakra.span fontWeight="medium">{label}</chakra.span>}
+      {fields.map((field) => (
+        <Fragment key={field}>
+          {" "}
+          <span>
+            <chakra.span color="fg.info">{field}</chakra.span>={String(context[field])}
+          </span>
+        </Fragment>
+      ))}
+    </chakra.span>
+  );
+};
+
+const extractFromStructuredDatum = (
+  line: string | StructuredLogMessage,
+): Record<string, unknown> | undefined => {
+  if (typeof line === "string") {
+    return undefined;
+  }
+  const ctx: Record<string, unknown> = {};
+
+  for (const field of tiContextFields) {
+    // Callback triggers log these fields as null since they have no task instance.
+    if (Object.hasOwn(line, field) && line[field] !== undefined && line[field] !== null) {
+      ctx[field] = line[field];
+    }
+  }
+
+  return Object.keys(ctx).length > 0 ? ctx : undefined;
+};
+
+export const extractTIContext = (
+  data: TaskInstancesLogResponse["content"],
+): Record<string, unknown> | undefined => {
+  for (const datum of data) {
+    const ctx = extractFromStructuredDatum(datum);
+
+    if (ctx !== undefined) {
+      return ctx;
+    }
+  }
+
+  return undefined;
+};
+
 const renderStructuredLogImpl = ({
   index,
   logLevelFilters,
   logLink,
   logMessage,
   renderingMode = "jsx",
+  showLogLevel = true,
   showSource = true,
   showTimestamp = true,
   sourceFilters,
@@ -161,7 +231,7 @@ const renderStructuredLogImpl = ({
     }
   }
 
-  if (typeof level === "string") {
+  if (typeof level === "string" && showLogLevel) {
     const formattedLevel = level.toUpperCase();
 
     if (renderingMode === "text") {
@@ -189,14 +259,31 @@ const renderStructuredLogImpl = ({
     details = (errorDetail as Array<ErrorDetail>).map((error) => {
       const errorLines = error.frames.map((frame) => {
         if (renderingMode === "text") {
-          return `    ${translate("components:logs.file")} ${frame.filename}, ${translate("components:logs.location", { line: frame.lineno, name: frame.name })}\n`;
+          const sourceLine = frame.line === undefined ? "" : `      ${frame.line}\n`;
+
+          return `    ${translate("components:logs.file")} ${frame.filename}, ${translate("components:logs.location", { line: frame.lineno, name: frame.name })}\n${sourceLine}`;
         }
+
+        // Highlight user-code frames (DAG bundle, plugins, local files) in the info blue,
+        // and leave installed-package frames in the normal text color, so the frame the
+        // error actually came from stands out from the framework frames around it.
+        const userCode = isUserCodeFrame(frame.filename);
 
         return (
           <chakra.p key={`frame-${frame.name}-${frame.filename}-${frame.lineno}`}>
             {translate("components:logs.file")}{" "}
-            <chakra.span color="fg.info">{JSON.stringify(frame.filename)}</chakra.span>,{" "}
-            {translate("components:logs.location", { line: frame.lineno, name: frame.name })}
+            <chakra.span
+              color={userCode ? "fg.info" : undefined}
+              data-frame-source={userCode ? "user" : "library"}
+            >
+              {JSON.stringify(frame.filename)}
+            </chakra.span>
+            , {translate("components:logs.location", { line: frame.lineno, name: frame.name })}
+            {frame.line === undefined ? undefined : (
+              <chakra.span display="block" ps={4} whiteSpace="pre-wrap">
+                {frame.line}
+              </chakra.span>
+            )}
           </chakra.p>
         );
       });
@@ -240,6 +327,9 @@ const renderStructuredLogImpl = ({
       if (!showSource && sourceFields.includes(key)) {
         continue; // eslint-disable-line no-continue
       }
+      if (tiContextFields.includes(key)) {
+        continue; // eslint-disable-line no-continue
+      }
       const val = reStructured[key] as boolean | number | object | string | null;
 
       // Let strings, ints, etc through as is, but JSON stringify anything more complex
@@ -249,7 +339,7 @@ const renderStructuredLogImpl = ({
         elements.push(` ${key === "logger" ? "source" : key}=${stringifiedValue} `);
       } else {
         elements.push(
-          <React.Fragment key={`space_${key}`}> </React.Fragment>,
+          <Fragment key={`space_${key}`}> </Fragment>,
           <span data-key={key} key={`struct_${key}`}>
             <chakra.span color="fg.info">{key === "logger" ? "source" : key}</chakra.span>=
             <span data-value>{stringifiedValue}</span>
@@ -274,8 +364,9 @@ const renderStructuredLogImpl = ({
   }
 
   return (
-    <chakra.div display="flex" key={index} lineHeight={1.5}>
+    <chakra.div alignItems="flex-start" display="flex" key={index} lineHeight={1.5}>
       <RouterLink
+        data-copy-exclude
         id={index.toString()}
         key={`line_${index}`}
         style={{

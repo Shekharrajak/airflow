@@ -21,12 +21,17 @@ import { useTranslation } from "react-i18next";
 import { LuInfo } from "react-icons/lu";
 
 import type { DAGRunResponse } from "openapi/requests/types.gen";
-import { RunTypeIcon } from "src/components/RunTypeIcon";
-import { Tooltip } from "src/components/ui";
 
-const runTypes: Array<DAGRunResponse["run_type"]> = [
+import { Tooltip } from "src/system-components";
+
+import { RunTypeIcon } from "src/components/RunTypeIcon";
+
+// Every run type the API can return needs a row here, otherwise the grid shows an icon the
+// legend does not explain. RunTypeLegend.test.tsx holds this list to the generated enum.
+export const RUN_TYPE_LEGEND_ORDER: Array<DAGRunResponse["run_type"]> = [
   "scheduled",
   "manual",
+  "operator_triggered",
   "backfill",
   "asset_triggered",
   "asset_materialization",
@@ -38,21 +43,26 @@ export const RunTypeLegend = () => {
   return (
     <Tooltip
       content={
-        <Box>
+        <div>
           <Text fontSize="xs" fontWeight="bold" mb={1}>
             {translate("dag:grid.runTypeLegend")}
           </Text>
-          {runTypes.map((runType) => (
+          {RUN_TYPE_LEGEND_ORDER.map((runType) => (
             <Flex align="center" gap={2} key={runType}>
-              <RunTypeIcon runType={runType} />
+              {/* Grid bars show no icon for scheduled runs; the spacer keeps the labels aligned. */}
+              {runType === "scheduled" ? (
+                <Box flexShrink={0} width="1em" />
+              ) : (
+                <RunTypeIcon runType={runType} />
+              )}
               <Text fontSize="xs">{translate(`common:runTypes.${runType}`)}</Text>
             </Flex>
           ))}
-        </Box>
+        </div>
       }
       portalled
     >
-      <Box as="span" cursor="pointer">
+      <Box color="fg.muted" cursor="pointer" p={2}>
         <LuInfo />
       </Box>
     </Tooltip>

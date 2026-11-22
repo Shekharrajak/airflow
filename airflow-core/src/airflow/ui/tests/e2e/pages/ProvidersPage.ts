@@ -16,7 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
+
+import { DATA_ROWS } from "tests/e2e/utils/ui/selectors";
 
 import { BasePage } from "./BasePage";
 
@@ -28,58 +31,51 @@ export class ProvidersPage extends BasePage {
   public constructor(page: Page) {
     super(page);
 
-    this.heading = page.getByRole("heading", { name: /^providers$/i });
+    // DataTable's row count is the page heading, so this reads "90 Providers" rather than "Providers"
+    this.heading = page.getByRole("heading", { name: /providers/i });
     this.table = page.getByTestId("table-list");
-    this.rows = this.table.locator("tbody tr").filter({
+    this.rows = this.table.locator(DATA_ROWS).filter({
       has: page.locator("td"),
     });
+  }
+
+  public descriptionCellAt(index: number): Locator {
+    return this.rows.nth(index).locator("td").nth(2);
   }
 
   public async getRowCount(): Promise<number> {
     return this.rows.count();
   }
 
-  public async getRowDetails(index: number) {
-    const row = this.rows.nth(index);
-    const cells = row.locator("td");
+  public async getRowDetails(index: number): Promise<{
+    description: string;
+    packageName: string;
+    version: string;
+  }> {
+    const packageName = ((await this.packageLinkAt(index).textContent()) ?? "").trim();
+    const version = ((await this.versionCellAt(index).textContent()) ?? "").trim();
+    const description = ((await this.descriptionCellAt(index).textContent()) ?? "").trim();
 
-    const pkg = await cells.nth(0).locator("a").textContent();
-    const ver = await cells.nth(1).textContent();
-    const desc = await cells.nth(2).textContent();
-
-    return {
-      description: (desc ?? "").trim(),
-      packageName: (pkg ?? "").trim(),
-      version: (ver ?? "").trim(),
-    };
+    return { description, packageName, version };
   }
 
   public async navigate(): Promise<void> {
-    await this.navigateTo("/providers");
+    await expect(async () => {
+      await this.navigateTo("/providers");
+      await this.waitForLoad();
+    }).toPass({ intervals: [2000], timeout: 60_000 });
+  }
+
+  public packageLinkAt(index: number): Locator {
+    return this.rows.nth(index).locator("td").nth(0).getByRole("link");
+  }
+
+  public versionCellAt(index: number): Locator {
+    return this.rows.nth(index).locator("td").nth(1);
   }
 
   public async waitForLoad(): Promise<void> {
-    await this.table.waitFor({ state: "visible", timeout: 30_000 });
-    await this.waitForTableData();
-  }
-
-  private async waitForTableData(): Promise<void> {
-    // Wait for actual data links to appear (not skeleton loaders)
-    await this.page.waitForFunction(
-      () => {
-        const table = document.querySelector('[data-testid="table-list"]');
-
-        if (!table) {
-          return false;
-        }
-
-        // Check for actual links in tbody (real data, not skeleton)
-        const links = table.querySelectorAll("tbody tr td a");
-
-        return links.length > 0;
-      },
-      undefined,
-      { timeout: 30_000 },
-    );
+    await expect(this.table).toBeVisible();
+    await expect(this.rows.first()).toBeVisible();
   }
 }

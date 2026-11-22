@@ -20,12 +20,13 @@ from __future__ import annotations
 import codecs
 import io
 import itertools
+import linecache
 import logging
 import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from functools import cache, cached_property, partial
+from functools import cache, cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, BinaryIO, Generic, TextIO, TypeVar, cast
@@ -58,6 +59,44 @@ __all__ = [
 JWT_PATTERN = re.compile(r"eyJ[\.A-Za-z0-9-_]*")
 
 LEVEL_TO_FILTERING_LOGGER: dict[int, type[Logger]] = {}
+
+
+# ``_parse_path`` was introduced in Python 3.12; older versions use a different
+# parsing path (``_flavour.parse_parts``) that does not call ``sys.intern``,
+# so the patch is neither necessary nor applicable there. Python 3.14 removed
+# the ``sys.intern`` call upstream, so the patch is unnecessary there too.
+if sys.version_info < (3, 12) or sys.version_info >= (3, 14):
+    _PatchedPath = Path  # type: ignore[misc, assignment]
+else:
+
+    class _PatchedPath(Path):
+        """
+        Backport of Python 3.14's ``PurePath._parse_path`` without ``sys.intern``.
+
+        The ``sys.intern`` call in the stock ``_parse_path`` causes memory
+        to grow unboundedly in long-running processes. Upstream removed it
+        in Python 3.14 (https://github.com/python/cpython/issues/119518);
+        this class applies the same fix for earlier versions.
+        """
+
+        @classmethod
+        def _parse_path(cls, path: str) -> tuple[str, str, list[str]]:
+            if not path:
+                return "", "", []
+            sep = os.path.sep
+            altsep = os.path.altsep
+            if altsep:
+                path = path.replace(altsep, sep)
+            drv, root, rel = os.path.splitroot(path)
+            if not root and drv.startswith(sep) and not drv.endswith(sep):
+                drv_parts = drv.split(sep)
+                if len(drv_parts) == 4 and drv_parts[2] not in "?.":
+                    # e.g. //server/share
+                    root = sep
+                elif len(drv_parts) == 6:
+                    # e.g. //?/unc/server/share
+                    root = sep
+            return drv, root, [x for x in rel.split(sep) if x and x != "."]
 
 
 def _make_airflow_structlogger(min_level):
@@ -95,10 +134,15 @@ def _make_airflow_structlogger(min_level):
             if not args:
                 return self._proxy_to_logger(name, event, **kw)
 
-            # See https://github.com/python/cpython/blob/3.13/Lib/logging/__init__.py#L307-L326 for reason
-            if args and len(args) == 1 and isinstance(args[0], Mapping) and args[0]:
-                return self._proxy_to_logger(name, event % args[0], **kw)
-            return self._proxy_to_logger(name, event % args, **kw)
+            # Match CPython's stdlib logging behavior: try positional formatting first,
+            # fall back to named substitution only if that fails.
+            # See https://github.com/python/cpython/blob/3.13/Lib/logging/__init__.py#L307-L326
+            try:
+                return self._proxy_to_logger(name, event % args, **kw)
+            except (TypeError, KeyError):
+                if len(args) == 1 and isinstance(args[0], Mapping) and args[0]:
+                    return self._proxy_to_logger(name, event % args[0], **kw)
+                raise
 
         meth.__name__ = name
         return meth
@@ -140,6 +184,56 @@ PER_LOGGER_LEVELS.update(
 )
 
 
+_NAMESPACE_LEVEL_SEPARATORS = re.compile(r"[\s,]+")
+
+
+def parse_namespace_log_levels(value: str | Mapping[str, str] | None) -> dict[str, int]:
+    """
+    Parse the namespace logging levels configuration into per-logger levels.
+
+    Real callers always pass a string with a series of ``<logger>=<level>``
+    pairs separated by whitespaces and/or commas, or *None* if the configuration
+    is not set. See documentation on configuration for details.
+
+    Parsing is best-effort. Invalid entries are skipped with an ERROR level log
+    message.
+
+    An already-split ``Mapping`` of logger name to level name is also accepted
+    as a convenience for programmatic (test) callers; it is trusted and merely
+    resolved to numeric levels without validation.
+
+    :meta private:
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, str):
+        return {name: NAME_TO_LEVEL[level.lower()] for name, level in value.items()}
+
+    levels: dict[str, int] = {}
+    errors: list[str] = []
+    for entry in _NAMESPACE_LEVEL_SEPARATORS.split(value.strip()):
+        if not entry:
+            continue
+        logger_name, sep, level_name = entry.partition("=")
+        if not sep:
+            errors.append(f"malformed entry {entry!r}, expected '<logger>=<level>'")
+            continue
+        if not (logger_name := logger_name.strip()):
+            errors.append(f"malformed entry {entry!r}, logger name is empty")
+            continue
+        try:
+            levels[logger_name] = NAME_TO_LEVEL[(level_name := level_name.strip()).lower()]
+        except KeyError:
+            errors.append(
+                f"invalid level {level_name!r} for logger {logger_name!r}, "
+                f"expected one of: {', '.join(sorted(NAME_TO_LEVEL))}"
+            )
+
+    for error in errors:
+        log.error("Ignoring invalid namespace_levels entry: %s", error)
+    return levels
+
+
 def make_filtering_logger() -> Callable[..., BindableLogger]:
     def maker(logger: WrappedLogger, *args, **kwargs):
         # If the logger is a NamedBytesLogger/NamedWriteLogger (an Airflow specific subclass) then
@@ -160,24 +254,32 @@ def make_filtering_logger() -> Callable[..., BindableLogger]:
     return maker
 
 
+# structlog >= 26.1.0 (our floor) gave BytesLogger a `name` slot + kwarg
+# (hynek/structlog#786), but WriteLogger has not received the analogous change
+# yet. Detect it so the upstream addition lands without a regression.
+_WRITE_LOGGER_HAS_NAME = "name" in getattr(structlog.WriteLogger, "__slots__", ())
+
+
 class NamedBytesLogger(structlog.BytesLogger):
-    __slots__ = ("name",)
+    __slots__ = ()
 
     def __init__(self, name: str | None = None, file: BinaryIO | None = None):
-        self.name = name
         if file is not None:
             file = make_file_io_non_caching(file)
-        super().__init__(file)
+        super().__init__(file, name=name)
 
 
 class NamedWriteLogger(structlog.WriteLogger):
-    __slots__ = ("name",)
+    __slots__ = () if _WRITE_LOGGER_HAS_NAME else ("name",)
 
     def __init__(self, name: str | None = None, file: TextIO | None = None):
-        self.name = name
         if file is not None:
             file = make_file_io_non_caching(file)
-        super().__init__(file)
+        if _WRITE_LOGGER_HAS_NAME:
+            super().__init__(file, name=name)  # type: ignore[call-arg]
+        else:
+            super().__init__(file)
+            self.name = name
 
 
 LogOutputType = TypeVar("LogOutputType", bound=TextIO | BinaryIO)
@@ -216,6 +318,30 @@ def drop_positional_args(logger: Any, method_name: Any, event_dict: EventDict) -
     return event_dict
 
 
+def positional_arguments_formatter(logger: Any, method_name: Any, event_dict: EventDict) -> EventDict:
+    """
+    Format positional arguments matching CPython's stdlib logging behavior.
+
+    Replaces structlog's built-in PositionalArgumentsFormatter to correctly handle the case
+    where a single dict is passed as a positional argument (e.g. ``log.warning('%s', {'a': 1})``).
+
+    CPython tries positional formatting first (``msg % args``), and only falls back to named
+    substitution (``msg % args[0]``) if that raises TypeError or KeyError. structlog's built-in
+    formatter does it the other way around, causing TypeError for ``%s`` format specifiers.
+    """
+    args = event_dict.get("positional_args")
+    if args:
+        try:
+            event_dict["event"] = event_dict["event"] % args
+        except (TypeError, KeyError):
+            if len(args) == 1 and isinstance(args[0], Mapping) and args[0]:
+                event_dict["event"] = event_dict["event"] % args[0]
+            else:
+                raise
+        del event_dict["positional_args"]
+    return event_dict
+
+
 # This is a placeholder fn, that is "edited" in place via the `suppress_logs_and_warning` decorator
 # The reason we need to do it this way is that structlog caches loggers on first use, and those include the
 # configured processors, so we can't get away with changing the config as it won't have any effect once the
@@ -236,6 +362,16 @@ def _make_safe_enc_hook(default):
         return str(obj)
 
     return safe_enc_hook
+
+
+def _add_source_lines(stacks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add each frame's source code ``line``, which structlog's ``ExceptionDictTransformer`` omits."""
+    for stack in stacks:
+        for frame in stack["frames"]:
+            linecache.checkcache(frame["filename"])
+            if line := linecache.getline(frame["filename"], frame["lineno"]).strip():
+                frame["line"] = line
+    return stacks
 
 
 @cache
@@ -268,7 +404,7 @@ def structlog_processors(
         timestamper,
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
+        positional_arguments_formatter,
         logger_name,
         redact_jwt,
         structlog.processors.StackInfoRenderer(),
@@ -295,29 +431,25 @@ def structlog_processors(
     # structlog to ignore.
 
     import contextlib
+    import importlib
 
     import click
 
     suppress: tuple[ModuleType, ...] = (click, contextlib)
-    try:
-        import httpcore
-
-        suppress = (*suppress, httpcore)
-    except ImportError:
-        pass
-    try:
-        import httpx
-
-        suppress = (*suppress, httpx)
-    except ImportError:
-        pass
+    # airflow-core is still on httpx while the Task SDK is on httpx2, so either (or both) may
+    # be installed; tracked at https://github.com/apache/airflow/issues/70522
+    for module_name in ("httpcore", "httpcore2", "httpx", "httpx2"):
+        with contextlib.suppress(ImportError):
+            suppress = (*suppress, importlib.import_module(module_name))
 
     if json_output:
         dict_exc_formatter = structlog.tracebacks.ExceptionDictTransformer(
             use_rich=False, show_locals=False, suppress=suppress
         )
 
-        dict_tracebacks = structlog.processors.ExceptionRenderer(dict_exc_formatter)
+        dict_tracebacks = structlog.processors.ExceptionRenderer(
+            lambda exc_info: _add_source_lines(dict_exc_formatter(exc_info))
+        )
 
         import msgspec
 
@@ -473,21 +605,7 @@ def configure_logging(
     extra_processors = extra_processors or ()
 
     PER_LOGGER_LEVELS[""] = NAME_TO_LEVEL[log_level.lower()]
-
-    # Extract per-logger-tree levels and set them
-    if isinstance(namespace_log_levels, str):
-        log_from_level = partial(re.compile(r"\s*=\s*").split, maxsplit=2)
-        namespace_log_levels = {
-            log: level for log, level in map(log_from_level, re.split(r"[\s,]+", namespace_log_levels))
-        }
-    if namespace_log_levels:
-        for log, level in namespace_log_levels.items():
-            try:
-                loglevel = NAME_TO_LEVEL[level.lower()]
-            except KeyError:
-                raise ValueError(f"Invalid log level for logger {log!r}: {level!r}") from None
-            else:
-                PER_LOGGER_LEVELS[log] = loglevel
+    PER_LOGGER_LEVELS.update(parse_namespace_log_levels(namespace_log_levels))
 
     shared_pre_chain, for_stdlib, for_structlog = structlog_processors(
         json_output,
@@ -579,7 +697,9 @@ def configure_logging(
             "airflow": {"level": log_level.upper()},
             # These ones are too chatty even at info
             "httpx": {"level": "WARN"},
+            "httpx2": {"level": "WARN"},
             "sqlalchemy.engine": {"level": "WARN"},
+            "alembic.runtime.plugins": {"level": "WARN"},
         }
     )
     config["root"] = {
@@ -688,10 +808,16 @@ def init_log_folder(directory: str | os.PathLike[str], new_folder_permissions: i
     sure that the same group is set as default group for both - impersonated user and main airflow
     user.
     """
-    directory = Path(directory)
-    for parent in reversed(Path(directory).parents):
-        parent.mkdir(mode=new_folder_permissions, exist_ok=True)
-    directory.mkdir(mode=new_folder_permissions, exist_ok=True)
+    directory = _PatchedPath(directory)
+    try:
+        directory.mkdir(mode=new_folder_permissions, parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(
+            "Could not create log folder %s: %s. "
+            "Airflow will continue but logging to this directory may fail.",
+            directory,
+            e,
+        )
 
 
 def init_log_file(
@@ -708,7 +834,7 @@ def init_log_file(
 
     See above ``init_log_folder`` method for more detailed explanation.
     """
-    full_path = Path(base_log_folder, local_relative_path)
+    full_path = _PatchedPath(base_log_folder, local_relative_path)
     init_log_folder(full_path.parent, new_folder_permissions)
 
     try:

@@ -26,6 +26,11 @@ from airflow.providers.pinecone.hooks.pinecone import PineconeHook
 
 if TYPE_CHECKING:
     from pinecone import Vector
+    from pinecone.db_data.types import (
+        VectorTuple,
+        VectorTupleWithMetadata,
+        VectorTypedDict,
+    )
 
     from airflow.sdk import Context
 
@@ -47,14 +52,17 @@ class PineconeIngestOperator(BaseOperator):
     :param upsert_kwargs: .. seealso:: https://docs.pinecone.io/reference/upsert
     """
 
-    template_fields: Sequence[str] = ("index_name", "input_vectors", "namespace")
+    template_fields: Sequence[str] = ("index_name", "input_vectors", "namespace", "conn_id")
 
     def __init__(
         self,
         *,
         conn_id: str = PineconeHook.default_conn_name,
         index_name: str,
-        input_vectors: list[Vector] | list[tuple] | list[dict],
+        input_vectors: list[Vector]
+        | list[VectorTuple]
+        | list[VectorTupleWithMetadata]
+        | list[VectorTypedDict],
         namespace: str = "",
         batch_size: int | None = None,
         upsert_kwargs: dict | None = None,
@@ -107,6 +115,8 @@ class CreatePodIndexOperator(BaseOperator):
     :param metric: The metric to use. Defaults to cosine.
     :param timeout: The timeout to use.
     """
+
+    template_fields: Sequence[str] = ("conn_id",)
 
     def __init__(
         self,
@@ -178,6 +188,8 @@ class CreateServerlessIndexOperator(BaseOperator):
     :param metric: The metric to use.
     :param timeout: The timeout to use.
     """
+
+    template_fields: Sequence[str] = ("conn_id",)
 
     def __init__(
         self,

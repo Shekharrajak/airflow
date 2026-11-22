@@ -20,6 +20,8 @@ import { useDisclosure, Button } from "@chakra-ui/react";
 import { useTranslation } from "react-i18next";
 import { FiPlus } from "react-icons/fi";
 
+import { useTaskInstanceCoordinates } from "src/hooks/useTaskInstanceCoordinates";
+
 import XComModal from "./XComModal";
 
 type AddXComButtonProps = {
@@ -30,16 +32,18 @@ type AddXComButtonProps = {
 };
 
 const AddXComButton = ({ dagId, mapIndex, runId, taskId }: AddXComButtonProps) => {
+  const coordinates = useTaskInstanceCoordinates();
   const { t: translate } = useTranslation("browse");
   const { onClose, onOpen, open } = useDisclosure();
 
   return (
     <>
-      <Button colorPalette="brand" onClick={onOpen}>
+      <Button onClick={onOpen}>
         <FiPlus /> {translate("xcom.add.title")}
       </Button>
 
       <XComModal
+        {...coordinates}
         dagId={dagId}
         isOpen={open}
         mapIndex={mapIndex}

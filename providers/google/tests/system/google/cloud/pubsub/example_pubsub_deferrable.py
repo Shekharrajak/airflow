@@ -78,6 +78,7 @@ with DAG(
         project_id=PROJECT_ID,
         subscription=subscription,
         deferrable=True,
+        return_immediately=False,
     )
     # [END howto_operator_gcp_pubsub_pull_message_with_async_sensor]
 
@@ -115,5 +116,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

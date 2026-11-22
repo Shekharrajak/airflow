@@ -16,82 +16,44 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { expect, test } from "@playwright/test";
-import { AUTH_FILE, testConfig } from "playwright.config";
+import { randomUUID } from "node:crypto";
+import { testConfig } from "playwright.config";
 
-import { AssetDetailPage } from "../pages/AssetDetailPage";
-import { AssetListPage } from "../pages/AssetListPage";
-import { DagsPage } from "../pages/DagsPage";
+import { expect } from "tests/e2e/fixtures";
+import { test } from "tests/e2e/fixtures/asset-data";
 
 test.describe("Assets Page", () => {
-  let assets: AssetListPage;
-
-  test.beforeAll(async ({ browser }) => {
-    test.setTimeout(3 * 60 * 1000);
-    const context = await browser.newContext({ storageState: AUTH_FILE });
-    const page = await context.newPage();
-    const dagsPage = new DagsPage(page);
-
-    await dagsPage.triggerDag("asset_produces_1");
-    await expect
-      .poll(
-        async () => {
-          const response = await page.request.get(
-            `/api/v2/dags/asset_produces_1/dagRuns?order_by=-start_date&limit=1`,
-          );
-          const data = (await response.json()) as { dag_runs: Array<{ state: string }> };
-
-          return data.dag_runs[0]?.state ?? "pending";
-        },
-        { intervals: [2000], timeout: 120_000 },
-      )
-      .toBe("success");
-    await context.close();
+  // assetData is triggered once per worker via beforeEach.
+  test.beforeEach(async ({ assetData: _data, assetListPage }) => {
+    await assetListPage.navigate();
   });
 
-  test.beforeEach(async ({ page }) => {
-    assets = new AssetListPage(page);
-    await assets.navigate();
-    await assets.waitForLoad();
+  test("verify assets table lists assets with name links", async ({ assetListPage }) => {
+    await expect.soft(assetListPage.heading).toBeVisible();
+    await expect.soft(assetListPage.table).toBeVisible();
+    await expect(assetListPage.rows.first()).toBeVisible();
+    await expect.soft(assetListPage.rows.locator("td a").first()).toBeVisible();
   });
 
-  test("verify assets page heading", async () => {
-    await expect(assets.heading).toBeVisible();
-  });
-
-  test("verify assets table", async () => {
-    await expect(assets.table).toBeVisible();
-  });
-
-  test("verify asset rows when data exists", async () => {
-    await expect(assets.rows.first()).toBeVisible();
-  });
-
-  test("verify asset has a visible name link", async () => {
-    await expect(assets.rows.locator("td a").first()).toBeVisible();
-  });
-
-  test("verify clicking an asset navigates to detail page", async ({ page }) => {
-    const name = await assets.openFirstAsset();
+  test("verify clicking an asset navigates to detail page", async ({ assetListPage, page }) => {
+    const name = await assetListPage.openFirstAsset();
 
     await expect(page).toHaveURL(/\/assets\/.+/);
     await expect(page.getByRole("heading", { name: new RegExp(name, "i") })).toBeVisible();
   });
 
-  test("verify assets using search", async () => {
-    await expect(assets.rows.first()).toBeVisible();
+  test("verify assets using search", async ({ assetListPage }) => {
+    await expect(assetListPage.rows.first()).toBeVisible();
 
     const searchTerm = testConfig.asset.name;
 
-    await assets.searchInput.fill(searchTerm);
+    await assetListPage.searchInput.fill(searchTerm);
 
-    // Wait for filtered results - count should decrease OR stay same if search matches all
     await expect
       .poll(
         async () => {
-          const links = await assets.rows.locator("td a").allTextContents();
+          const links = await assetListPage.rows.locator("td a").allTextContents();
 
-          // Return true when we have results that match the search
           return (
             links.length > 0 && links.every((name) => name.toLowerCase().includes(searchTerm.toLowerCase()))
           );
@@ -101,18 +63,87 @@ test.describe("Assets Page", () => {
       .toBe(true);
   });
 
-  test("verify asset details and dependencies", async ({ page }) => {
-    const assetDetailPage = new AssetDetailPage(page);
+  test("verify asset details and dependencies", async ({ assetDetailPage }) => {
     const assetName = testConfig.asset.name;
 
     await assetDetailPage.goto();
-
     await assetDetailPage.clickOnAsset(assetName);
-
-    await assetDetailPage.verifyAssetDetails(assetName);
-
+    await expect(assetDetailPage.getHeading(assetName)).toBeVisible();
     await assetDetailPage.verifyProducingTasks();
-
     await assetDetailPage.verifyScheduledDags();
+  });
+
+  test("asset state store entries remain scrollable when the table overflows", async ({
+    assetData: _data,
+    assetDetailPage,
+    authenticatedRequest,
+    browserName,
+    page,
+  }) => {
+    test.skip(browserName !== "chromium", "The asset fixture is shared across browser projects.");
+
+    const assetResponse = await authenticatedRequest.get(
+      `/api/v2/assets?uri=${encodeURIComponent(testConfig.asset.name)}&limit=1`,
+    );
+
+    expect(assetResponse.ok()).toBe(true);
+
+    const { assets } = (await assetResponse.json()) as { assets: Array<{ id: number }> };
+    const [asset] = assets;
+
+    if (asset === undefined) {
+      throw new Error(`Test asset ${testConfig.asset.name} was not found`);
+    }
+
+    const keyPrefix = `000-e2e-scroll-${randomUUID()}`;
+    const keys = Array.from({ length: 20 }, (_, index) => `${keyPrefix}-${String(index).padStart(3, "0")}`);
+
+    try {
+      const responses = await Promise.all(
+        keys.map((key, index) =>
+          authenticatedRequest.put(`/api/v2/assets/${asset.id}/state-store/${encodeURIComponent(key)}`, {
+            data: { value: { index, value: `scroll test ${index}` } },
+          }),
+        ),
+      );
+
+      expect(responses.every((response) => response.ok())).toBe(true);
+
+      await assetDetailPage.goto();
+      await assetDetailPage.clickOnAsset(testConfig.asset.name);
+      await page.getByRole("link", { exact: true, name: "Asset State Store" }).click();
+
+      const table = page.getByTestId("table-list");
+      const lastKey = `${keyPrefix}-019`;
+
+      await expect(table.getByText(lastKey)).toBeAttached();
+
+      const canScroll = await table.evaluate((element) => {
+        let parent = element.parentElement;
+
+        while (parent !== null) {
+          const { overflowY } = window.getComputedStyle(parent);
+
+          if ((overflowY === "auto" || overflowY === "scroll") && parent.scrollHeight > parent.clientHeight) {
+            parent.scrollTop = parent.scrollHeight;
+
+            return parent.scrollTop > 0;
+          }
+
+          parent = parent.parentElement;
+        }
+
+        return false;
+      });
+
+      expect(canScroll).toBe(true);
+      await expect(table.locator("tbody tr").last()).toBeInViewport();
+    } finally {
+      await Promise.all(
+        keys.map((key) =>
+          authenticatedRequest.delete(`/api/v2/assets/${asset.id}/state-store/${encodeURIComponent(key)}`),
+        ),
+      );
+    }
   });
 });

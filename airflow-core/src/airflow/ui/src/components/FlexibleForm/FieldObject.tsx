@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import type { ParamValue } from "src/queries/useDagParams";
 import { paramPlaceholder, useParamStore } from "src/queries/useParamStore";
 
 import type { FlexibleFormElementProps } from ".";
@@ -28,8 +29,7 @@ export const FieldObject = ({ name, namespace = "default", onUpdate }: FlexibleF
   const handleChange = (value: string) => {
     try {
       // "undefined" values are removed from params, so we set it to null to avoid falling back to DAG defaults.
-      // eslint-disable-next-line unicorn/no-null
-      const parsedValue = value === "" ? null : (JSON.parse(value) as JSON);
+      const parsedValue = value === "" ? null : (JSON.parse(value) as ParamValue);
 
       if (paramsDict[name]) {
         paramsDict[name].value = parsedValue;
@@ -47,7 +47,7 @@ export const FieldObject = ({ name, namespace = "default", onUpdate }: FlexibleF
       editable={!disabled}
       id={`element_${name}`}
       onChange={handleChange}
-      value={JSON.stringify(param.value ?? [], undefined, 2)}
+      value={JSON.stringify(param.value ?? {}, undefined, 2)}
     />
   );
 };

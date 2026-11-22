@@ -16,12 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { useConnectionServiceBulkConnections, useConnectionServiceGetConnectionsKey } from "openapi/queries";
-import { toaster } from "src/components/ui";
+
+import { toaster } from "src/system-components";
 
 type Props = {
   readonly clearSelections: VoidFunction;
@@ -54,7 +56,9 @@ export const useBulkDeleteConnections = ({ clearSelections, onSuccessConfirm }: 
             keys: success.join(", "),
             resourceName: translate("admin:connections.connection_other"),
           }),
-          title: translate("toaster.bulkDelete.success.title"),
+          title: translate("toaster.bulkDelete.success.title", {
+            resourceName: translate("admin:connections.connection_other"),
+          }),
           type: "success",
         });
         clearSelections();

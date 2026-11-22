@@ -346,6 +346,87 @@ class TestCliDb:
             b"[client]\nhost     = mysql\nuser     = root\npassword = \nport     = 3306\ndatabase = airflow"
         )
 
+    @pytest.mark.parametrize(
+        ("sql_alchemy_conn", "expected_cnf"),
+        [
+            pytest.param(
+                "mysql://root@mysql:3306/airflow",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow",
+                id="no_query_params",
+            ),
+            pytest.param(
+                "mysql://root@mysql/airflow",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow",
+                id="missing_port_defaults_to_3306",
+            ),
+            pytest.param(
+                "mysql://airflow@mysql:3306/airflow"
+                "?ssl_ca=/etc/ssl/ca.crt&ssl_cert=/etc/ssl/client.crt"
+                "&ssl_key=/etc/ssl/client.key&ssl_mode=VERIFY_CA",
+                b"[client]\nhost     = mysql\nuser     = airflow\npassword = \n"
+                b"port     = 3306\ndatabase = airflow\n"
+                b"ssl-ca = /etc/ssl/ca.crt\n"
+                b"ssl-cert = /etc/ssl/client.crt\n"
+                b"ssl-key = /etc/ssl/client.key\n"
+                b"ssl-mode = VERIFY_CA",
+                id="ssl_params_forwarded_with_hyphen_translation",
+            ),
+            pytest.param(
+                "mysql://root@mysql:3306/airflow?unknown_param=something&ssl_cipher=AES256-SHA",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow\n"
+                b"ssl-cipher = AES256-SHA",
+                id="only_allowlisted_query_keys_are_forwarded",
+            ),
+            pytest.param(
+                "mysql://root@mysql:3306/airflow?charset=utf8mb4",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow\n"
+                b"default-character-set = utf8mb4",
+                id="charset_forwarded_as_default_character_set",
+            ),
+            pytest.param(
+                'mysql://root:pa"ss\\word@mysql:3306/airflow',
+                b'[client]\nhost     = mysql\nuser     = root\npassword = "pa\\"ss\\\\word"\n'
+                b"port     = 3306\ndatabase = airflow",
+                id="password_with_special_chars_is_escaped",
+            ),
+            pytest.param(
+                # %0A and %0D in a query value get percent-decoded to LF/CR by
+                # SQLAlchemy. Without sanitization those would inject extra
+                # lines into the [client] section of the rendered my.cnf.
+                "mysql://root@mysql:3306/airflow?ssl_ca=/etc/ssl/ca.crt%0Amalicious=evil%0Dmore=bad",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow\n"
+                b"ssl-ca = /etc/ssl/ca.crtmalicious=evilmore=bad",
+                id="cr_lf_in_query_value_is_stripped_no_option_injection",
+            ),
+            pytest.param(
+                # SQLAlchemy returns a tuple when the same query key repeats;
+                # mysql's option file is one value per key, so the last wins
+                # (mirroring command-line override semantics) and any CR/LF
+                # in the chosen value is still stripped.
+                "mysql://root@mysql:3306/airflow?ssl_ca=/etc/ssl/old.crt&ssl_ca=/etc/ssl/new.crt%0Ainjected=x",
+                b"[client]\nhost     = mysql\nuser     = root\npassword = \n"
+                b"port     = 3306\ndatabase = airflow\n"
+                b"ssl-ca = /etc/ssl/new.crtinjected=x",
+                id="repeated_query_key_collapses_to_last_value",
+            ),
+        ],
+    )
+    def test_build_mysql_cnf(self, sql_alchemy_conn, expected_cnf):
+        """
+        Pure-function test of the my.cnf builder — no mocking of ``shell()`` needed.
+
+        Exercises every behavior we care about: bare URL, missing-port default,
+        SSL params forwarded with underscore→hyphen translation, query-string
+        allowlisting, the charset rename, and password escaping. New allowlist
+        keys should be added here first — bug-regressions then fail loudly.
+        """
+        assert db_command._build_mysql_cnf(make_url(sql_alchemy_conn)) == expected_cnf
+
     @mock.patch("airflow.cli.commands.db_command.execute_interactive")
     @mock.patch(
         "airflow.cli.commands.db_command.settings.engine.url",
@@ -453,6 +534,23 @@ class TestCliDb:
         with pytest.raises(AirflowException, match=r"Unknown driver: invalid\+psycopg"):
             db_command.shell(self.parser.parse_args(["db", "shell"]))
 
+    @mock.patch(
+        "airflow.cli.commands.db_command.settings.engine.url",
+        make_url("postgresql+psycopg2://postgres:airflow@postgres/"),
+    )
+    @pytest.mark.parametrize(
+        "conn_uri",
+        [
+            pytest.param("postgresql://postgres:postgres@postgres:5432", id="db-name-none"),
+            pytest.param("postgresql://postgres:postgres@postgres:5432/", id="db-name-empty"),
+        ],
+    )
+    def test_db_shell_missing_database_name(self, conn_uri):
+        """Assert that an explicit ValueError is raised when the database name is missing."""
+        with mock.patch("airflow.cli.commands.db_command.settings.engine.url", make_url(conn_uri)):
+            with pytest.raises(ValueError, match="The metadata database name is missing"):
+                db_command.shell(self.parser.parse_args(["db", "shell"]))
+
     def test_run_db_downgrade_command_success_and_messages(self, capsys):
         class Args:
             to_revision = "abc"
@@ -546,6 +644,28 @@ class TestCliDb:
             (
                 {
                     "to_revision": None,
+                    "to_version": "abc",
+                    "from_revision": None,
+                    "from_version": None,
+                    "show_sql_only": False,
+                    "yes": True,
+                },
+                "Invalid version 'abc' supplied as `--to-version`",
+            ),
+            (
+                {
+                    "to_revision": "abc1",
+                    "to_version": None,
+                    "from_revision": None,
+                    "from_version": "abc",
+                    "show_sql_only": True,
+                    "yes": True,
+                },
+                "Invalid version 'abc' supplied as `--from-version`",
+            ),
+            (
+                {
+                    "to_revision": None,
                     "to_version": None,
                     "from_revision": "abc",
                     "from_version": None,
@@ -628,7 +748,12 @@ class TestCliDb:
                 ["-y", "--to-revision", "abc", "--from-version", "2.2.0", "--from-revision", "abc"],
                 "may not be combined",
             ),
-            (["-y", "--to-version", "abc"], r"Downgrading to .* not supported\."),
+            (["-y", "--to-version", "2.1.25"], r"Downgrading to .* not supported\."),
+            (["-y", "--to-version", "abc"], "Invalid version 'abc' supplied as `--to-version`"),
+            (
+                ["-y", "--to-revision", "abc1", "--from-version", "abc", "-s"],
+                "Invalid version 'abc' supplied as `--from-version`",
+            ),
             (["-y"], "Must provide either"),
         ],
     )
@@ -704,6 +829,19 @@ class TestCliDb:
             always_fail.assert_has_calls([call()] * (retry + 1))
             sleep.assert_has_calls([call(retry_delay)] * retry)
 
+    def test_check_warns_about_the_retries_that_are_actually_left(self, caplog):
+        args = self.parser.parse_args(["db", "check", "--retry", "3", "--retry-delay", "9"])
+        always_fail = Mock(side_effect=OperationalError("", None, None))
+
+        with patch("time.sleep", new=MagicMock()), patch("airflow.utils.db.check", new=always_fail):
+            with pytest.raises(OperationalError):
+                db_command.check(args)
+
+        assert "3 retries remain. Will retry in 9 seconds" in caplog
+        assert "2 retries remain. Will retry in 9 seconds" in caplog
+        assert "1 retries remain. Will retry in 9 seconds" in caplog
+        assert "0 retries remain. Will retry in 9 seconds" not in caplog
+
 
 class TestCLIDBClean:
     @classmethod
@@ -727,12 +865,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse(timestamp, tz=timezone),
             verbose=False,
             confirm=False,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize("timezone", ["UTC", "Europe/Berlin", "America/Los_Angeles"])
@@ -750,12 +890,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse(timestamp),
             verbose=False,
             confirm=False,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(("confirm_arg", "expected"), [(["-y"], False), ([], True)])
@@ -779,12 +921,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=expected,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(("extra_arg", "expected"), [(["--skip-archive"], True), ([], False)])
@@ -808,12 +952,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=expected,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(("dry_run_arg", "expected"), [(["--dry-run"], True), ([], False)])
@@ -837,12 +983,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=expected,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(
@@ -868,12 +1016,14 @@ class TestCLIDBClean:
             table_names=expected,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(("extra_args", "expected"), [(["--verbose"], True), ([], False)])
@@ -897,12 +1047,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=expected,
             confirm=True,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(("extra_args", "expected"), [(["--batch-size", "1234"], 1234), ([], None)])
@@ -926,12 +1078,14 @@ class TestCLIDBClean:
             table_names=None,
             dag_ids=None,
             exclude_dag_ids=None,
+            asset_ids=None,
             dry_run=False,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=False,
             batch_size=expected,
+            error_on_cleanup_failure=False,
         )
 
     @pytest.mark.parametrize(
@@ -958,12 +1112,87 @@ class TestCLIDBClean:
             dry_run=False,
             dag_ids=expected,
             exclude_dag_ids=None,
+            asset_ids=None,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
         )
+
+    @patch("airflow.cli.commands.db_command.run_cleanup", autospec=True)
+    def test_asset_ids(self, run_cleanup_mock):
+        args = self.parser.parse_args(
+            [
+                "db",
+                "clean",
+                "--clean-before-timestamp",
+                "2021-01-01",
+                "--tables",
+                "asset_event",
+                "--asset-ids",
+                " 1, 2 ",
+                "--dag-ids",
+                "producer",
+                "--exclude-dag-ids",
+                "excluded",
+            ]
+        )
+        db_command.cleanup_tables(args)
+        run_cleanup_mock.assert_called_once_with(
+            table_names=["asset_event"],
+            asset_ids=[1, 2],
+            dag_ids=["producer"],
+            exclude_dag_ids=["excluded"],
+            clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
+            dry_run=False,
+            verbose=False,
+            confirm=True,
+            skip_archive=False,
+            batch_size=None,
+            error_on_cleanup_failure=False,
+        )
+
+    @pytest.mark.parametrize("asset_ids", ["", " ", ",", "1,", ",1", "1,,2", "0", "-1", "1.5", "abc", "1, 0"])
+    @patch("airflow.cli.commands.db_command.run_cleanup", autospec=True)
+    def test_invalid_asset_ids(self, run_cleanup_mock, asset_ids, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            db_command.cleanup_tables(
+                self.parser.parse_args(
+                    [
+                        "db",
+                        "clean",
+                        "--clean-before-timestamp",
+                        "2021-01-01",
+                        "--tables",
+                        "asset_event",
+                        f"--asset-ids={asset_ids}",
+                    ]
+                )
+            )
+        assert exc_info.value.code == 2
+        assert "argument --asset-ids: invalid positive int value:" in capsys.readouterr().err
+        run_cleanup_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tables",
+        [[], ["--tables", "log"], ["--tables", "asset_event,log"], ["--tables", "asset_event,invalid"]],
+    )
+    @patch("airflow.utils.db_cleanup.reflect_tables", autospec=True)
+    @patch("airflow.utils.db_cleanup._cleanup_table", autospec=True)
+    @patch("airflow.utils.db_cleanup._confirm_delete", autospec=True)
+    def test_asset_ids_require_only_asset_event(self, confirm_mock, cleanup_mock, reflect_mock, tables):
+        args = self.parser.parse_args(
+            ["db", "clean", "--clean-before-timestamp", "2021-01-01", "--asset-ids", "1,2", *tables]
+        )
+        with pytest.raises(
+            SystemExit, match="--asset-ids requires explicitly selecting only --tables asset_event"
+        ):
+            db_command.cleanup_tables(args)
+        confirm_mock.assert_not_called()
+        cleanup_mock.assert_not_called()
+        reflect_mock.assert_not_called()
 
     @pytest.mark.parametrize(
         ("extra_args", "expected"), [(["--exclude-dag-ids", "dag1, dag2"], ["dag1", "dag2"]), ([], None)]
@@ -989,11 +1218,44 @@ class TestCLIDBClean:
             dry_run=False,
             dag_ids=None,
             exclude_dag_ids=expected,
+            asset_ids=None,
             clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
             verbose=False,
             confirm=True,
             skip_archive=False,
             batch_size=None,
+            error_on_cleanup_failure=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("extra_args", "expected"), [(["--error-on-cleanup-failure"], True), ([], False)]
+    )
+    @patch("airflow.cli.commands.db_command.run_cleanup")
+    def test_error_on_cleanup_failure(self, run_cleanup_mock, extra_args, expected):
+        """When --error-on-cleanup-failure is passed, error_on_cleanup_failure should be True."""
+        args = self.parser.parse_args(
+            [
+                "db",
+                "clean",
+                "--clean-before-timestamp",
+                "2021-01-01",
+                *extra_args,
+            ]
+        )
+        db_command.cleanup_tables(args)
+
+        run_cleanup_mock.assert_called_once_with(
+            table_names=None,
+            dry_run=False,
+            dag_ids=None,
+            exclude_dag_ids=None,
+            asset_ids=None,
+            clean_before_timestamp=pendulum.parse("2021-01-01 00:00:00Z"),
+            verbose=False,
+            confirm=True,
+            skip_archive=False,
+            batch_size=None,
+            error_on_cleanup_failure=expected,
         )
 
     @patch("airflow.cli.commands.db_command.export_archived_records")

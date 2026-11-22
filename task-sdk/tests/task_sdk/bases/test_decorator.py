@@ -68,6 +68,18 @@ class TestBaseDecorator:
         ast.parse(cleaned)
         assert cleaned.lstrip().splitlines()[0].startswith("def a_task")
 
+    def test_docstring_used_as_doc_md_is_dedented(self):
+        @task
+        def my_task():
+            """Summary line.
+
+            Body line indented under the function.
+            """
+
+        op = my_task().operator
+
+        assert op.doc_md == "Summary line.\n\nBody line indented under the function."
+
 
 class DummyDecoratedOperator(DecoratedOperator):
     custom_operator_name = "@task.dummy"
@@ -189,6 +201,36 @@ class TestDefaultFillingLogic:
         with pytest.raises(TypeError):
             make_op(dummy_task)
 
+    def test_bind_validation_hints_for_accidental_task_decorator_call(self):
+        @task
+        def sleep():
+            sleep(3600)
+
+        with pytest.raises(
+            TypeError,
+            match="too many positional arguments.*@task-decorated function shadows another callable",
+        ):
+            sleep.function()
+
+    def test_bind_validation_plain_arity_error_has_no_accidental_call_hint(self):
+        @task
+        def dummy_task(required_arg):
+            return required_arg
+
+        with pytest.raises(TypeError) as ctx:
+            dummy_task(1, 2)
+
+        assert "@task-decorated function shadows another callable" not in str(ctx.value)
+
+    def test_bind_validation_missing_required_args_has_no_accidental_call_hint(self):
+        def dummy_task(required_arg):
+            return required_arg
+
+        with pytest.raises(TypeError) as ctx:
+            make_op(dummy_task)
+
+        assert "@task-decorated function shadows another callable" not in str(ctx.value)
+
     def test_variadic_and_keyword_only_params_are_not_assigned_defaults(self):
         """Construction succeeds when variadic and keyword-only params are present."""
 
@@ -196,6 +238,39 @@ class TestDefaultFillingLogic:
             return a, b, args, kw_required, kwargs
 
         assert make_op(dummy_task, op_kwargs={"a": 1, "kw_required": "x"}) is not None
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            pytest.param(
+                {"task_id": "fetch_{}".format},
+                "Expected 'task_id' to be .*, got builtin_function_or_method",
+                id="task_id_bound_method",
+            ),
+            pytest.param(
+                {"retries": "three"},
+                "Expected 'retries' to be .*, got str",
+                id="retries_string",
+            ),
+            pytest.param(
+                {"queue": 42},
+                "Expected 'queue' to be .*, got int",
+                id="queue_int",
+            ),
+            pytest.param(
+                {"priority_weight": 1.5},
+                "Expected 'priority_weight' to be .*, got float",
+                id="priority_weight_float",
+            ),
+        ],
+    )
+    def test_wrong_arg_type_raises_type_error_at_decoration_time(self, kwargs, match):
+        """Non-matching types for operator kwargs raise TypeError at decoration time."""
+        with pytest.raises(TypeError, match=match):
+
+            @task(**kwargs)
+            def my_task():
+                return 1
 
 
 def make_op(func, op_args=None, op_kwargs=None, **kwargs):

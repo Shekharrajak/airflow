@@ -16,153 +16,33 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { test, expect } from "@playwright/test";
-import { testConfig, AUTH_FILE } from "playwright.config";
-import { DagsPage } from "tests/e2e/pages/DagsPage";
+import { expect, test } from "tests/e2e/fixtures";
 
 test.describe("Dag Tasks Tab", () => {
-  const testDagId = testConfig.testDag.id;
-
-  test.beforeAll(async ({ browser }) => {
-    test.setTimeout(7 * 60 * 1000);
-
-    const context = await browser.newContext({ storageState: AUTH_FILE });
-    const page = await context.newPage();
-    const dagPage = new DagsPage(page);
-
-    const dagRunId = await dagPage.triggerDag(testDagId);
-
-    await dagPage.verifyDagRunStatus(testDagId, dagRunId);
-
-    await context.close();
-  });
-  test("verify tasks tab displays task list", async ({ page }) => {
-    const dagPage = new DagsPage(page);
-
-    await dagPage.navigateToDagTasks(testDagId);
+  test("verify tasks tab displays task list", async ({ dagsPage, page, successDagRun }) => {
+    await dagsPage.navigateToDagTasks(successDagRun.dagId);
 
     await expect(page).toHaveURL(/\/tasks$/);
-    await expect(dagPage.taskRows.first()).toBeVisible();
+    await expect(dagsPage.taskRows.first()).toBeVisible();
 
-    const firstRow = dagPage.taskRows.first();
+    const firstRow = dagsPage.taskRows.first();
 
     await expect(firstRow.getByRole("link").first()).toBeVisible();
     await expect(firstRow).toContainText("BashOperator");
     await expect(firstRow).toContainText("all_success");
   });
 
-  test("verify search tasks by name", async ({ page }) => {
-    const dagPage = new DagsPage(page);
+  test("verify click task to show details", async ({ dagsPage, page, successDagRun }) => {
+    await dagsPage.navigateToDagTasks(successDagRun.dagId);
 
-    await dagPage.navigateToDagTasks(testDagId);
-
-    const firstTaskLink = dagPage.taskRows.first().getByRole("link").first();
-    const taskName = await firstTaskLink.textContent();
-
-    if (taskName === null) {
-      throw new Error("Task name not found");
-    }
-
-    await dagPage.searchBox.fill(taskName);
-
-    await expect.poll(() => dagPage.taskRows.count(), { timeout: 20_000 }).toBe(1);
-    await expect(dagPage.taskRows).toContainText(taskName);
-  });
-
-  test("verify filter tasks by operator dropdown", async ({ page }) => {
-    const dagPage = new DagsPage(page);
-
-    await dagPage.navigateToDagTasks(testDagId);
-
-    const operators = await dagPage.getFilterOptions(dagPage.operatorFilter);
-
-    expect(operators.length).toBeGreaterThan(0);
-
-    for (const operator of operators) {
-      await dagPage.filterByOperator(operator);
-
-      await expect
-        .poll(
-          async () => {
-            const count = await dagPage.taskRows.count();
-
-            if (count === 0) return false;
-            for (let i = 0; i < count; i++) {
-              const text = await dagPage.taskRows.nth(i).textContent();
-
-              if (!text?.includes(operator)) return false;
-            }
-
-            return true;
-          },
-          { timeout: 20_000 },
-        )
-        .toBeTruthy();
-
-      await dagPage.navigateToDagTasks(testDagId);
-    }
-  });
-
-  test("verify filter tasks by trigger rule dropdown", async ({ page }) => {
-    const dagPage = new DagsPage(page);
-
-    await dagPage.navigateToDagTasks(testDagId);
-
-    const rules = await dagPage.getFilterOptions(dagPage.triggerRuleFilter);
-
-    expect(rules.length).toBeGreaterThan(0);
-
-    for (const rule of rules) {
-      await dagPage.filterByTriggerRule(rule);
-
-      await expect
-        .poll(
-          async () => {
-            const count = await dagPage.taskRows.count();
-
-            if (count === 0) return false;
-            for (let i = 0; i < count; i++) {
-              const text = await dagPage.taskRows.nth(i).textContent();
-
-              if (!text?.includes(rule)) return false;
-            }
-
-            return true;
-          },
-          { timeout: 20_000 },
-        )
-        .toBeTruthy();
-
-      await dagPage.navigateToDagTasks(testDagId);
-    }
-  });
-
-  test("verify filter by retries", async ({ page }) => {
-    const dagPage = new DagsPage(page);
-
-    await dagPage.navigateToDagTasks(testDagId);
-
-    const retriesOptions = await dagPage.getFilterOptions(dagPage.retriesFilter);
-
-    if (retriesOptions.length === 0) {
-      return;
-    }
-
-    for (const retries of retriesOptions) {
-      await dagPage.filterByRetries(retries);
-      await expect(dagPage.taskRows.first()).toBeVisible();
-      await dagPage.navigateToDagTasks(testDagId);
-    }
-  });
-  test("verify click task to show details", async ({ page }) => {
-    const dagPage = new DagsPage(page);
-
-    await dagPage.navigateToDagTasks(testDagId);
-
-    const firstCard = dagPage.taskRows.first();
+    const firstCard = dagsPage.taskRows.first();
     const taskLink = firstCard.getByRole("link").first();
 
-    await taskLink.click();
-    await expect(page).toHaveURL(new RegExp(`/dags/${testDagId}/tasks/.*`));
+    await expect(taskLink).toBeVisible({ timeout: 30_000 });
+
+    await expect(async () => {
+      await taskLink.click();
+      await expect(page).toHaveURL(new RegExp(`/dags/${successDagRun.dagId}/tasks/.+`), { timeout: 5000 });
+    }).toPass({ intervals: [1000, 2000], timeout: 30_000 });
   });
 });

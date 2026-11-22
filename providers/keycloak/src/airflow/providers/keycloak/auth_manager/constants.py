@@ -19,9 +19,23 @@
 from __future__ import annotations
 
 CONF_SECTION_NAME = "keycloak_auth_manager"
+CONF_CACHE_TTL_SECONDS_KEY = "cache_ttl_seconds"
+CONF_CACHE_TIMEOUT_SECONDS_KEY = "cache_timeout_seconds"
 CONF_CLIENT_ID_KEY = "client_id"
 CONF_CLIENT_SECRET_KEY = "client_secret"
 CONF_REALM_KEY = "realm"
 CONF_SERVER_URL_KEY = "server_url"
 CONF_REQUESTS_POOL_SIZE_KEY = "requests_pool_size"
 CONF_REQUESTS_RETRIES_KEY = "requests_retries"
+# Comma-separated allow-list of federated Keycloak client ids (azp claim) permitted
+# to use the jwt-bearer grant. Empty/unset denies all callers.
+CONF_JWT_FEDERATED_CLIENT_IDS_KEY = "jwt_federated_client_ids"
+CONF_TEAM_LEVEL_AUTHORIZATION_KEY = "team_level_authorization"
+CONF_CLI_AUTHORIZATION_CODE_ENABLED_KEY = "cli_authorization_code_enabled"
+
+# Extra Cookie names
+COOKIE_NAME_ACCESS_TOKEN = "_access_token"
+COOKIE_NAME_ID_TOKEN = "_id_token"
+COOKIE_NAME_LOGIN_NEXT_URL = "_login_next_url"
+COOKIE_NAME_OAUTH_STATE = "_oauth_state"
+COOKIE_NAME_REFRESH_TOKEN = "_refresh_token"

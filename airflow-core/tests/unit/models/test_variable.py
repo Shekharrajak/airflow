@@ -28,7 +28,9 @@ from sqlalchemy import select
 
 from airflow.models import Variable, crypto, variable
 from airflow.sdk import SecretCache
+from airflow.secrets import BaseSecretsBackend
 from airflow.secrets.metastore import MetastoreBackend
+from airflow.utils.sqlalchemy import prohibit_commit
 
 from tests_common.test_utils import db
 from tests_common.test_utils.config import conf_vars
@@ -39,6 +41,53 @@ if TYPE_CHECKING:
     from airflow.models.team import Team
 
 pytestmark = pytest.mark.db_test
+
+
+class _TeamUnawareVariableBackend(BaseSecretsBackend):
+    """A custom backend whose ``get_variable`` override predates the ``team_name`` keyword."""
+
+    def __init__(self):
+        self.was_called = False
+
+    # The signature mismatch with the base class is the point of this fixture, so mypy's
+    # override check has to be waived here rather than fixed.
+    def get_variable(self, key: str) -> str | None:  # type: ignore[override]
+        self.was_called = True
+        return "secret_val"
+
+
+class _TeamAwareVariableBackend(BaseSecretsBackend):
+    """A custom backend whose ``get_variable`` override accepts ``team_name``."""
+
+    def __init__(self):
+        self.received_team_name: str | None = None
+
+    def get_variable(self, key: str, team_name: str | None = None) -> str | None:
+        self.received_team_name = team_name
+        return "secret_val"
+
+
+class _SessionUnawareMetastoreBackend(MetastoreBackend):
+    """A custom backend whose ``get_variable`` override predates the ``session`` keyword."""
+
+    # The signature mismatch with the base class is the point of this fixture, so mypy's
+    # override check has to be waived here rather than fixed.
+    def get_variable(self, key: str, team_name: str | None = None) -> str | None:  # type: ignore[override]
+        return "from_subclass"
+
+
+class _SessionAwareMetastoreBackend(MetastoreBackend):
+    """A custom backend whose ``get_variable`` override does accept ``session``."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_session: Session | None = None
+
+    def get_variable(
+        self, key: str, team_name: str | None = None, *, session: Session | None = None
+    ) -> str | None:
+        self.received_session = session
+        return "from_subclass"
 
 
 class TestVariable:
@@ -108,13 +157,13 @@ class TestVariable:
     @conf_vars({("core", "multi_team"): "True"})
     def test_get_variable_with_team(self, testing_team, session):
         Variable.set(key="key", value="value", team_name=testing_team.name, session=session)
-        result = Variable.get(key="key", team_name=testing_team.name)
+        result = Variable.get(key="key", team_name=testing_team.name, session=session)
         assert result == "value"
 
     @conf_vars({("core", "multi_team"): "True"})
     def test_get_global_variable_with_team(self, testing_team, session):
         Variable.set(key="key", value="value", session=session)
-        result = Variable.get(key="key", team_name=testing_team.name)
+        result = Variable.get(key="key", team_name=testing_team.name, session=session)
         assert result == "value"
 
     @conf_vars({("core", "multi_team"): "True"})
@@ -127,6 +176,11 @@ class TestVariable:
         Variable.set("tested_var_set_id", "Monday morning breakfast")
         assert Variable.get("tested_var_set_id") == "Monday morning breakfast"
 
+    def test_set_val_rejects_non_string_with_clear_error(self):
+        var = Variable(key="a_key")
+        with pytest.raises(TypeError, match="Variable value must be a string, got list"):
+            var.val = ["a", "b"]
+
     def test_variable_set_with_env_variable(self, caplog, session):
         caplog.set_level(logging.WARNING, logger=variable.log.name)
         Variable.set(key="key", value="db-value", session=session)
@@ -138,7 +192,7 @@ class TestVariable:
         # invalidate the cache to re-evaluate value
         SecretCache.invalidate_variable("key")
         # now that env var is not here anymore, we see the value we set before.
-        assert Variable.get("key") == "new-db-value"
+        assert Variable.get("key", session=session) == "new-db-value"
 
         assert caplog.messages[0] == (
             "The variable key is defined in the EnvironmentVariablesBackend secrets backend, "
@@ -187,6 +241,137 @@ class TestVariable:
         )
         Variable.delete(key="key", session=session)
 
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_write_conflict_check_forwards_team_name(self, mock_ensure_secrets):
+        """The check must resolve against the scope being written, not the global one."""
+        backend = _TeamAwareVariableBackend()
+        mock_ensure_secrets.return_value = [backend, MetastoreBackend()]
+
+        Variable.check_for_write_conflict(key="key", team_name="team_a")
+
+        assert backend.received_team_name == "team_a"
+
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_write_conflict_check_tolerates_team_unaware_backend(self, mock_ensure_secrets):
+        """A backend whose override predates ``team_name`` must still be consulted, not error out."""
+        backend = _TeamUnawareVariableBackend()
+        mock_ensure_secrets.return_value = [backend, MetastoreBackend()]
+
+        Variable.check_for_write_conflict(key="key", team_name="team_a")
+
+        assert backend.was_called
+
+    @conf_vars({("core", "multi_team"): "True"})
+    @mock.patch.object(Variable, "check_for_write_conflict")
+    def test_set_forwards_team_name_to_write_conflict_check(self, mock_check, testing_team, session):
+        Variable.set(key="key", value="db-value", team_name=testing_team.name, session=session)
+
+        assert mock_check.call_args.kwargs["team_name"] == testing_team.name
+
+    @conf_vars({("core", "multi_team"): "True"})
+    @mock.patch.object(Variable, "check_for_write_conflict")
+    def test_update_forwards_team_name_to_write_conflict_check(self, mock_check, testing_team, session):
+        Variable.set(key="key", value="db-value", team_name=testing_team.name, session=session)
+        SecretCache.invalidate_variable("key")
+
+        Variable.update(key="key", value="new-value", team_name=testing_team.name, session=session)
+
+        assert mock_check.call_args.kwargs["team_name"] == testing_team.name
+
+    @mock.patch.object(MetastoreBackend, "get_variable", autospec=True)
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_get_forwards_session_to_metastore_backend(self, mock_ensure_secrets, mock_get_variable, session):
+        mock_get_variable.return_value = "from_db"
+        mock_ensure_secrets.return_value = [MetastoreBackend()]
+
+        assert Variable.get("some_key", session=session) == "from_db"
+        assert mock_get_variable.call_args.kwargs["session"] is session
+
+    @mock.patch.object(MetastoreBackend, "get_variable", autospec=True)
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_get_without_session_omits_session_kwarg(self, mock_ensure_secrets, mock_get_variable):
+        mock_get_variable.return_value = "from_db"
+        mock_ensure_secrets.return_value = [MetastoreBackend()]
+
+        assert Variable.get("some_key") == "from_db"
+        assert "session" not in mock_get_variable.call_args.kwargs
+
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_get_does_not_forward_session_to_other_backends(self, mock_ensure_secrets, session):
+        """Only the metastore backend reads the metadata database, so only it accepts a session."""
+        mock_backend = mock.Mock()
+        mock_backend.get_variable.return_value = "from_backend"
+        mock_backend.__class__.__name__ = "MockSecretsBackend"
+        mock_ensure_secrets.return_value = [mock_backend]
+
+        assert Variable.get("some_key", session=session) == "from_backend"
+        assert "session" not in mock_backend.get_variable.call_args.kwargs
+
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_get_omits_session_for_session_unaware_metastore_subclass(self, mock_ensure_secrets, session):
+        """Forwarding a session to an override that predates it would read as a missing Variable."""
+        mock_ensure_secrets.return_value = [_SessionUnawareMetastoreBackend()]
+
+        assert Variable.get("some_key", session=session) == "from_subclass"
+
+    @mock.patch("airflow.models.variable.ensure_secrets_loaded")
+    def test_get_forwards_session_to_session_aware_metastore_subclass(self, mock_ensure_secrets, session):
+        """A subclass that does accept a session still receives it, so it reuses the transaction."""
+        backend = _SessionAwareMetastoreBackend()
+        mock_ensure_secrets.return_value = [backend]
+
+        assert Variable.get("some_key", session=session) == "from_subclass"
+        assert backend.received_session is session
+
+    def test_get_with_session_does_not_commit_under_prohibit_commit(self, session):
+        """
+        A caller holding an open transaction can read a Variable without its session being committed.
+
+        Without the session being forwarded, ``MetastoreBackend.get_variable``'s ``provide_session``
+        takes the same scoped session and commits it, which the guard rejects.
+        """
+        Variable.set(key="interval_key", value="60", session=session)
+        session.commit()
+        SecretCache.invalidate_variable("interval_key")
+
+        with prohibit_commit(session):
+            assert Variable.get("interval_key", session=session) == "60"
+
+    def test_update_with_session_does_not_commit_under_prohibit_commit(self, session):
+        """``update`` verifies existence through the secrets chain, which must reuse the session too."""
+        Variable.set(key="interval_key", value="60", session=session)
+        session.commit()
+        SecretCache.invalidate_variable("interval_key")
+
+        with prohibit_commit(session):
+            Variable.update(key="interval_key", value="120", session=session)
+
+    def test_setdefault_with_session_does_not_commit_under_prohibit_commit(self, session):
+        """``setdefault`` reads through the secrets chain before deciding whether to write."""
+        Variable.set(key="interval_key", value="60", session=session)
+        session.commit()
+        SecretCache.invalidate_variable("interval_key")
+
+        with prohibit_commit(session):
+            assert Variable.setdefault("interval_key", "120", session=session) == "60"
+
+    def test_setdefault_writes_default_with_session_under_prohibit_commit(self, session):
+        """The write half must reuse the session too, so the miss path stays inside the transaction."""
+        with prohibit_commit(session):
+            assert Variable.setdefault("absent_key", "30", session=session) == "30"
+        session.commit()
+
+        assert Variable.get("absent_key", session=session) == "30"
+
+    def test_get_rejects_session_in_execution_context(self):
+        """Reads from an execution context go via the Execution API, where a session is meaningless."""
+        task_runner = mock.Mock(SUPERVISOR_COMMS=mock.Mock())
+        with (
+            mock.patch.dict("sys.modules", {"airflow.sdk.execution_time.task_runner": task_runner}),
+            pytest.raises(ValueError, match="cannot use a metadata database session"),
+        ):
+            Variable.get("some_key", session=mock.Mock())
+
     def test_variable_set_get_round_trip_json(self):
         value = {"a": 17, "b": 47}
         Variable.set(key="tested_var_set_id", value=value, serialize_json=True)
@@ -194,9 +379,9 @@ class TestVariable:
 
     def test_variable_update(self, session):
         Variable.set(key="test_key", value="value1", session=session)
-        assert Variable.get(key="test_key") == "value1"
+        assert Variable.get(key="test_key", session=session) == "value1"
         Variable.update(key="test_key", value="value2", session=session)
-        assert Variable.get("test_key") == "value2"
+        assert Variable.get("test_key", session=session) == "value2"
 
     def test_variable_update_fails_on_non_metastore_variable(self, session):
         with mock.patch.dict("os.environ", AIRFLOW_VAR_KEY="env-value"):
@@ -205,7 +390,7 @@ class TestVariable:
 
     def test_variable_update_preserves_description(self, session):
         Variable.set(key="key", value="value", description="a test variable", session=session)
-        assert Variable.get("key") == "value"
+        assert Variable.get("key", session=session) == "value"
         Variable.update("key", "value2")
         test_var = session.scalar(select(Variable).where(Variable.key == "key"))
         assert test_var.val == "value2"
@@ -215,13 +400,13 @@ class TestVariable:
     def test_variable_update_with_team(self, testing_team, session):
         Variable.set(key="test_key", value="value1", team_name=testing_team.name, session=session)
         Variable.update(key="test_key", value="value2", team_name=testing_team.name, session=session)
-        assert Variable.get("test_key", team_name=testing_team.name) == "value2"
+        assert Variable.get("test_key", team_name=testing_team.name, session=session) == "value2"
 
     @conf_vars({("core", "multi_team"): "True"})
     def test_variable_update_with_team_global(self, testing_team, session):
         Variable.set(key="test_key", value="value1", session=session)
         Variable.update(key="test_key", value="value2", team_name=testing_team.name, session=session)
-        assert Variable.get("test_key", team_name=testing_team.name) == "value2"
+        assert Variable.get("test_key", team_name=testing_team.name, session=session) == "value2"
 
     @conf_vars({("core", "multi_team"): "True"})
     def test_variable_update_with_wrong_team(self, testing_team, session):
@@ -251,7 +436,7 @@ class TestVariable:
         test_key = "test_key"
         Variable.set(key=test_key, value=test_value, session=session)
         Variable.set(key=test_key, value="", session=session)
-        assert Variable.get("test_key") == ""
+        assert Variable.get("test_key", session=session) == ""
 
     def test_get_non_existing_var_should_return_default(self):
         default_value = "some default val"
@@ -306,12 +491,12 @@ class TestVariable:
 
         # Set the variable
         Variable.set(key=key, value=value, session=session)
-        assert value == Variable.get(key)
+        assert value == Variable.get(key, session=session)
 
         # Delete the variable
         Variable.delete(key=key, session=session)
         with pytest.raises(KeyError):
-            Variable.get(key)
+            Variable.get(key, session=session)
 
     @conf_vars({("core", "multi_team"): "True"})
     def test_variable_delete_with_team(self, testing_team, session):
@@ -364,6 +549,14 @@ class TestVariable:
         finally:
             session.rollback()
 
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_variable_set_does_not_change_team_name_on_update(self, testing_team, session):
+        Variable.set(key="k", value="v1", session=session)
+
+        Variable.set(key="k", value="v2", team_name=testing_team.name, session=session)
+
+        assert Variable.get("k", session=session) == "v2"
+
     @mock.patch("airflow.models.variable.ensure_secrets_loaded")
     def test_caching_caches(self, mock_ensure_secrets: mock.Mock):
         mock_backend = mock.Mock()
@@ -388,7 +581,7 @@ class TestVariable:
         # setting a new value invalidates the cache
         Variable.set(key="key", value="new_value", session=session)
 
-        c = Variable.get("key")  # cache should not be used
+        c = Variable.get("key", session=session)  # cache should not be used
 
         assert c != b
 

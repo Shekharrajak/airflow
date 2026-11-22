@@ -16,37 +16,42 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { IconButton, useDisclosure } from "@chakra-ui/react";
+import { Button, type ButtonProps, useDisclosure } from "@chakra-ui/react";
 import { useTranslation } from "react-i18next";
 import { FiPlay } from "react-icons/fi";
 
 import type { AssetResponse } from "openapi/requests/types.gen";
-import { Tooltip } from "src/components/ui";
+
+import { IconButton } from "src/system-components";
 
 import { CreateAssetEventModal } from "./CreateAssetEventModal";
 
 type Props = {
   readonly asset?: AssetResponse;
-};
+  readonly withText?: boolean;
+} & ButtonProps;
 
-export const CreateAssetEvent = ({ asset }: Props) => {
+export const CreateAssetEvent = ({ asset, withText = false, ...rest }: Props) => {
   const { onClose, onOpen, open } = useDisclosure();
   const { t: translate } = useTranslation("assets");
 
   return (
     <>
-      <Tooltip content={translate("createEvent.button")}>
+      {withText ? (
+        <Button {...rest} disabled={asset === undefined} onClick={onOpen}>
+          <FiPlay />
+          {translate("createEvent.button")}
+        </Button>
+      ) : (
         <IconButton
-          aria-label={translate("createEvent.button")}
-          colorPalette="brand"
+          {...rest}
           disabled={asset === undefined}
+          label={translate("createEvent.button")}
           onClick={onOpen}
-          size="md"
-          variant="ghost"
         >
           <FiPlay />
         </IconButton>
-      </Tooltip>
+      )}
 
       {asset === undefined || !open ? undefined : (
         <CreateAssetEventModal asset={asset} onClose={onClose} open={open} />

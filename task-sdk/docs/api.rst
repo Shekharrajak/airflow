@@ -67,11 +67,14 @@ Task Decorators:
 
 .. autoapifunction:: airflow.sdk.task_group
 
+.. autoapifunction:: airflow.sdk.task_handler
+
 .. autoapifunction:: airflow.sdk.setup
 
 .. autoapifunction:: airflow.sdk.teardown
 
 .. autofunction:: airflow.sdk.task
+.. autofunction:: airflow.sdk.result
 .. autofunction:: airflow.sdk.setup
 .. autofunction:: airflow.sdk.teardown
 .. autofunction:: airflow.sdk.asset
@@ -93,11 +96,17 @@ Bases
 
 .. autoapiclass:: airflow.sdk.BaseXCom
 
+.. autoapiclass:: airflow.sdk.bases.xcom.XComCoordinate
+
 .. autoapiclass:: airflow.sdk.BranchMixIn
 
 .. autoapiclass:: airflow.sdk.PokeReturnValue
 
 .. autoapiclass:: airflow.sdk.SkipMixin
+
+.. autoclass:: airflow.sdk.ResumableJobMixin
+
+.. autoclass:: airflow.sdk.ResumeDecision
 
 .. autoapiclass:: airflow.sdk.BaseHook
 
@@ -107,11 +116,19 @@ Callbacks
 
 .. autoclass:: airflow.sdk.SyncCallback
 
+.. autoclass:: airflow.sdk.CallbackSource
+
+.. autoclass:: airflow.sdk.CallbackMeta
+
 Deadline Alerts
 ---------------
 .. autoclass:: airflow.sdk.DeadlineAlert
 
 .. autoclass:: airflow.sdk.DeadlineReference
+
+.. autoclass:: airflow.sdk.BaseDeadlineReference
+
+.. autofunction:: airflow.sdk.deadline_reference
 
 Connections & Variables
 -----------------------
@@ -122,6 +139,8 @@ Connections & Variables
 Tasks & Operators
 -----------------
 .. autoapiclass:: airflow.sdk.TaskGroup
+
+.. autoapiclass:: airflow.sdk.LoopDecision
 
 .. autoclass:: airflow.sdk.TaskInstance
 
@@ -138,6 +157,34 @@ Tasks & Operators
 .. autoapifunction:: airflow.sdk.get_current_context
 
 .. autoapifunction:: airflow.sdk.get_parsing_context
+
+Retry Policies
+--------------
+Retry policies let you configure per-exception retry behaviour as a parameter on any
+task or operator without modifying task code. See the Retry Policies section of the
+Tasks page in the core docs for usage and design rationale.
+
+.. autoapiclass:: airflow.sdk.RetryPolicy
+
+.. autoapiclass:: airflow.sdk.ExceptionRetryPolicy
+
+.. autoapiclass:: airflow.sdk.ChainRetryPolicy
+
+.. autoapiclass:: airflow.sdk.RetryRule
+
+.. autoapiclass:: airflow.sdk.RetryDecision
+
+.. autoclass:: airflow.sdk.RetryAction
+
+Clearing Tasks in Other Dags
+----------------------------
+An operator can name a task in another Dag to clear, with everything downstream of it, whenever the
+operator's task is cleared with its downstream tasks. A target known when the Dag is parsed goes in an
+``external_clear_target`` property, and is stored with the Dag version. A target that depends on the run
+comes from ``get_external_clear_target(context)``, which the task runner calls after a successful run.
+``ExternalTaskMarker`` in the standard provider does both.
+
+.. autoapiclass:: airflow.sdk.ExternalClearTarget
 
 State Enums
 -----------
@@ -165,6 +212,8 @@ Assets
 ------
 .. autoapiclass:: airflow.sdk.Asset
 
+.. autoapiclass:: airflow.sdk.AssetAccessControl
+
 .. autoapiclass:: airflow.sdk.AssetAlias
 
 .. autoapiclass:: airflow.sdk.AssetAll
@@ -177,7 +226,11 @@ Assets
 
 Timetables
 ----------
+.. autoapiclass:: airflow.sdk.AssetAndTimeSchedule
+
 .. autoapiclass:: airflow.sdk.AssetOrTimeSchedule
+
+.. autoapiclass:: airflow.sdk.AssetTriggeredTimetable
 
 .. autoapiclass:: airflow.sdk.CronDataIntervalTimetable
 
@@ -193,6 +246,8 @@ Timetables
 
 .. autoapiclass:: airflow.sdk.MultipleCronTriggerTimetable
 
+.. autoapiclass:: airflow.sdk.PartitionedAtRuntime
+
 .. autoapiclass:: airflow.sdk.PartitionedAssetTimetable
 
 
@@ -205,21 +260,50 @@ Partition Mapper
 
 .. autoapiclass:: airflow.sdk.IdentityMapper
 
-.. autoapiclass:: airflow.sdk.ToHourlyMapper
+.. autoapiclass:: airflow.sdk.StartOfHourMapper
 
-.. autoapiclass:: airflow.sdk.ToDailyMapper
+.. autoapiclass:: airflow.sdk.StartOfDayMapper
 
-.. autoapiclass:: airflow.sdk.ToWeeklyMapper
+.. autoapiclass:: airflow.sdk.StartOfWeekMapper
 
-.. autoapiclass:: airflow.sdk.ToMonthlyMapper
+.. autoapiclass:: airflow.sdk.StartOfMonthMapper
 
-.. autoapiclass:: airflow.sdk.ToQuarterlyMapper
+.. autoapiclass:: airflow.sdk.StartOfQuarterMapper
 
-.. autoapiclass:: airflow.sdk.ToYearlyMapper
+.. autoapiclass:: airflow.sdk.StartOfYearMapper
+
+.. autoapiclass:: airflow.sdk.RollupMapper
+
+.. autoapiclass:: airflow.sdk.WaitForAll
+
+.. autoapiclass:: airflow.sdk.MinimumCount
 
 .. autoapiclass:: airflow.sdk.ProductMapper
 
 .. autoapiclass:: airflow.sdk.AllowedKeyMapper
+
+.. autoapiclass:: airflow.sdk.FanOutMapper
+
+.. autoapiclass:: airflow.sdk.FixedKeyMapper
+
+Rollup Windows
+~~~~~~~~~~~~~~
+
+.. autoapiclass:: airflow.sdk.Window
+
+.. autoapiclass:: airflow.sdk.HourWindow
+
+.. autoapiclass:: airflow.sdk.DayWindow
+
+.. autoapiclass:: airflow.sdk.WeekWindow
+
+.. autoapiclass:: airflow.sdk.MonthWindow
+
+.. autoapiclass:: airflow.sdk.QuarterWindow
+
+.. autoapiclass:: airflow.sdk.YearWindow
+
+.. autoapiclass:: airflow.sdk.SegmentWindow
 
 I/O Helpers
 -----------
@@ -231,6 +315,59 @@ The ``lineage`` module is available as part of the Task SDK. It provides the pub
 collector interfaces used to capture and retrieve asset lineage metadata during task execution.
 
 .. autoapimodule:: airflow.sdk.lineage
+
+Coordinators
+------------
+
+Coordinators bridge the Airflow worker and a non-Python language runtime.
+See :doc:`apache-airflow:authoring-and-scheduling/language-sdks/index` for a conceptual overview.
+
+.. rubric:: JVM
+
+.. autoapiclass:: airflow.sdk.coordinators.java.JavaCoordinator
+
+.. rubric:: Native executable (e.g. Go)
+
+.. autoapiclass:: airflow.sdk.coordinators.executable.ExecutableCoordinator
+
+.. rubric:: Node.js (TypeScript)
+
+.. autoapiclass:: airflow.sdk.coordinators.node.NodeCoordinator
+
+Dag Importers
+-------------
+
+|experimental|
+
+Dag importers turn the contents of a Dag bundle into Dags. This interface may still change in a minor
+release while it is being stabilized. See :doc:`apache-airflow:administration-and-deployment/dag-importers` for how
+importers are configured and how to write one.
+
+.. autoapiclass:: airflow.sdk.importers.AbstractDagImporter
+
+.. autoapiclass:: airflow.sdk.importers.DagDefinition
+
+.. autoapiclass:: airflow.sdk.importers.FileDagDefinition
+
+.. autoapiclass:: airflow.sdk.importers.FilesystemDagDefinition
+
+.. autoapiclass:: airflow.sdk.importers.DagImportResult
+
+.. autoapiclass:: airflow.sdk.importers.DagImportError
+
+.. autoapiclass:: airflow.sdk.importers.DagImportWarning
+
+.. autoapiclass:: airflow.sdk.importers.DagSourceCode
+
+.. autoapifunction:: airflow.sdk.importers.find_file_dag_definitions
+
+.. autoapifunction:: airflow.sdk.importers.get_file_suffix
+
+.. rubric:: Built-in importers
+
+.. autoapiclass:: airflow.sdk.importers.PythonDagImporter
+
+.. autoapiclass:: airflow.sdk.importers.ZipImporter
 
 Execution Time Components
 -------------------------
@@ -244,6 +381,10 @@ It corresponds to the same context that is exposed to Jinja templates during tas
 For a complete list of available context variables (such as ``dag_run``,
 ``task_instance``, ``logical_date``, etc.), see the
 :ref:`Templates reference <templates-ref>`.
+
+.. rubric:: Task State
+
+.. autodata:: airflow.sdk.NEVER_EXPIRE
 
 .. rubric:: Logging
 
@@ -259,7 +400,7 @@ Everything else
 .. autoapimodule:: airflow.sdk
   :members:
   :special-members: __version__
-  :exclude-members: BaseAsyncOperator, BaseOperator, DAG, dag, asset, Asset, AssetAlias, AssetAll, AssetAny, AssetWatcher, TaskGroup, TaskInstance, XComArg, get_current_context, get_parsing_context
+  :exclude-members: BaseAsyncOperator, BaseOperator, DAG, dag, asset, Asset, AssetAccessControl, AssetAlias, AssetAll, AssetAny, AssetWatcher, TaskGroup, TaskInstance, XComArg, get_current_context, get_parsing_context
   :undoc-members:
   :imported-members:
   :no-index:

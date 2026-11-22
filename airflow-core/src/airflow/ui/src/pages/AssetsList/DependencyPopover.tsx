@@ -16,28 +16,61 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Button, Link } from "@chakra-ui/react";
+import { Button, HStack, Icon, VisuallyHidden } from "@chakra-ui/react";
 import { useTranslation } from "react-i18next";
-import { Link as RouterLink } from "react-router-dom";
+import { FiUsers } from "react-icons/fi";
 
 import type { DagScheduleAssetReference, TaskOutletAssetReference } from "openapi/requests/types.gen";
-import { Popover } from "src/components/ui";
+
+import { Popover, RouterLink, Tooltip } from "src/system-components";
+
+import { TeamName } from "src/components/TeamName";
+
+import { useShowTeam } from "src/hooks/useShowTeam";
+import { formatNumber } from "src/utils";
 
 type Props = {
   readonly dependencies: Array<DagScheduleAssetReference | TaskOutletAssetReference>;
   readonly type: "Dag" | "Task";
 };
 
-export const DependencyPopover = ({ dependencies, type }: Props) => {
+// Elsewhere a team sits under a "Team" column header or detail-row label; the popover has no such
+// heading, so the icon marks the link as a team rather than a second Dag link. ``FiUsers`` is the
+// same icon the teams filter uses.
+const IconTeamName = ({ teamName }: { readonly teamName?: string | null }) => {
   const { t: translate } = useTranslation("common");
+  const showTeam = useShowTeam(teamName);
+
+  if (!showTeam) {
+    return undefined;
+  }
+
+  return (
+    <Tooltip content={translate("dagDetails.team")}>
+      <HStack gap={1}>
+        <Icon color="fg.muted">
+          <FiUsers />
+        </Icon>
+        {/* The icon is the only cue that this link is a team rather than another Dag, and Chakra
+            hides icons from assistive tech, so the label is announced separately. */}
+        <VisuallyHidden>{translate("dagDetails.team")}</VisuallyHidden>
+        <TeamName teamName={teamName} />
+      </HStack>
+    </Tooltip>
+  );
+};
+
+export const DependencyPopover = ({ dependencies, type }: Props) => {
+  const { i18n, t: translate } = useTranslation();
   const dependencyKey = type.toLowerCase() as "dag" | "task";
 
   return (
     // eslint-disable-next-line jsx-a11y/no-autofocus
     <Popover.Root autoFocus={false} lazyMount unmountOnExit>
       <Popover.Trigger asChild disabled={dependencies.length === 0}>
-        <Button size="sm" variant="outline">
-          {dependencies.length} {translate(dependencyKey, { count: dependencies.length })}
+        <Button variant="outline">
+          {formatNumber(dependencies.length, i18n.language)}{" "}
+          {translate(dependencyKey, { count: dependencies.length })}
         </Button>
       </Popover.Trigger>
       <Popover.Content css={{ "--popover-bg": "colors.bg.emphasized" }} width="fit-content">
@@ -57,9 +90,10 @@ export const DependencyPopover = ({ dependencies, type }: Props) => {
             }
 
             return (
-              <Link asChild color="fg.info" display="block" key={key} py={2}>
+              <HStack gap={2} justifyContent="space-between" key={key} py={2}>
                 <RouterLink to={link}>{label}</RouterLink>
-              </Link>
+                <IconTeamName teamName={dependency.team_name} />
+              </HStack>
             );
           })}
         </Popover.Body>

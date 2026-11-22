@@ -28,7 +28,7 @@ from typing import Any
 from urllib.parse import quote, urlencode, urljoin
 
 import google.auth
-from aiohttp import ClientSession
+from aiohttp import ClientResponseError, ClientSession
 from gcloud.aio.auth import AioSession, Token
 from google.api_core.retry import exponential_sleep_generator
 from googleapiclient.discovery import Resource, build
@@ -133,8 +133,11 @@ class DataFusionHook(GoogleBaseHook):
                     namespace=namespace,
                 )
                 current_state = workflow["status"]
-            except KeyError:
-                pass  # Because the pipeline may not be visible in system yet
+            except (HTTPError, KeyError):
+                # A 404 is raised as HTTPError by _check_response_status_and_data, and a
+                # missing "status" key raises KeyError. Both mean the run is not visible
+                # in the system yet, so keep polling instead of failing the task.
+                pass
             if current_state in success_states:
                 return
             if current_state in failure_states:
@@ -179,7 +182,7 @@ class DataFusionHook(GoogleBaseHook):
         if not response:
             raise RequestException(
                 "Invalid / Empty response received. Please, check for possible root "
-                "causes of this behavior either in DAG code or on Cloud DataFusion side"
+                "causes of this behavior either in Dag code or on Cloud DataFusion side"
             )
         if response.status == 404:
             raise HTTPError(message)
@@ -190,7 +193,7 @@ class DataFusionHook(GoogleBaseHook):
         if response.data is None:
             raise ValueError(
                 "Empty response received. Please, check for possible root "
-                "causes of this behavior either in DAG code or on Cloud DataFusion side"
+                "causes of this behavior either in Dag code or on Cloud DataFusion side"
             )
 
     def get_conn(self) -> Resource:
@@ -202,6 +205,7 @@ class DataFusionHook(GoogleBaseHook):
                 self.api_version,
                 http=http_authorized,
                 cache_discovery=False,
+                client_options=self.get_client_options(),
             )
         return self._conn
 
@@ -610,6 +614,11 @@ class DataFusionAsyncHook(GoogleBaseAsyncHook):
                 try:
                     pipeline = await session_aio.get(url=url, headers=headers)
                     break
+                except ClientResponseError as exc:
+                    if exc.status == 404:
+                        await asyncio.sleep(time_to_wait)
+                    else:
+                        raise
                 except ValueError as exc:
                     if "404" in str(exc):
                         await asyncio.sleep(time_to_wait)

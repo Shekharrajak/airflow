@@ -114,7 +114,7 @@ There are multiple ways of running system tests. Each system test is a self-cont
 other Dag. Some tests may require access to external services, enabled APIs or specific permissions. Make sure to
 prepare your  environment correctly, depending on the system tests you want to run - some may require additional
 configuration which should be documented by the relevant providers in their subdirectory
-``tests/system/<provider_name>/README.md``.
+``providers/<provider_name>/tests/system/<provider_name>/README.md``.
 
 Running as Airflow Dags
 .......................
@@ -125,8 +125,8 @@ your Airflow instance as Dags and they will be automatically triggered. If the s
 how to set up the environment is documented in each provider's system tests directory. Make sure that all resource
 required by the tests are also imported.
 
-Running via Pytest + Breezee
-............................
+Running via Pytest + Breeze
+...........................
 
 Running system tests with pytest is the easiest with `Breeze <https://github.com/apache/airflow/blob/main/dev/breeze/doc/README.rst>`_.
 Breeze makes sure that the environment is pre-configured, and all additional required services are started,
@@ -177,7 +177,7 @@ Running manually via Pytest outside of the Airflow codebase
 
 2. Airflow API server
 
-  In case you want to run tests agasint an Airflow Executor, you will need to have the Airflow API server available.
+  In case you want to run tests against an Airflow Executor, you will need to have the Airflow API server available.
 
   NOTE: You have to make sure that the API server is sharing certain configuration as the test environment. This is
   particularly important so that the Airflow Task SDK may be able to communicate to the API Server.

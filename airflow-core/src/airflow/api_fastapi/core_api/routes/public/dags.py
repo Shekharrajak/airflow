@@ -23,14 +23,13 @@ from fastapi import Depends, HTTPException, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.orm import selectinload
 
 from airflow.api.common import delete_dag as delete_dag_module
+from airflow.api_fastapi.common.asset_expression import redact_asset_expression
 from airflow.api_fastapi.common.dagbag import DagBagDep, get_latest_version_of_dag
-from airflow.api_fastapi.common.db.common import (
-    SessionDep,
-    paginated_select,
-)
-from airflow.api_fastapi.common.db.dags import generate_dag_with_latest_run_query
+from airflow.api_fastapi.common.db.common import SessionDep, apply_filters_to_select, paginated_select
+from airflow.api_fastapi.common.db.dags import eager_load_teams, generate_dag_with_latest_run_query
 from airflow.api_fastapi.common.parameters import (
     FilterOptionEnum,
     FilterParam,
@@ -38,8 +37,11 @@ from airflow.api_fastapi.common.parameters import (
     QueryBundleNameFilter,
     QueryBundleVersionFilter,
     QueryDagDisplayNamePatternSearch,
+    QueryDagDisplayNamePrefixPatternSearch,
     QueryDagIdPatternSearch,
     QueryDagIdPatternSearchWithNone,
+    QueryDagIdPrefixPatternSearch,
+    QueryDagIdPrefixPatternSearchWithNone,
     QueryExcludeStaleFilter,
     QueryFavoriteFilter,
     QueryHasAssetScheduleFilter,
@@ -58,7 +60,13 @@ from airflow.api_fastapi.common.parameters import (
 )
 from airflow.api_fastapi.common.router import AirflowRouter
 from airflow.api_fastapi.compat import HTTP_422_UNPROCESSABLE_CONTENT
+from airflow.api_fastapi.core_api.datamodels.common import (
+    BulkBody,
+    BulkResponse,
+    validate_asset_expression,
+)
 from airflow.api_fastapi.core_api.datamodels.dags import (
+    BulkDAGBody,
     DAGCollectionResponse,
     DAGDetailsResponse,
     DAGPatchBody,
@@ -69,15 +77,20 @@ from airflow.api_fastapi.core_api.openapi.exceptions import create_openapi_http_
 from airflow.api_fastapi.core_api.security import (
     EditableDagsFilterDep,
     GetUserDep,
+    ReadableAssetsFilterDep,
     ReadableDagsFilterDep,
     requires_access_dag,
+    requires_access_dag_bulk,
 )
+from airflow.api_fastapi.core_api.services.public.dags import BulkDagService, get_scheduling_state
 from airflow.api_fastapi.logging.decorators import action_logging
 from airflow.exceptions import AirflowException, DagNotFound
 from airflow.models import DagModel
 from airflow.models.dag_favorite import DagFavorite
+from airflow.models.dag_version import DagVersion
 from airflow.models.dagrun import DagRun
-from airflow.utils.state import DagRunState
+from airflow.utils.sqlalchemy import with_row_locks
+from airflow.utils.state import DagRunState, DagSchedulingState
 
 dags_router = AirflowRouter(tags=["DAG"], prefix="/dags")
 
@@ -89,7 +102,9 @@ def get_dags(
     tags: QueryTagsFilter,
     owners: QueryOwnersFilter,
     dag_id_pattern: QueryDagIdPatternSearch,
+    dag_id_prefix_pattern: QueryDagIdPrefixPatternSearch,
     dag_display_name_pattern: QueryDagDisplayNamePatternSearch,
+    dag_display_name_prefix_pattern: QueryDagDisplayNamePrefixPatternSearch,
     exclude_stale: QueryExcludeStaleFilter,
     paused: QueryPausedFilter,
     has_import_errors: QueryHasImportErrorsFilter,
@@ -121,7 +136,7 @@ def get_dags(
         SortParam,
         Depends(
             SortParam(
-                ["dag_id", "dag_display_name", "next_dagrun", "state", "start_date"],
+                ["dag_id", "dag_display_name", "next_dagrun"],
                 DagModel,
                 {"last_run_state": DagRun.state, "last_run_start_date": DagRun.start_date},
             ).dynamic_depends()
@@ -134,8 +149,12 @@ def get_dags(
         FilterParam[list[str] | None],
         Depends(filter_param_factory(DagModel.timetable_type, list[str], FilterOptionEnum.IN)),
     ],
+    is_scheduled: Annotated[
+        bool | None,
+        Query(description="Filter Dags by whether their timetable can create scheduled runs."),
+    ] = None,
 ) -> DAGCollectionResponse:
-    """Get all DAGs."""
+    """Get all Dags."""
     query = generate_dag_with_latest_run_query(
         max_run_filters=[
             dag_run_start_date_range,
@@ -146,6 +165,12 @@ def get_dags(
         order_by=order_by,
         dag_ids=readable_dags_filter.value,
     )
+    if is_scheduled is not None:
+        unscheduled_timetable_types = ("NullTimetable", "PartitionedAtRuntime")
+        if is_scheduled:
+            query = query.where(DagModel.timetable_type.not_in(unscheduled_timetable_types))
+        else:
+            query = query.where(DagModel.timetable_type.in_(unscheduled_timetable_types))
 
     dags_select, total_entries = paginated_select(
         statement=query,
@@ -154,7 +179,9 @@ def get_dags(
             paused,
             has_import_errors,
             dag_id_pattern,
+            dag_id_prefix_pattern,
             dag_display_name_pattern,
+            dag_display_name_prefix_pattern,
             tags,
             is_favorite,
             owners,
@@ -174,7 +201,7 @@ def get_dags(
     dags = session.scalars(dags_select)
 
     return DAGCollectionResponse(
-        dags=dags,
+        dags=list(dags),
         total_entries=total_entries,
     )
 
@@ -195,7 +222,7 @@ def get_dag(
     session: SessionDep,
     dag_bag: DagBagDep,
 ) -> DAGResponse:
-    """Get basic information about a DAG."""
+    """Get basic information about a Dag."""
     dag = get_latest_version_of_dag(dag_bag, dag_id, session)
     dag_model = session.get(DagModel, dag_id)
     if not dag_model:
@@ -219,12 +246,16 @@ def get_dag(
     dependencies=[Depends(requires_access_dag(method="GET"))],
 )
 def get_dag_details(
-    dag_id: str, session: SessionDep, dag_bag: DagBagDep, user: GetUserDep
+    dag_id: str,
+    session: SessionDep,
+    dag_bag: DagBagDep,
+    user: GetUserDep,
+    readable_assets_filter: ReadableAssetsFilterDep,
 ) -> DAGDetailsResponse:
-    """Get details of DAG."""
+    """Get details of Dag."""
     dag = get_latest_version_of_dag(dag_bag, dag_id, session)
 
-    dag_model = session.get(DagModel, dag_id)
+    dag_model = session.scalar(select(DagModel).where(DagModel.dag_id == dag_id).options(*eager_load_teams()))
     if not dag_model:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unable to obtain dag with id {dag_id} from session")
 
@@ -232,7 +263,7 @@ def get_dag_details(
         if not key.startswith("_") and not hasattr(dag_model, key):
             setattr(dag_model, key, value)
 
-    # Check if this DAG is marked as favorite by the current user
+    # Check if this Dag is marked as favorite by the current user
     user_id = str(user.get_id())
     is_favorite = (
         session.scalar(
@@ -241,21 +272,45 @@ def get_dag_details(
         is not None
     )
 
-    # Count active (running + queued) DAG runs for this DAG
+    # Count only running Dag runs: this stat shows runs that are actually executing right now.
     active_runs_count = (
         session.scalar(
             select(func.count())
             .select_from(DagRun)
-            .where(DagRun.dag_id == dag_id, DagRun.state.in_([DagRunState.RUNNING, DagRunState.QUEUED]))
+            .where(DagRun.dag_id == dag_id, DagRun.state == DagRunState.RUNNING)
         )
         or 0
     )
 
-    # Add is_favorite and active_runs_count fields to the DAG model
+    latest_dag_version = DagVersion.get_latest_version(
+        dag_id, load_dag_model=True, load_bundle_model=True, session=session
+    )
+
+    # Add is_favorite, active_runs_count and latest_dag_version fields to the Dag model
     setattr(dag_model, "is_favorite", is_favorite)
     setattr(dag_model, "active_runs_count", active_runs_count)
+    setattr(dag_model, "latest_dag_version", latest_dag_version)
 
-    return DAGDetailsResponse.model_validate(dag_model)
+    details = DAGDetailsResponse.model_validate(dag_model)
+    # The redaction lands on the response, not on `dag_model`: that is a live ORM instance whose
+    # session commits when the request ends, so assigning the blanked leaves back onto it would
+    # persist them.
+    details.asset_expression = validate_asset_expression(
+        redact_asset_expression(
+            dag_model.asset_expression, readable_asset_ids=readable_assets_filter.value or set()
+        )
+    )
+    return details
+
+
+@dags_router.patch(
+    # Declared before "/{dag_id}" so this literal segment isn't shadowed by that path param.
+    "/bulk",
+    dependencies=[Depends(requires_access_dag_bulk()), Depends(action_logging())],
+)
+def bulk_dags(request: BulkBody[BulkDAGBody], session: SessionDep) -> BulkResponse:
+    """Bulk pause, resume, or drain Dags by id."""
+    return BulkDagService(session=session, request=request).handle_request()
 
 
 @dags_router.patch(
@@ -274,17 +329,24 @@ def patch_dag(
     session: SessionDep,
     update_mask: list[str] | None = Query(None),
 ) -> DAGResponse:
-    """Patch the specific DAG."""
-    dag = session.get(DagModel, dag_id)
+    """Patch the specific Dag."""
+    dag = session.scalar(
+        with_row_locks(
+            select(DagModel).where(DagModel.dag_id == dag_id),
+            of=DagModel,
+            session=session,
+        )
+    )
 
     if dag is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Dag with id: {dag_id} was not found")
 
     fields_to_update = patch_body.model_fields_set
     if update_mask:
-        if update_mask != ["is_paused"]:
+        if len(update_mask) != 1 or update_mask[0] not in {"is_paused", "scheduling_state"}:
             raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "Only `is_paused` field can be updated through the REST API"
+                status.HTTP_400_BAD_REQUEST,
+                "Only one of `is_paused` or `scheduling_state` can be updated through the REST API",
             )
         fields_to_update = fields_to_update.intersection(update_mask)
         try:
@@ -293,14 +355,11 @@ def patch_dag(
             raise RequestValidationError(errors=e.errors())
     else:
         try:
-            DAGPatchBody(**patch_body.model_dump())
+            DAGPatchBody(**patch_body.model_dump(exclude_unset=True))
         except ValidationError as e:
             raise RequestValidationError(errors=e.errors())
 
-    data = patch_body.model_dump(include=fields_to_update, by_alias=True)
-
-    for key, val in data.items():
-        setattr(dag, key, val)
+    dag.set_scheduling_state(get_scheduling_state(patch_body))
 
     return dag
 
@@ -322,18 +381,30 @@ def patch_dags(
     tags: QueryTagsFilter,
     owners: QueryOwnersFilter,
     dag_id_pattern: QueryDagIdPatternSearchWithNone,
+    dag_id_prefix_pattern: QueryDagIdPrefixPatternSearchWithNone,
     exclude_stale: QueryExcludeStaleFilter,
     paused: QueryPausedFilter,
     editable_dags_filter: EditableDagsFilterDep,
     session: SessionDep,
     update_mask: list[str] | None = Query(None),
 ) -> DAGCollectionResponse:
-    """Patch multiple DAGs."""
+    """
+    Patch multiple Dags.
+
+    If neither `dag_id_pattern` nor `dag_id_prefix_pattern` is provided, no Dags will be
+    matched regardless of other filters. To match all Dags, pass a wildcard value such as
+    `~` or `%` for `dag_id_pattern`.
+    """
     if update_mask:
-        if update_mask != ["is_paused"]:
+        if len(update_mask) != 1 or update_mask[0] not in {"is_paused", "scheduling_state"}:
             raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "Only `is_paused` field can be updated through the REST API"
+                status.HTTP_400_BAD_REQUEST,
+                "Only one of `is_paused` or `scheduling_state` can be updated through the REST API",
             )
+        try:
+            DAGPatchBodyPartial(**patch_body.model_dump(include=set(update_mask)))
+        except ValidationError as e:
+            raise RequestValidationError(errors=e.errors())
     else:
         try:
             DAGPatchBody.model_validate(patch_body)
@@ -341,11 +412,12 @@ def patch_dags(
             raise RequestValidationError(errors=e.errors())
 
     dags_select, total_entries = paginated_select(
-        statement=select(DagModel),
+        statement=select(DagModel).options(selectinload(DagModel.tags)),
         filters=[
             exclude_stale,
             paused,
             dag_id_pattern,
+            dag_id_prefix_pattern,
             tags,
             owners,
             editable_dags_filter,
@@ -356,16 +428,33 @@ def patch_dags(
         session=session,
     )
     dags = session.scalars(dags_select).all()
-    dags_to_update = {dag.dag_id for dag in dags}
+
+    filtered_dag_ids = apply_filters_to_select(
+        statement=select(DagModel.dag_id),
+        filters=[
+            exclude_stale,
+            paused,
+            dag_id_pattern,
+            dag_id_prefix_pattern,
+            tags,
+            owners,
+            editable_dags_filter,
+        ],
+    ).subquery()
+
+    scheduling_state = get_scheduling_state(patch_body)
     session.execute(
         update(DagModel)
-        .where(DagModel.dag_id.in_(dags_to_update))
-        .values(is_paused=patch_body.is_paused)
+        .where(DagModel.dag_id.in_(select(filtered_dag_ids.c.dag_id)))
+        .values(
+            is_paused=scheduling_state == DagSchedulingState.PAUSED,
+            is_draining=scheduling_state == DagSchedulingState.DRAINING,
+        )
         .execution_options(synchronize_session="fetch")
     )
 
     return DAGCollectionResponse(
-        dags=dags,
+        dags=list(dags),
         total_entries=total_entries,
     )
 
@@ -373,16 +462,29 @@ def patch_dags(
 @dags_router.post(
     "/{dag_id}/favorite",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=create_openapi_http_exception_doc([status.HTTP_404_NOT_FOUND]),
+    responses=create_openapi_http_exception_doc([status.HTTP_404_NOT_FOUND, status.HTTP_409_CONFLICT]),
     dependencies=[Depends(requires_access_dag(method="GET")), Depends(action_logging())],
 )
 def favorite_dag(dag_id: str, session: SessionDep, user: GetUserDep):
-    """Mark the DAG as favorite."""
+    """Mark the Dag as favorite."""
     dag = session.get(DagModel, dag_id)
     if not dag:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"DAG with id '{dag_id}' not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Dag with id '{dag_id}' not found")
 
     user_id = str(user.get_id())
+
+    favorite_exists = session.execute(
+        select(DagFavorite)
+        .where(
+            DagFavorite.dag_id == dag_id,
+            DagFavorite.user_id == user_id,
+        )
+        .limit(1)
+    ).first()
+
+    if favorite_exists:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Dag is already marked as favorite")
+
     session.execute(insert(DagFavorite).values(dag_id=dag_id, user_id=user_id))
 
 
@@ -393,22 +495,24 @@ def favorite_dag(dag_id: str, session: SessionDep, user: GetUserDep):
     dependencies=[Depends(requires_access_dag(method="GET")), Depends(action_logging())],
 )
 def unfavorite_dag(dag_id: str, session: SessionDep, user: GetUserDep):
-    """Unmark the DAG as favorite."""
+    """Unmark the Dag as favorite."""
     dag = session.get(DagModel, dag_id)
     if not dag:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"DAG with id '{dag_id}' not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Dag with id '{dag_id}' not found")
 
     user_id = str(user.get_id())
 
     favorite_exists = session.execute(
-        select(DagFavorite).where(
+        select(DagFavorite)
+        .where(
             DagFavorite.dag_id == dag_id,
             DagFavorite.user_id == user_id,
         )
+        .limit(1)
     ).first()
 
     if not favorite_exists:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="DAG is not marked as favorite")
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Dag is not marked as favorite")
 
     session.execute(
         delete(DagFavorite).where(
@@ -424,6 +528,7 @@ def unfavorite_dag(dag_id: str, session: SessionDep, user: GetUserDep):
         [
             status.HTTP_400_BAD_REQUEST,
             status.HTTP_404_NOT_FOUND,
+            status.HTTP_409_CONFLICT,
             HTTP_422_UNPROCESSABLE_CONTENT,
         ]
     ),
@@ -433,7 +538,7 @@ def delete_dag(
     dag_id: str,
     session: SessionDep,
 ) -> Response:
-    """Delete the specific DAG."""
+    """Delete the specific Dag."""
     try:
         delete_dag_module.delete_dag(dag_id, session=session)
     except DagNotFound:

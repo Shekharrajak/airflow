@@ -20,14 +20,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import {
-  UseTaskInstanceServiceGetMappedTaskInstanceKeyFn,
-  UseTaskInstanceServiceGetTaskInstanceKeyFn,
+  useDagRunServiceGetExecutionKey,
+  useTaskInstanceServiceGetMappedTaskInstanceKey,
+  useTaskInstanceServiceGetTaskInstanceKey,
   useTaskInstanceServiceGetTaskInstancesKey,
   useTaskInstanceServicePatchTaskInstance,
-  UseGridServiceGetGridRunsKeyFn,
 } from "openapi/queries";
+
 import { createErrorToaster } from "src/utils";
 
+import { gridQueryKeys, tiPerAttemptQueryKeys } from "./gridViewQueryKeys";
 import { useClearTaskInstancesDryRunKey } from "./useClearTaskInstancesDryRun";
 import { usePatchTaskInstanceDryRunKey } from "./usePatchTaskInstanceDryRun";
 
@@ -40,7 +42,7 @@ export const usePatchTaskInstance = ({
 }: {
   dagId: string;
   dagRunId: string;
-  mapIndex: number;
+  mapIndex?: number;
   onSuccess?: () => void;
   taskId: string;
 }) => {
@@ -60,15 +62,19 @@ export const usePatchTaskInstance = ({
 
   const onSuccessFn = async () => {
     const queryKeys = [
-      UseTaskInstanceServiceGetTaskInstanceKeyFn({ dagId, dagRunId, taskId }),
-      UseTaskInstanceServiceGetMappedTaskInstanceKeyFn({ dagId, dagRunId, mapIndex, taskId }),
+      [useDagRunServiceGetExecutionKey, { dagId, dagRunId }],
+      [useTaskInstanceServiceGetTaskInstanceKey, { dagId, dagRunId, taskId }],
       [useTaskInstanceServiceGetTaskInstancesKey],
       [usePatchTaskInstanceDryRunKey, dagId, dagRunId, { mapIndex, taskId }],
       [useClearTaskInstancesDryRunKey, dagId],
-      UseGridServiceGetGridRunsKeyFn({ dagId }, [{ dagId }]),
+      [useTaskInstanceServiceGetMappedTaskInstanceKey, { dagId, dagRunId, taskId }],
+      ...tiPerAttemptQueryKeys,
     ];
 
-    await Promise.all(queryKeys.map((key) => queryClient.invalidateQueries({ queryKey: key })));
+    await Promise.all([
+      ...gridQueryKeys(dagId).map((key) => queryClient.invalidateQueries({ queryKey: key })),
+      ...queryKeys.map((key) => queryClient.invalidateQueries({ queryKey: key })),
+    ]);
 
     if (onSuccess) {
       onSuccess();

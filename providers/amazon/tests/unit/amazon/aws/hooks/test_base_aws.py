@@ -21,7 +21,7 @@ import json
 import os
 from base64 import b64encode
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock, mock_open
@@ -39,6 +39,7 @@ from moto import mock_aws
 from moto.core import DEFAULT_ACCOUNT_ID
 
 from airflow.models.connection import Connection
+from airflow.providers.amazon import __version__ as amazon_provider_version
 from airflow.providers.amazon.aws.executors.ecs.ecs_executor import AwsEcsExecutor
 from airflow.providers.amazon.aws.hooks.base_aws import (
     AwsBaseHook,
@@ -321,7 +322,7 @@ class TestSessionFactory:
                     "access_key": "mock-AccessKeyId",
                     "secret_key": "mock-SecretAccessKey",
                     "token": "mock-SessionToken",
-                    "expiry_time": datetime.now(timezone.utc).isoformat(),
+                    "expiry_time": datetime.now(UTC).isoformat(),
                 }
 
             mock_refresh.side_effect = side_effect
@@ -343,8 +344,55 @@ class TestSessionFactory:
             assert credentials.method == "sts-assume-role"
             assert isinstance(session, aiobotocore.session.AioSession)
 
+    @pytest.mark.parametrize(
+        ("doctype_entity", "reference"),
+        [
+            pytest.param('<!ENTITY xxe SYSTEM "file://{secret_file}">', "&xxe;", id="external-entity"),
+            pytest.param('<!ENTITY payload "INJECTED">', "&payload;", id="internal-entity"),
+        ],
+    )
+    def test_fetch_saml_assertion_does_not_resolve_doctype_entities(
+        self, tmp_path, doctype_entity, reference
+    ):
+        secret_file = tmp_path / "secret.txt"
+        secret_file.write_text("TOPSECRET")
+        idp_response = (
+            '<?xml version="1.0"?>'
+            f"<!DOCTYPE r [{doctype_entity.format(secret_file=secret_file)}]>"
+            f"<r><assertion>{reference}</assertion></r>"
+        ).encode()
+
+        saml_config = {
+            "idp_url": "https://my-idp.local.corp",
+            "idp_auth_method": "http_spegno_auth",
+            "saml_response_xpath": "//assertion/text()",
+        }
+
+        orig_import = __import__
+
+        def import_mock(name, *args, **kwargs):
+            if name == "requests_gssapi":
+                return mock.Mock()
+            return orig_import(name, *args, **kwargs)
+
+        factory = BaseSessionFactory(conn=None)
+        with (
+            mock.patch("builtins.__import__", side_effect=import_mock),
+            mock.patch.object(factory, "_get_idp_response", autospec=True) as mock_idp,
+        ):
+            mock_idp.return_value.content = idp_response
+            # With resolve_entities=False the entity stays unexpanded, so the xpath yields no
+            # text node and the hook rejects the assertion instead of returning file contents
+            # or the substituted literal.
+            with pytest.raises(ValueError, match="Invalid SAML Assertion"):
+                factory._fetch_saml_assertion_using_http_spegno_auth(saml_config)
+
 
 class TestAwsBaseHook:
+    @pytest.mark.filterwarnings("error:ProvidersManager.hooks is deprecated")
+    def test_get_provider_version_without_deprecated_hooks(self):
+        assert AwsBaseHook._get_provider_version() == amazon_provider_version
+
     @mock_aws
     def test_get_client_type_set_in_class_attribute(self):
         client = boto3.client("emr", region_name="us-east-1")
@@ -406,7 +454,7 @@ class TestAwsBaseHook:
         """
         client_meta = AwsBaseHook(aws_conn_id=None, client_type="s3").conn_client_meta
 
-        expected_user_agent_tag_keys = ["Airflow", "AmPP", "Caller", "DagRunKey"]
+        expected_user_agent_tag_keys = ["Airflow", "AmPP", "Caller", "DagRunKey", "MultiTeam", "TeamNameKey"]
 
         result_user_agent_tags = client_meta.config.user_agent.split(" ")
         result_user_agent_tag_keys = [tag.split("/")[0].lower() for tag in result_user_agent_tags]
@@ -467,11 +515,40 @@ class TestAwsBaseHook:
             mock_supervisor_comms.send.return_value = ConnectionResult(
                 conn_id="aws_default",
                 conn_type="aws",
+                host=None,
+                schema=None,
+                login=None,
+                password=None,
+                port=None,
+                extra=None,
             )
         with mock.patch.dict(os.environ, env_var, clear=True):
             dag_run_key = self.fetch_tags()["DagRunKey"]
 
             assert UUID(dag_run_key).version == expected_version
+
+    @pytest.mark.parametrize(
+        ("env_var", "expected"),
+        [
+            pytest.param({"AIRFLOW_CTX_TEAM_NAME": "my-team"}, "True", id="multi-team-enabled"),
+            pytest.param({}, "False", id="multi-team-disabled"),
+        ],
+    )
+    def test_user_agent_multi_team(self, env_var, expected):
+        with mock.patch.dict(os.environ, env_var, clear=True):
+            assert AwsBaseHook._is_multi_team() == (expected == "True")
+
+    @pytest.mark.parametrize(
+        ("env_var", "expected_version"),
+        [
+            pytest.param({"AIRFLOW_CTX_TEAM_NAME": "my-team"}, 5, id="team-set"),
+            pytest.param({}, None, id="team-not-set"),
+        ],
+    )
+    def test_user_agent_team_name_key_is_hashed_correctly(self, env_var, expected_version):
+        with mock.patch.dict(os.environ, env_var, clear=True):
+            team_name_key = AwsBaseHook._generate_team_name_key()
+            assert UUID(team_name_key).version == expected_version
 
     @pytest.mark.parametrize(
         "sts_endpoint",
@@ -569,21 +646,19 @@ class TestAwsBaseHook:
         mock_boto3.assert_has_calls(
             [
                 mock.call.session.Session(),
-                mock.call.session.Session()._session.__bool__(),
                 mock.call.session.Session(botocore_session=mock_session.get_session.return_value),
                 mock.call.session.Session().get_credentials(),
                 mock.call.session.Session().get_credentials().get_frozen_credentials(),
             ]
         )
         mock_fetcher = mock_botocore.credentials.AssumeRoleWithWebIdentityCredentialFetcher
+        mock_fetcher_call_kwargs = mock_fetcher.call_args.kwargs
+        assert mock_fetcher_call_kwargs["role_arn"] == "arn:aws:iam::123456:role/role_arn"
+        assert mock_fetcher_call_kwargs["extra_args"] == {}
+        # client_creator should be a wrapper function, not the raw create_client
+        assert callable(mock_fetcher_call_kwargs["client_creator"])
         mock_botocore.assert_has_calls(
             [
-                mock.call.credentials.AssumeRoleWithWebIdentityCredentialFetcher(
-                    client_creator=mock_boto3.session.Session.return_value._session.create_client,
-                    extra_args={},
-                    role_arn="arn:aws:iam::123456:role/role_arn",
-                    web_identity_token_loader=mock.ANY,
-                ),
                 mock.call.credentials.DeferredRefreshableCredentials(
                     method="assume-role-with-web-identity",
                     refresh_using=mock_fetcher.return_value.fetch_credentials,
@@ -638,6 +713,55 @@ class TestAwsBaseHook:
             )
             assert mock_creds_fetcher_kwargs["web_identity_token_loader"]() == "TOKEN"
             assert mock_open_.call_args.args[0] == "/my-token-path"
+
+    @mock.patch(
+        "airflow.providers.amazon.aws.hooks.base_aws.botocore.credentials.AssumeRoleWithWebIdentityCredentialFetcher"
+    )
+    @mock.patch("airflow.providers.amazon.aws.hooks.base_aws.botocore.session.Session")
+    def test_web_identity_credential_fetcher_uses_botocore_config(
+        self, mock_session, mock_credentials_fetcher
+    ):
+        """Test that assume_role_with_web_identity passes botocore config (e.g. proxy) to STS client."""
+        proxy_config = {"https": "http://proxy.example.com:8080"}
+        with mock.patch.object(
+            AwsBaseHook,
+            "get_connection",
+            return_value=Connection(
+                conn_id="aws_default",
+                conn_type="aws",
+                extra=json.dumps(
+                    {
+                        "role_arn": "arn:aws:iam::123456:role/role_arn",
+                        "assume_role_method": "assume_role_with_web_identity",
+                        "assume_role_with_web_identity_token_file": "/my-token-path",
+                        "assume_role_with_web_identity_federation": "file",
+                        "config_kwargs": {"proxies": proxy_config},
+                    }
+                ),
+            ),
+        ):
+            mock_open_ = mock_open(read_data="TOKEN")
+            with mock.patch(
+                "airflow.providers.amazon.aws.hooks.base_aws.botocore.utils.FileWebIdentityTokenLoader.__init__.__defaults__",
+                new=(mock_open_,),
+            ):
+                AwsBaseHook(aws_conn_id="aws_default", client_type="airflow_test").get_session()
+
+            _, mock_creds_fetcher_kwargs = mock_credentials_fetcher.call_args
+            # Invoke the client_creator wrapper to verify config is merged
+            client_creator = mock_creds_fetcher_kwargs["client_creator"]
+            mock_base_client_creator = mock_session.return_value.create_client
+
+            # Simulate what botocore does internally: calls client_creator('sts', config=Config(...))
+            from botocore.config import Config
+
+            unsigned_config = Config(signature_version="unsigned")
+            client_creator("sts", config=unsigned_config)
+
+            call_kwargs = mock_base_client_creator.call_args.kwargs
+            merged_config = call_kwargs["config"]
+            # The proxy settings from the connection should be present in the merged config
+            assert merged_config.proxies == proxy_config
 
     @pytest.mark.parametrize(
         "sts_endpoint",
@@ -763,7 +887,7 @@ class TestAwsBaseHook:
         expire_on_calls = []
 
         def mock_refresh_credentials():
-            expiry_datetime = datetime.now(timezone.utc)
+            expiry_datetime = datetime.now(UTC)
             expire_on_call = expire_on_calls.pop()
             if expire_on_call:
                 expiry_datetime -= timedelta(minutes=1000)
@@ -1121,6 +1245,8 @@ def test_raise_no_creds_default_credentials_strategy(tmp_path_factory, monkeypat
     for env_key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
         # Delete aws credentials environment variables
         monkeypatch.delenv(env_key, raising=False)
+    # On an EC2 host the credential chain would otherwise reach the instance role via IMDS
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
     hook = AwsBaseHook(aws_conn_id=None, client_type="sts")
     with pytest.raises(NoCredentialsError) as credential_error:

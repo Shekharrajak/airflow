@@ -16,19 +16,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Box, HStack, Skeleton, SimpleGrid } from "@chakra-ui/react";
-import dayjs from "dayjs";
 import { useState } from "react";
-import { useTranslation } from "react-i18next";
-import { useParams } from "react-router-dom";
 
-import { useTaskInstanceServiceGetTaskInstances } from "openapi/queries";
+import { Box, HStack, Skeleton, VStack } from "@chakra-ui/react";
+import dayjs from "dayjs";
+import { useTranslation } from "react-i18next";
+import { useParams, useSearchParams } from "react-router-dom";
+
+import { usePluginServiceGetPlugins, useTaskInstanceServiceGetTaskInstances } from "openapi/queries";
+
+import { ReactPlugin } from "src/pages/ReactPlugin";
+
 import { DurationChart } from "src/components/DurationChart";
 import { NeedsReviewButton } from "src/components/NeedsReviewButton";
 import TimeRangeSelector from "src/components/TimeRangeSelector";
 import { TrendCountButton } from "src/components/TrendCountButton";
+
 import { SearchParamsKeys } from "src/constants/searchParams";
+import { useScopedPluginViews } from "src/hooks/useScopedPluginViews";
+import { useLoopGroupNode } from "src/queries/useIsLoopGroup";
 import { isStatePending, useAutoRefresh } from "src/utils";
+
+import { LoopHistoryChart } from "./LoopHistoryChart";
 
 const defaultHour = "24";
 
@@ -36,13 +45,16 @@ export const Overview = () => {
   const { dagId = "", groupId, taskId } = useParams();
   const { t: translate } = useTranslation("dag");
 
+  const [searchParams] = useSearchParams();
+  const limit = Number(searchParams.get(SearchParamsKeys.LIMIT) ?? "10");
+
   const now = dayjs();
   const [startDate, setStartDate] = useState(now.subtract(Number(defaultHour), "hour").toISOString());
   const [endDate, setEndDate] = useState(now.toISOString());
 
   const refetchInterval = useAutoRefresh({});
 
-  const { data: failedTaskInstances, isLoading: isFailedTaskInstancesLoading } =
+  const { data: failedTaskInstancesData, isLoading: isFailedTaskInstancesLoading } =
     useTaskInstanceServiceGetTaskInstances({
       dagId,
       dagRunId: "~",
@@ -54,11 +66,13 @@ export const Overview = () => {
       taskId: Boolean(groupId) ? undefined : taskId,
     });
 
+  const failedTaskCount = failedTaskInstancesData?.total_entries ?? 0;
+
   const { data: tiData, isLoading: isLoadingTaskInstances } = useTaskInstanceServiceGetTaskInstances(
     {
       dagId,
       dagRunId: "~",
-      limit: 14,
+      limit,
       orderBy: ["-run_after"],
       taskGroupId: groupId ?? undefined,
       taskId: Boolean(groupId) ? undefined : taskId,
@@ -69,11 +83,19 @@ export const Overview = () => {
         query.state.data?.task_instances.some((ti) => isStatePending(ti.state)) ? refetchInterval : false,
     },
   );
+  const groupNode = useLoopGroupNode(groupId ?? "");
+  const loopNode = groupNode?.is_loop === true ? groupNode : undefined;
+
+  const { data: pluginData } = usePluginServiceGetPlugins();
+  const reactApps = pluginData?.plugins.flatMap((plugin) => plugin.react_apps) ?? [];
+  const taskOverviewReactPlugins = useScopedPluginViews(reactApps, "task_overview");
 
   return (
-    <Box m={4} spaceY={4}>
-      <NeedsReviewButton taskId={taskId} />
-      <Box my={2}>
+    <VStack alignItems="stretch" gap={4} m={4}>
+      <Box css={{ "&:empty": { display: "none" } }} order={1}>
+        <NeedsReviewButton taskId={taskId} />
+      </Box>
+      <Box my={2} order={2}>
         <TimeRangeSelector
           defaultValue={defaultHour}
           endDate={endDate}
@@ -82,17 +104,17 @@ export const Overview = () => {
           startDate={startDate}
         />
       </Box>
-      <HStack flexWrap="wrap">
+      <HStack flexWrap="wrap" order={3}>
         <TrendCountButton
-          colorPalette={(failedTaskInstances?.total_entries ?? 0) === 0 ? "green" : "red"}
-          count={failedTaskInstances?.total_entries ?? 0}
+          colorPalette={failedTaskCount === 0 ? "green" : "red"}
+          count={failedTaskCount}
           endDate={endDate}
-          events={(failedTaskInstances?.task_instances ?? []).map((ti) => ({
+          events={(failedTaskInstancesData?.task_instances ?? []).map((ti) => ({
             timestamp: ti.start_date ?? ti.logical_date,
           }))}
           isLoading={isFailedTaskInstancesLoading}
           label={translate("overview.buttons.failedTaskInstance", {
-            count: failedTaskInstances?.total_entries ?? 0,
+            count: failedTaskCount,
           })}
           route={{
             pathname: "task_instances",
@@ -101,15 +123,31 @@ export const Overview = () => {
           startDate={startDate}
         />
       </HStack>
-      <SimpleGrid columns={3} gap={5} my={5}>
-        <Box borderRadius={4} borderStyle="solid" borderWidth={1} p={2} width="350px">
+      <HStack alignItems="flex-start" flexWrap="wrap" gap={5} my={5} order={4}>
+        {loopNode === undefined ? undefined : <LoopHistoryChart groupId={loopNode.id} />}
+        <Box
+          borderRadius={4}
+          borderStyle="solid"
+          borderWidth={1}
+          flex="1 1 400px"
+          maxWidth="900px"
+          minWidth="320px"
+          p={2}
+        >
           {isLoadingTaskInstances ? (
-            <Skeleton height="200px" w="full" />
+            <Skeleton height="310px" w="full" />
           ) : (
-            <DurationChart entries={tiData?.task_instances.slice().reverse()} kind="Task Instance" />
+            <DurationChart
+              // oxlint-disable-next-line unicorn/prefer-spread -- a spread would drop the optional chain
+              entries={tiData?.task_instances.slice().reverse()}
+              kind="Task Instance"
+            />
           )}
         </Box>
-      </SimpleGrid>
-    </Box>
+      </HStack>
+      {taskOverviewReactPlugins.map((plugin) => (
+        <ReactPlugin key={plugin.name} reactApp={plugin} />
+      ))}
+    </VStack>
   );
 };

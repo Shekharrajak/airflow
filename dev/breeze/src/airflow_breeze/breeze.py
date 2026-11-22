@@ -34,8 +34,8 @@ from airflow_breeze.commands import developer_commands  # noqa: I001, E402, F401
 from airflow_breeze.commands.ci_commands import ci_group  # noqa: E402
 from airflow_breeze.commands.ci_image_commands import ci_image_group  # noqa: E402
 from airflow_breeze.commands.issues_commands import issues_group  # noqa: E402
-from airflow_breeze.commands.pr_commands import pr_group  # noqa: E402
 from airflow_breeze.commands.kubernetes_commands import kubernetes_group  # noqa: E402
+from airflow_breeze.commands import kubernetes_kustomize_commands  # noqa: E402, F401
 from airflow_breeze.commands.production_image_commands import prod_image_group  # noqa: E402
 from airflow_breeze.commands.minor_release_command import create_minor_version_branch  # noqa: E402, F401
 from airflow_breeze.commands.release_command import airflow_release  # noqa: E402, F401
@@ -46,6 +46,7 @@ from airflow_breeze.commands.sbom_commands import sbom_group  # noqa: E402
 from airflow_breeze.commands.setup_commands import setup_group  # noqa: E402
 from airflow_breeze.commands.testing_commands import testing_group  # noqa: E402
 from airflow_breeze.commands.ui_commands import ui_group  # noqa: E402
+from airflow_breeze.commands import verify_commands  # noqa: E402, F401
 
 main.add_command(testing_group)
 main.add_command(kubernetes_group)
@@ -58,7 +59,6 @@ main.add_command(release_management_group)
 main.add_command(sbom_group)
 main.add_command(ui_group)
 main.add_command(issues_group)
-main.add_command(pr_group)
 main.add_command(workflow_run_group)
 
 if __name__ == "__main__":

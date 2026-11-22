@@ -118,7 +118,7 @@ In the case above, these are the ways you could import the python files:
 
 You can see the ``.airflowignore`` file at the root of your folder. This is a file that you can put in your
 ``dags`` folder to tell Airflow which files from the folder should be ignored when the Airflow
-scheduler looks for Dags. It should contain either regular expressions (the default) or glob expressions
+scheduler looks for Dags. It should contain either glob expressions (the default) or regular expressions
 for the paths that should be ignored. You do not need to have that file in any other folder in
 ``PYTHONPATH`` (and also you can only keep shared code in the other folders, not the actual Dags).
 
@@ -141,18 +141,19 @@ Airflow, when running dynamically adds three directories to the ``sys.path``:
 - The ``config`` folder: It is configured by setting ``AIRFLOW_HOME`` variable (``{AIRFLOW_HOME}/config``) by default.
 - The ``plugins`` Folder: It is configured with option ``plugins_folder`` in section ``[core]``.
 
-.. warning::
+.. _plugins-auto-import:
 
-   Unlike the ``dags`` and ``config`` folders, which are simply appended to ``sys.path``
-   (making them available for explicit imports only), the ``plugins`` folder's ``.py`` files
-   are **actively imported at Airflow startup** and registered in ``sys.modules`` under the
-   bare filename as a top-level module. The subdirectory structure is ignored when
-   determining the module name, so a file at ``plugins/my_project/operators/hdfs.py`` is
-   registered as ``sys.modules["hdfs"]``, not ``sys.modules["my_project.operators.hdfs"]``.
-   Because ``sys.modules`` is populated at process startup, any ``import hdfs`` anywhere in
-   the process — including inside installed providers or third-party libraries — will resolve
-   to the plugin file instead of the intended package. See :ref:`plugins:loading` for the
-   full plugin loading lifecycle.
+.. warning::
+   Unlike ``dags`` and ``config`` — which are only added to ``sys.path`` — the ``plugins``
+   folder's ``.py`` files are **actively imported at startup** and registered as top-level
+   modules using just the bare filename, regardless of subdirectory structure. This applies
+   to **all** ``.py`` files in the plugins tree, not only those defining an
+   ``AirflowPlugin`` subclass.
+
+   For example, a file at ``plugins/my_company/utils/logging.py`` is registered as the
+   module ``logging``, shadowing the standard library module globally and preventing Airflow
+   from starting. Collisions with third-party package names produce subtler failures that
+   are harder to trace. See :doc:`Plugins <plugins>` for an overview of the plugin system.
 
 .. note::
    The Dags folder in Airflow 2 and 3 should not be shared with the webserver. While you can do it, unlike in Airflow 1.10,
@@ -200,17 +201,14 @@ create ``airflow/operators`` subfolder it will not be accessible because Airflow
 named ``airflow.operators`` and it will look there when importing ``from airflow.operators``.
 
 .. warning::
+   For the ``plugins`` folder, this advice extends beyond top-level names to ``.py`` files
+   at **any depth** — see the :ref:`warning above <plugins-auto-import>`. Placing files in
+   subdirectories does **not** prevent collisions. Every ``.py`` filename in the
+   ``plugins`` tree must be unique and must not match any standard library or installed
+   third-party module name.
 
-   For the ``plugins`` folder, the name-collision risk extends to ``.py`` files at **any
-   depth**, not just the top level. Because plugin files are automatically imported at
-   startup and registered in ``sys.modules`` by bare filename alone, a file at
-   ``plugins/my_company/operators/hdfs.py`` registers as ``sys.modules["hdfs"]``, silently
-   shadowing the PyPI ``hdfs`` package. This can break providers that depend on it — for
-   example, ``apache-airflow-providers-apache-hdfs`` imports ``from hdfs import HdfsError``,
-   which fails with ``ImportError`` if a plugin file named ``hdfs.py`` exists anywhere in
-   the plugins folder. Note that if the conflicting file is added while Airflow is already
-   running, the collision will not occur until the next restart, making the root cause
-   difficult to diagnose.
+   If a conflicting file is added while Airflow is already running, the collision will not
+   occur until the next restart, making the root cause difficult to diagnose.
 
 Don't use relative imports
 ..........................
@@ -231,7 +229,7 @@ You should import such shared Dags using full path (starting from the directory 
    from my_company.my_custom_dags.base_dag import BaseDag  # This is cool
 
 The relative imports are counter-intuitive, and depending on how you start your python code, they can behave
-differently. In Airflow the same Dag file might be parsed in different contexts (by schedulers, by workers
+differently. In Airflow the same Dag file might be parsed in different contexts (by the Dag processor, by workers
 or during tests) and in those cases, relative imports might behave differently. Always use full
 python package paths when you import anything in Airflow Dags, this will save you a lot of troubles.
 You can read more about relative import caveats in
@@ -295,7 +293,7 @@ Below is the sample output of the ``airflow info`` command:
     Config info
     executor             | LocalExecutor
     task_logging_handler | airflow.utils.log.file_task_handler.FileTaskHandler
-    sql_alchemy_conn     | postgresql+psycopg2://postgres:airflow@postgres/airflow
+    sql_alchemy_conn     | postgresql+psycopg://postgres:airflow@postgres/airflow
     dags_folder          | /files/dags
     plugins_folder       | /root/airflow/plugins
     base_log_folder      | /root/airflow/logs
@@ -381,7 +379,7 @@ The popular choices are setuptools, poetry, hatch, flit.
 
     mkdir airflow_operators
 
-3. Create the file ``__init__.py`` inside the package and add following code:
+3. Create a file called ``__init__.py`` inside the package and add the following code:
 
 .. code-block:: python
 

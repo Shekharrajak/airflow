@@ -27,6 +27,7 @@ from airflow.api_fastapi.common.parameters import (
     QueryLimit,
     QueryOffset,
     QueryPoolNamePatternSearch,
+    QueryPoolNamePrefixPatternSearch,
     SortParam,
 )
 from airflow.api_fastapi.common.router import AirflowRouter
@@ -94,7 +95,6 @@ def get_pool(
 
 @pools_router.get(
     "",
-    responses=create_openapi_http_exception_doc([status.HTTP_404_NOT_FOUND]),
     dependencies=[Depends(requires_access_pool(method="GET"))],
 )
 def get_pools(
@@ -105,13 +105,14 @@ def get_pools(
         Depends(SortParam(["id", "pool"], Pool, to_replace={"name": "pool"}).dynamic_depends()),
     ],
     pool_name_pattern: QueryPoolNamePatternSearch,
+    pool_name_prefix_pattern: QueryPoolNamePrefixPatternSearch,
     readable_pools_filter: ReadablePoolsFilterDep,
     session: SessionDep,
 ) -> PoolCollectionResponse:
     """Get all pools entries."""
     pools_select, total_entries = paginated_select(
         statement=select(Pool),
-        filters=[pool_name_pattern, readable_pools_filter],
+        filters=[pool_name_pattern, pool_name_prefix_pattern, readable_pools_filter],
         order_by=order_by,
         offset=offset,
         limit=limit,
@@ -121,7 +122,7 @@ def get_pools(
     pools = session.scalars(pools_select)
 
     return PoolCollectionResponse(
-        pools=pools,
+        pools=[PoolResponse.model_validate(pool) for pool in pools],
         total_entries=total_entries,
     )
 
@@ -143,14 +144,22 @@ def patch_pool(
     update_mask: list[str] | None = Query(None),
 ) -> PoolResponse:
     """Update a Pool."""
-    if patch_body.name and patch_body.name != pool_name:
+    # Tested against None, not truthiness: a blank name is a mismatch like any other, and
+    # treating it as "no name supplied" let it fall through and rename the pool to "".
+    if patch_body.name is not None and patch_body.name != pool_name:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Invalid body, pool name from request body doesn't match uri parameter",
         )
 
-    pool = update_orm_from_pydantic(pool_name, patch_body, update_mask, session)
-    return pool
+    pool = session.scalar(select(Pool).where(Pool.pool == pool_name).limit(1))
+    if not pool:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"The Pool with name: `{pool_name}` was not found"
+        )
+
+    updated_pool = update_orm_from_pydantic(pool, patch_body, update_mask)
+    return updated_pool
 
 
 @pools_router.post(

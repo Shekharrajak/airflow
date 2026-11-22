@@ -20,8 +20,11 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 **Table of contents**
 
+- [Collect ambiguities during the release (for a follow-up doc PR)](#collect-ambiguities-during-the-release-for-a-follow-up-doc-pr)
 - [Perform review of security issues that are marked for the release](#perform-review-of-security-issues-that-are-marked-for-the-release)
 - [Selecting what to put into the release](#selecting-what-to-put-into-the-release)
+  - [CI of the `vX-Y-test` branch](#ci-of-the-vx-y-test-branch)
+  - [Beta releases: fast-forwarding `vX-Y-test` to `main`](#beta-releases-fast-forwarding-vx-y-test-to-main)
   - [i18n workflow](#i18n-workflow)
   - [Selecting what to cherry-pick](#selecting-what-to-cherry-pick)
   - [Making the cherry picking](#making-the-cherry-picking)
@@ -43,6 +46,7 @@
 - [Verify the release candidate by Contributors](#verify-the-release-candidate-by-contributors)
   - [Installing release candidate in your local virtual environment](#installing-release-candidate-in-your-local-virtual-environment)
 - [Publish the final Apache Airflow release](#publish-the-final-apache-airflow-release)
+  - [Release or yank the outstanding provider candidates](#release-or-yank-the-outstanding-provider-candidates)
   - [Summarize the voting for the Apache Airflow release](#summarize-the-voting-for-the-apache-airflow-release)
   - [Publish release to SVN](#publish-release-to-svn)
   - [Manually prepare production Docker Image](#manually-prepare-production-docker-image)
@@ -68,6 +72,21 @@
 
 You can find the prerequisites to release Apache Airflow in [README.md](README.md).
 
+# Collect ambiguities during the release (for a follow-up doc PR)
+
+These instructions are imperfect. Every release uncovers at least one command
+that has drifted, one step that is under-documented, or one automation that
+silently did the wrong thing. As you run through this document, jot down any
+such observations in a scratch file kept **outside** the repo (anywhere that
+is not tracked by git — a note in your home directory, a scratchpad, a
+gist). Once the release has landed, turn those notes into a follow-up PR
+against this document.
+
+Keeping the scratch file out of the repo avoids accidentally committing
+release-manager notes along with the release-prep PR, and makes it obvious
+that the notes are input to the next doc PR rather than something to keep
+around long-term.
+
 # Perform review of security issues that are marked for the release
 
 We are keeping track of security issues in the [Security Issues](https://github.com/airflow-s/airflow-s/issues)
@@ -88,6 +107,151 @@ The first step of a release is to work out what is being included. This differs 
 
 - For a *patch* release, you will be selecting specific commits to cherry-pick and backport into the existing release branch.
 
+## CI of the `vX-Y-test` branch
+
+Release branches do not run the full CI on every push. Backports land in bursts while a release is
+prepared, and a full AMD + ARM run per merged commit was mostly cancelled by the next merge. Instead:
+
+- **Full runs** are started by
+  [`release-branch-ci.yml`](../.github/workflows/release-branch-ci.yml) on every release branch whose
+  HEAD has not had a successful full run yet: `Tests (AMD)` at 04:43 and 16:43 UTC, `Tests (ARM)` at
+  10:43 and 22:43 UTC. A failed or cancelled run of HEAD is repeated at the next slot. They are
+  `workflow_dispatch` runs of `ci-amd.yml` / `ci-arm.yml` on the branch, run the full matrix, and
+  refresh the branch's constraints and image cache, as the push runs used to.
+- **Incremental tests on push**: every push starts a `Tests (AMD)` run that tests only what changed
+  since the last successful run of `Tests (AMD)` on the branch (push or full run), selected the same
+  way as for a PR with those changes. A newer push cancels the push run still in progress, and its
+  run then also covers the cancelled run's changes; changes from a failed run are tested again by
+  the next one. A broken backport therefore shows up within the hour, not at the next full run.
+
+Nothing needs to be switched on or off for a release. Branches cut from `main` after this was
+introduced have it already. An older release branch only behaves this way once the change to
+`ci-amd.yml` / `ci-arm.yml` that introduced it has been backported to it; until then it keeps
+running the full CI on every push.
+
+### Before cutting a beta or an RC: refresh the base images and the important CI versions
+
+The images are built on hardened Python base images pinned to digests, and the legacy images compile
+a pinned Python patch release. Only the "Upgrade important CI environment" upgrade moves those pins,
+so a release ships with the latest base images, Python patch releases and their security fixes only
+when the upgrade ran right before it. It is one command, which first mirrors the latest hardened base
+images (a workflow run on `main`, as the mirror is shared by all branches) and waits for it. It needs
+`gh` credentials that may dispatch `apache/airflow` workflows, and checks that first.
+
+- **Beta** - before you fast-forward `vX-Y-test` to `main` for the beta (see
+  [Beta releases](#beta-releases-fast-forwarding-vx-y-test-to-main)), as during the beta phase
+  `vX-Y-test` takes its changes only from `main`:
+
+  ```shell script
+  breeze workflow-run upgrade-check --branch main
+  ```
+
+  It runs the upgrade check workflow for `main` and waits for it. When anything moved, the workflow
+  opens (or updates) the `[main] Upgrade important CI environment` PR as a draft. Mark it ready for
+  review, which starts its CI, and merge it once the CI has passed.
+
+- **RC** - before you open the PR syncing `vX-Y-test` into `vX-Y-stable`, and before the full-run
+  check in the next section:
+
+  ```shell script
+  git switch vX-Y-test
+  git pull --ff-only upstream vX-Y-test
+  breeze workflow-run upgrade-check --branch vX-Y-test
+  ```
+
+  It runs the upgrade in your checkout and pushes the `[vX-Y-test] CI: Upgrade important CI
+  environment` commit straight to `vX-Y-test`, the head of the test-to-stable PR, so the PR's CI tests
+  it. This runs locally because the release branch rules let only committers push to `vX-Y-test`
+  without CI having passed. It never switches, resets or cleans your checkout: it fails and tells you
+  what to do when you are not on `vX-Y-test` at the tip of `apache/airflow`, or have local changes.
+
+### Before cutting an RC: check the full run of the branch HEAD
+
+The incremental push runs do not replace the full run. Before you cut an RC (or open the PR syncing
+`vX-Y-test` into `vX-Y-stable`), make sure both the AMD and the ARM full run of the current HEAD of
+`vX-Y-test` have succeeded:
+
+```shell script
+git ls-remote https://github.com/apache/airflow.git refs/heads/vX-Y-test
+gh run list --repo apache/airflow --workflow ci-amd.yml --branch vX-Y-test --event workflow_dispatch \
+    --limit 1 --json headSha,status,conclusion,url
+gh run list --repo apache/airflow --workflow ci-arm.yml --branch vX-Y-test --event workflow_dispatch \
+    --limit 1 --json headSha,status,conclusion,url
+```
+
+The `headSha` of each run must be the SHA `git ls-remote` printed. If the last run is for an older
+commit, start the full runs now instead of waiting for the next slot, and check again when they finish:
+
+```shell script
+gh workflow run release-branch-ci.yml --repo apache/airflow -f branch=vX-Y-test
+```
+
+This starts both architectures for the branch HEAD (add `-f platform=amd` or `-f platform=arm` for
+one of them, and `-f force=true` to repeat a run that already succeeded for HEAD). You can also start
+one directly with `gh workflow run ci-amd.yml --repo apache/airflow --ref vX-Y-test`. Starting a new
+full run cancels the full run of the same workflow already in progress on the branch.
+
+## Beta releases: fast-forwarding `vX-Y-test` to `main`
+
+For a *major* or *minor* release, the `vX-Y-test` branch is created early (see
+[Build RC artifacts](#build-rc-artifacts)), but while the beta releases (`X.Y.0b1`, `X.Y.0b2`, ...)
+are being prepared nothing is cherry-picked to it yet. Instead, the release manager periodically
+moves `vX-Y-test` forward to the current `main` - only the branch-specific commits (such as
+`Update default branches for X.Y`) are kept on top of `main`. Each beta is cut from the branch
+in that state, so everything merged to `main` lands in the next beta.
+
+### Cutting a beta
+
+A beta is cut with `breeze release-management start-beta-process`, not `start-rc-process`. A beta is
+released from `vX-Y-test` only: there is no `vX-Y-stable` branch yet and therefore no sync PR (a sync
+PR exists only to carry changes from `vX-Y-test` into `vX-Y-stable` for an `rc`/final), and there is
+no vote.
+
+1. Run the upgrade check for `main` and merge its PR, as described in
+   [Before cutting a beta or an RC](#before-cutting-a-beta-or-an-rc-refresh-the-base-images-and-the-important-ci-versions),
+   then fast-forward `vX-Y-test` to `main`.
+2. Push the version-bump and release-notes commits to `vX-Y-test` through normal PRs, so the tip of
+   `vX-Y-test` is exactly what the beta should ship.
+3. Run:
+
+   ```shell script
+   breeze release-management start-beta-process \
+       --version ${VERSION} \
+       --task-sdk-version ${TASK_SDK_VERSION}
+   ```
+
+   It validates that `vX-Y-test` exists, checks out its tip, tags the beta there, builds and signs
+   the artifacts, resolves constraints through the `release-constraints` workflow from `vX-Y-test`
+   (exactly like an `rc`: provider rc waves are allowed, the result is committed onto the shared
+   `constraints-X-Y` branch and tagged `constraints-X.Y.0bN`), uploads to
+   SVN dev and PyPI, and pushes the tags. Everything downstream of the tag is the same as an `rc`;
+   only the branch/sync/vote handling differs.
+
+During this phase, all automation that would add commits directly to `vX-Y-test` must be paused -
+any such commit makes `vX-Y-test` diverge from `main` and breaks the next fast-forward. Upgrades and
+fixes land on `main` only and reach `vX-Y-test` with the next fast-forward. When you add the new
+branch to the `.github/` configuration on `main` (see below), pause the following on `main` for
+`vX-Y-test` at the same time (every paused place is marked with a comment pointing to this section):
+
+- `.github/workflows/scheduled-upgrade-check-vX-Y-test.yml` - comment out the `schedule` trigger
+  (keep `workflow_dispatch`), so no `[vX-Y-test] Upgrade important CI environment` PRs are opened.
+- `.github/dependabot.yml` - add `open-pull-requests-limit: 0` to every `target-branch: vX-Y-test`
+  entry, so Dependabot does not open version-update PRs against the branch.
+- `.github/boring-cyborg.yml` - comment out the `backport-to-vX-Y-test` auto-labelling rule.
+- `.github/workflows/automatic-backport.yml` - add `vX-Y-test` to `BACKPORT_PAUSED_BRANCHES`, so a
+  `backport-to-vX-Y-test` label added by hand does not open a backport PR either.
+
+Close any PR that was opened against `vX-Y-test` by this automation before it was paused - the
+change reaches the branch from `main` anyway.
+
+The fast-forward phase ends when the release manager stops taking everything from `main` - usually
+just before the first release candidate (`X.Y.0rc1`), when `main` starts accepting changes meant for
+the next minor release. From that point on `vX-Y-test` diverges from `main` and changes reach it
+only by cherry-picking, as for a patch release. Announce the switch on the dev@airflow.apache.org
+list (so contributors know they need to start adding `backport-to-vX-Y-test` labels and milestones
+to the PRs they want in `X.Y.0`) and revert all the pauses listed above in a PR to `main`
+(this step is also called out at the start of [Build RC artifacts](#build-rc-artifacts)).
+
 
 ## i18n workflow
 
@@ -100,7 +264,7 @@ The first step of a release is to work out what is being included. This differs 
 ### Validating completeness of locale files
 
 Before cutting the release candidate (RC), you should verify the completeness of all merged locale files.
-Generate a completeness output for all locale files – follow the instructions in section 8.1 of the [internationalization (i18n) policy](../airflow-core/src/airflow/ui/public/i18n/README.md#81-checking-completeness-of-i18n-files) to do so.
+Generate a completeness output for all locale files by following the tooling instructions in the [internationalization (i18n) policy](../airflow-core/src/airflow/ui/public/i18n/README.md#tools).
 
 #### Patch releases (v3-X-test branch)
 
@@ -144,8 +308,7 @@ When it is time to cut the RC:
 
 #### Minor/Major releases
 
-If the median completeness across all supported languages is below 90%, or upon other justifying circumstances (e.g., release of a critical UI feature), you should consider skipping the following instructions and applying an i18n translation freeze instead (see subsection below).
-Otherwise, you should announce the completeness status to the dev@airflow.apache.org mailing list.
+For major and minor releases, announce the completeness status to the dev@airflow.apache.org mailing list.
 
 Subject:
 
@@ -170,14 +333,14 @@ After running the i18n completeness script, this is the coverage state of all me
 Code owners, translation owners, and engaged translators whose locales are currently below 90% coverage are kindly asked to complete their translations prior to the RC being cut.
 This will help ensure that all languages included in the upcoming release remain complete and consistent.
 
-Contributors are also encouraged to plan their PRs accordingly and avoid introducing large sets of new English terms close to the release date, to prevent unexpected translation work for code owners.
+Contributors are also encouraged to keep PRs small and avoid introducing large sets of new English terms close to the release date, to reduce last-minute translation work.
 
 Important notes:
 1. Locales that remain incomplete for two consecutive major or minor releases may be removed from the project, according to the i18n policy.
-2. Any changes merged after the final release won't be included, and missing terms will fall back to English.
+2. Any changes merged after the release is cut won't be included, and missing terms will fall back to English.
 3. Code owners are responsible for ensuring that their assigned locales reach at least 90% coverage before the RC is cut.
 4. Requests for assistance, coordination, or early heads-up on expected terminology changes may be shared in the #i18n Slack channel.
-5. PRs introducing new translations may continue to be merged as usual, provided that coverage remains complete by the RC date.
+5. PRs introducing translation updates may continue to be merged as usual until the RC is cut.
 
 Thanks for your cooperation!
 <your name>
@@ -187,73 +350,12 @@ EOF
 When it is time to cut the RC, you should:
 
 1. Generate an additional completeness output:
-  a. If there are incomplete locales that were also incomplete in the previous major/minor release, please contact the code owner and ask them to act according to section "Relinquishing translation/code ownership" in the i18n policy (section 6.4).
+  a. If there are incomplete locales that were also incomplete in the previous major/minor release, please contact the code owner and ask them to act according to the [Relinquishing translation/code ownership procedure](../airflow-core/src/airflow/ui/public/i18n/README.md#relinquishing-translationcode-ownership) in the i18n policy.
   b. If there are other incomplete locales, please write it as a reminder for the next major/minor release.
 2. Post the final completeness output on the same thread.
 
-### Applying an i18n translation freeze
-
-Before cutting the release candidate (RC), you may announce a freeze time to allow translators to complete translations for the upcoming release.
-During the freeze time, no changes to the English locale file should be merged (enforced by CI checks), except for approved exemptions (see below).
-In general, if the overall median coverage across all supported languages stays above 90%, a freeze is not required. However, if significant changes are introduced that lower the median coverage to or below this threshold, a freeze period can help translators complete their work without being overloaded.
-When a freeze is used, it should remain in effect until the median coverage reaches at least 90% again, or until the RC is cut, whichever comes first.
-The freeze should be announced at least two weeks before it starts, to allow time for translators to get ready and for contributors to plan their PRs accordingly.
-To prepare for the announcement, fetch the completeness output generated earlier.
-The announcement should be sent via the dev@airflow.apache.org mailing list – you may accompany it with a GitHub issue for tracking purposes.
-
-Subject:
-
-```shell script
-cat <<EOF
-[ANNOUNCEMENT] English Translation freeze for Airflow ${VERSION} RC starting at <START_DATE>
-EOF
-```
-
-Body (assuming delegation to another committer):
-
-```shell script
-cat <<EOF
-Hey fellow Airflowers,
-
-I'm sending this message on behalf of the release managers.
-The release managers are planning to cut the Airflow ${VERSION} RC soon/by <RELEASE_DATE>.
-
-After running the i18n completeness script, this is the coverage state of all merged locales as of <CURRENT_DATE>:
-
-<OUTPUT_OF_I18N_COMPLETENESS_SCRIPT>
-
-To prevent overloading the translators and to ensure completeness of all translations by the release, a freeze upon the English locale will be applied starting <START_DATE>,
-and until the RC is cut.
-Code owners, translation owners, and engaged translators are asked to complete the coverage of their assigned locales during this time.
-Contributors are also encouraged to plan their PRs accordingly, to avoid modifying the English locale during the freeze time.
-
-Important notes:
-1. Locales that remain incomplete for two consecutive major or minor releases may be removed from the project, according to the i18n policy.
-2. Any changes merged after the final release won't be included, and missing terms will fall back to English.
-3. Any PR that modifies the English locale during the freeze time will fail CI checks.
-4. Requests for exemptions should be communicated in the #i18n Slack channel, and approved by at least 1 PMC member - guidelines for approval are available in the i18n policy.
-5. PRs approved for an exemption will be labeled with `allow translation change`, and then the relevant CI check will pass. Translators are encouraged to complete the translations for the exempted terms during the freeze time.
-6. Merging PRs for adding new translations could be done during the freeze time - designated code owners should validate that by the end of the freeze time, the coverage of the suggested translation is complete.
-
-
-Thanks for your cooperation!
-<your name>
-EOF
-```
-
-When the freeze starts, you should merge a PR for setting the flag `FAIL_WHEN_ENGLISH_TRANSLATION_CHANGED` to `True` in the file [selective_checks.py](./breeze/src/airflow_breeze/utils/selective_checks.py).
-If the freeze gets extended beyond the originally announced date, you should post an update on the same thread.
-When it is time to cut the RC, you should:
-
-1. Generate an additional completeness output:
-  a. If there are incomplete locales that were also incomplete in the previous completeness output, please contact the code owner and ask them to act according to section "Relinquishing translation/code ownership" in the i18n policy (section 6.4).
-  b. If there are other incomplete locales, please write it as a reminder for the next major/minor release.
-2. Create a PR for setting the flag back to `False`.
-3. Post on the same thread that the freeze is lifted, and share the final completeness output.
-
 > [!NOTE]
-> Release managers - do not hold the release process beyond the due date if there are still incomplete locales after the freeze.
-> It is the responsibility of code owners to ensure the completeness of their locales by the due date.
+> The release process should not be blocked solely because some locales remain incomplete at RC cut time. Missing translations fall back to English, and incomplete locales should be followed up after the release.
 
 ## Selecting what to cherry-pick
 
@@ -277,27 +379,13 @@ and mark those as well. You can accomplish this by running the following command
 ./dev/airflow-github needs-categorization 2.3.2 HEAD
 ```
 
-Often you also want to cherry-pick changes related to CI and development tools, to include the latest
-stability fixes in CI and improvements in development tools. Usually you can see the list of such
-changes via (this will exclude already merged changes):
-
-```shell
-git fetch apache
-git log --oneline apache/v3-1-test | sed -n 's/.*\((#[0-9]*)\)$/\1/p' > /tmp/merged
-git log --oneline --decorate apache/v2-2-stable..apache/main -- Dockerfile* scripts breeze* .github/ setup* dev | grep -vf /tmp/merged
-```
-
-Most of those PRs should be marked with `changelog:skip` label, so that they are excluded from the
-user-facing changelog as they only matter for developers of Airflow. We have a tool
-that allows to easily review the cherry-picked PRs and mark them with the right label - see below.
-
-You also likely want to cherry-pick some of the latest doc changes in order to bring clarification and
+You are likely want to cherry-pick some of the latest doc changes in order to bring clarification and
 explanations added to the documentation. Usually you can see the list of such changes via:
 
 ```shell
-git fetch apache
-git log --oneline apache/v3-1-test | sed -n 's/.*\((#[0-9]*)\)$/\1/p' > /tmp/merged
-git log --oneline --decorate apache/v2-2-stable..apache/main -- docs/apache-airflow docs/docker-stack/ | grep -vf /tmp/merged
+git fetch upstream
+git log --oneline upstream/v3-2-test | sed -n 's/.*\((#[0-9]*)\)$/\1/p' > /tmp/merged
+git log --oneline --decorate upstream/v2-2-stable..upstream/main -- docs/apache-airflow docs/docker-stack/ | grep -vf /tmp/merged
 ```
 
 Those changes that are "doc-only" changes should be marked with `type:doc-only` label so that they
@@ -305,8 +393,22 @@ land in documentation part of the changelog. The tool to review and assign the l
 
 ## Making the cherry picking
 
-It is recommended to clone Airflow upstream (not your fork) and run the commands on
-the relevant test branch in this clone. That way origin points to the upstream repo.
+It is recommended to clone Airflow from `apache/airflow` directly (not your fork) into a
+dedicated release-manager checkout and run the commands on the relevant test branch there.
+This repo follows the standard convention that `upstream` → `apache/airflow` and `origin`
+→ your fork (see
+[`contributing-docs/10_working_with_git.rst`](../contributing-docs/10_working_with_git.rst#git-remote-naming-conventions)),
+so in this release-manager clone add `apache/airflow` as `upstream`:
+
+```shell
+git remote add upstream https://github.com/apache/airflow.git
+git fetch upstream
+```
+
+All the commands in this document assume `upstream` is the remote that tracks
+`apache/airflow`. If you previously set this up under a different name (e.g. `apache`),
+either rename it with `git remote rename apache upstream` or pass the alternative name
+via the `--remote-name` option where the commands accept it.
 
 To see cherry picking candidates (unmerged PR with the appropriate milestone), from the test
 branch you can run:
@@ -342,7 +444,7 @@ We have the tool that allows to review cherry-picked PRs and assign the labels
 It allows to manually review and assign milestones and labels to cherry-picked PRs:
 
 ```shell
-./dev/assign_cherry_picked_prs_with_milestone.py assign-prs --previous-release v2-2-stable --current-release apache/v2-2-test --milestone-number 48
+./dev/assign_cherry_picked_prs_with_milestone.py assign-prs --previous-release v2-2-stable --current-release upstream/v2-2-test --milestone-number 48
 ```
 
 It summarises the state of each cherry-picked PR including information whether it is going to be
@@ -358,7 +460,7 @@ assumes the `--skip-assigned` flag, so that the summary can be produced without 
 
 ```shell
 ./dev/assign_cherry_picked_prs_with_milestone.py assign-prs --previous-release v2-2-stable \
-  --current-release apache/v2-2-test --milestone-number 48 --skip-assigned --assume-yes --print-summary \
+  --current-release upstream/v2-2-test --milestone-number 48 --skip-assigned --assume-yes --print-summary \
   --output-folder /tmp
 ```
 
@@ -384,13 +486,13 @@ git show --format=tformat:"" --stat --name-only $(cat /tmp/doc-only-changes.txt)
 Then if you see suspicious file (example airflow/sensors/base.py) you can find details on where they came from:
 
 ```shell
-git log apache/v3-1-test --format="%H" -- airflow/sensors/base.py | grep -f /tmp/doc-only-changes.txt | xargs git show
+git log upstream/v3-2-test --format="%H" -- airflow/sensors/base.py | grep -f /tmp/doc-only-changes.txt | xargs git show
 ```
 
 And the URL to the PR it comes from:
 
 ```shell
-git log apache/v3-1-test --format="%H" -- airflow/sensors/base.py | grep -f /tmp/doc-only-changes.txt | \
+git log upstream/v3-2-test --format="%H" -- airflow/sensors/base.py | grep -f /tmp/doc-only-changes.txt | \
     xargs -n 1 git log --oneline --max-count=1 | \
     sed s'/.*(#\([0-9]*\))$/https:\/\/github.com\/apache\/airflow\/pull\/\1/'
 ```
@@ -404,6 +506,20 @@ Before cutting an RC, we should look at the milestone and merge anything ready, 
 ## Build RC artifacts
 
 The Release Candidate artifacts we vote upon should be the exact ones we vote against, without any modification other than renaming – i.e. the contents of the files must be the same between voted release candidate and final release. Because of this the version in the built artifacts that will become the official Apache releases must not include the rcN suffix.
+
+**Before you build the artifacts**, run the upgrade check, as described in
+[Before cutting a beta or an RC](#before-cutting-a-beta-or-an-rc-refresh-the-base-images-and-the-important-ci-versions).
+
+> [!IMPORTANT]
+> When you start the release candidates of a major/minor release that went through beta releases
+> (`X.Y.0rc1`), `vX-Y-test` stops being fast-forwarded to `main` and changes reach it only by
+> cherry-picking from now on. Before cutting `X.Y.0rc1`, re-enable the `vX-Y-test` automation that
+> was paused for the betas in a PR to `main`: uncomment the `schedule` in
+> `.github/workflows/scheduled-upgrade-check-vX-Y-test.yml` and the `backport-to-vX-Y-test` rule in
+> `.github/boring-cyborg.yml`, remove `open-pull-requests-limit: 0` from the `vX-Y-test` entries in
+> `.github/dependabot.yml`, and remove `vX-Y-test` from `BACKPORT_PAUSED_BRANCHES` in
+> `.github/workflows/automatic-backport.yml`. See
+> [Beta releases: fast-forwarding `vX-Y-test` to `main`](#beta-releases-fast-forwarding-vx-y-test-to-main).
 
 - Set environment variables
 
@@ -433,11 +549,49 @@ cd airflow
 export AIRFLOW_REPO_ROOT=$(pwd)
 ```
 
-- Install `breeze` command:
+- Install `breeze` command (recommended — installs a shim at `~/.local/bin/breeze` that runs
+  breeze via `uv run --locked` from the current git worktree's `dev/breeze`; see
+  [ADR 0017](breeze/doc/adr/0017-use-uvx-to-run-breeze-from-local-sources.md)):
 
 ```shell script
-uv tool install -e ./dev/breeze
+./scripts/tools/setup_breeze
 ```
+
+The legacy global install (`uv tool install -e ./dev/breeze` or `pipx install -e ./dev/breeze`)
+still works but is no longer recommended.
+
+- Verify your GPG signing key is ready.
+
+  Before you spend 10+ minutes building artifacts only to discover that signing
+  fails, run these checks once:
+
+  ```shell script
+  # 1. The apache.org key has a secret signing subkey available locally.
+  gpg --list-secret-keys apache.org
+
+  # 2. Signing actually works (exits 0, writes a .asc, verifies cleanly).
+  echo test > /tmp/sign-check && \
+      gpg --yes --armor --local-user apache.org \
+          --output /tmp/sign-check.asc --detach-sig /tmp/sign-check && \
+      gpg --verify /tmp/sign-check.asc /tmp/sign-check && \
+      rm -f /tmp/sign-check /tmp/sign-check.asc && \
+      echo "GPG signing OK"
+
+  # 3. The fingerprint of your signing (sub)key appears in the Airflow KEYS file.
+  #    Without this, PMC verifiers cannot validate the release.
+  FINGERPRINT=$(gpg --list-keys --with-colons apache.org | awk -F: '/^fpr:/ {print $10; exit}')
+  curl -fsS https://dist.apache.org/repos/dist/release/airflow/KEYS | \
+      grep -q "${FINGERPRINT}" && echo "Key ${FINGERPRINT} is in KEYS" || \
+      echo "MISSING: add your key to KEYS before releasing"
+  ```
+
+  If any of these fail, fix them before the build step. For first-time release
+  managers, adding your key to the `KEYS` file is a separate PR against
+  `https://dist.apache.org/repos/dist/release/airflow/` (SVN).
+
+  `sign.sh` defaults to `SIGN_WITH=apache.org`. If your `apache.org` uid resolves
+  to multiple keys (rare), set `SIGN_WITH` explicitly to the fingerprint of the
+  key you want to use.
 
 - For major/minor version release, run the following commands to create the 'test' and 'stable' branches.
 
@@ -449,7 +603,7 @@ uv tool install -e ./dev/breeze
 
     ```shell script
     git checkout v${VERSION_BRANCH}-test
-    git reset --hard origin/v${VERSION_BRANCH}-test
+    git reset --hard upstream/v${VERSION_BRANCH}-test
     ```
 
 - Create a new branch from v${VERSION_BRANCH}-test
@@ -461,17 +615,43 @@ uv tool install -e ./dev/breeze
     We sync this new branch to the stable branch so that people would continue to backport PRs to the test branch
     while the RC is being voted. The new branch must be in sync with where you cut it off from the test branch.
 
+- Switch to the new branch in .github/workflows/ci-notification.yml `workflow-status` matrix
 - Set the Airflow version in `airflow-core/src/airflow/__init__.py` (without the RC tag).
 - Set the Task SDK version in `task-sdk/src/airflow/sdk/__init__.py` (without the RC tag)
-- Update the Task SDK version `>=` part in `airflow-core/pyproject.toml` to `==` TASK_SDK_VERSION without RC
+- Those two steps below are temporary - until we finally split task-sdk and airflow-core:
+  - Update the Task SDK version `>=` part in `airflow-core/pyproject.toml` to `==` TASK_SDK_VERSION without RC
+  - Update the Task SDK version `>=` part in `pyproject.toml` to `==` TASK_SDK_VERSION without RC
 - Run `git commit` without a message to update versions in `docs`.
 - Add supported Airflow version to `./scripts/ci/prek/supported_versions.py` and let prek do the job again.
-- Replace the versions in `README.md` about installation and verify that installation instructions work fine.
+  The `update-supported-versions` hook also rewrites the "Stable version" header and the installation
+  `pip install` / constraints pins in `README.md` - verify that installation instructions work fine.
+- Update the build status badge in `README.md` to point to the new `vX-Y-test` branch (the `3.x` row in the
+  build status table). The `uv run dev/update_github_branch_config.py X Y` script does this automatically.
 - Add entry for default python version to `PROVIDERS_COMPATIBILITY_TESTS_MATRIX` in `src/airflow_breeze/global_constants.py`
   with the new Airflow version, and empty exclusion for providers. This list should be updated later when providers
   with minimum version for the next version of Airflow will be added in the future.
 - Check `Apache Airflow is tested with` (stable version) in `README.md` has the same tested versions as in the tip of
   the stable branch in `dev/breeze/src/airflow_breeze/global_constants.py`
+- Create `backport-to-vX-Y-test` label:
+
+    ```shell script
+    gh label create 'backport-to-vX-Y-test' --repo apache/airflow --description 'Backport to vX-Y-test' --color 0e8a16
+    ```
+
+- Update `.github/boring-cyborg.yml` and add `backport-to-vX-Y-test` auto-assignment for the new branch.
+- Update the `DEFAULT_BRANCHES` list in `dev/sync_fork.sh` to replace the previous `vX-Y-test` entry
+  with the newly cut `vX-Y-test` branch so contributors using the helper sync the current release branch
+  by default.
+- Update `.github/` configuration on `main` to add the new `vX-Y-test` branch (you can use the
+  `uv run dev/update_github_branch_config.py X Y` helper script for this). The following files need updating:
+  - `.github/dependabot.yml` — add `target-branch: vX-Y-test` entries for github-actions, pip, and npm ecosystems.
+  - `.github/workflows/milestone-tag-assistant.yml` — add `vX-Y-test` to the push branches list.
+  - `.github/workflows/basic-tests.yml` — update the release-management dry-run commands to test the new version.
+  - `.github/workflows/ci-notification.yml` — switch the `workflow-status` matrix branch to the new branch.
+
+  If the new branch is going through beta releases first, pause the automation that adds commits to
+  `vX-Y-test` in the same PR, as described in
+  [Beta releases: fast-forwarding `vX-Y-test` to `main`](#beta-releases-fast-forwarding-vx-y-test-to-main).
 - Commit the above changes with the message `Update version to ${VERSION}`.
 - Build the release notes:
 
@@ -497,10 +677,45 @@ uv tool install -e ./dev/breeze
 
 - PR from the 'test' branch to the 'stable' branch
 
-- When the PR is approved, install `dev/breeze` in a virtualenv:
+  Before you open it, run `breeze workflow-run upgrade-check --branch vX-Y-test`, which pushes the
+  upgrade onto `vX-Y-test`, as described in
+  [Before cutting a beta or an RC](#before-cutting-a-beta-or-an-rc-refresh-the-base-images-and-the-important-ci-versions),
+  so the release is built on the latest base images.
+
+  Cherry-picked commits often include provider dependency bumps (changes to `>=` constraints on
+  `apache-airflow-providers-*` packages in `pyproject.toml`). CI blocks such changes by default —
+  only Release Managers should perform them. To allow the PR to pass, add the
+  `allow provider dependency bump` label (and `skip common compat check` if common.compat files
+  changed). For example:
+
+  ```shell script
+  gh pr create \
+    --base v3-2-stable \
+    --head v3-2-test \
+    --title "Airflow ${VERSION}: test to stable" \
+    --label "allow provider dependency bump" \
+    --label "skip common compat check" \
+    --body "Sync v3-2-test into v3-2-stable for Airflow ${VERSION} release." \
+    --web
+  ```
+
+> [!TIP]
+> **Shortcut for first RC candidates:** When preparing the first RC candidate for a new minor release
+> (e.g., 3.2.0rc1), it is unlikely to be approved on the first attempt — bugs are typically found during
+> RC testing. In this case, the release manager can prepare the RC directly from the `v3-X-test` branch
+> without opening a PR to `v3-X-stable`. This saves the overhead of creating and managing a PR that will
+> likely need additional changes before GA. However, when using this shortcut, the release manager **must**
+> verify that the full CI runs ("Tests (AMD)" and "Tests (ARM)" workflows) of the `v3-X-test` HEAD have
+> succeeded before cutting the RC, as described in
+> [Before cutting an RC: check the full run of the branch HEAD](#before-cutting-an-rc-check-the-full-run-of-the-branch-head).
+> You can see them at:
+> https://github.com/apache/airflow/actions/workflows/ci-amd.yml?query=event%3Aworkflow_dispatch+branch%3Av3-2-test
+> (adjust the branch filter for the relevant `v3-X-test` branch, and check `ci-arm.yml` the same way).
+
+- When the PR is approved (or when using the shortcut above), install `dev/breeze` in a virtualenv:
 
     ```shell script
-    pip install -e ./dev/breeze
+    uv pip install -e ./dev/breeze
     ```
 
 - Set `GITHUB_TOKEN` environment variable. Needed in patch release for generating issue for testing of the RC.
@@ -509,6 +724,30 @@ uv tool install -e ./dev/breeze
     ```shell script
     export GITHUB_TOKEN="my_token"
     ```
+
+- Configure a short-lived PyPI token for this upload only. **Until Trusted
+  Publishing is deployed for apache-airflow on PyPI**, the recommended
+  practice is:
+
+  1. Log in to https://pypi.org and create an API token right before the
+     upload step. **Scope caveat:** you would ideally create a
+     project-scoped token for `apache-airflow` alone, but PyPI only
+     allows project-scoped tokens for projects you already own/maintain on
+     that account. Most Airflow release managers do not have per-project
+     owner rights on `apache-airflow`, so in practice you will need to
+     create an account-wide ("all projects") token. That is acceptable
+     **only if** you treat it as single-use and delete it immediately
+     after the upload (step 4 below). Never keep an all-projects token on
+     disk longer than the upload itself.
+  2. Put it in `~/.pypirc` (or export as `TWINE_USERNAME=__token__`
+     `TWINE_PASSWORD=pypi-...`).
+  3. Run the `start-rc-process` command (below) — it uploads to PyPI under
+     the hood.
+  4. **Immediately delete the token** from the PyPI web UI after the upload
+     completes. Do not keep long-lived release-manager tokens on disk.
+
+  This is a defence-in-depth practice: the RM machine becomes a one-time
+  release vehicle, not a persistent point of compromise.
 
 - Start the release candidate process by running the below command (If you have not generated a key yet, generate it by following instructions on
     http://www.apache.org/dev/openpgp.html#key-gen-generate-key):
@@ -523,17 +762,35 @@ uv tool install -e ./dev/breeze
         --sync-branch ${SYNC_BRANCH}
    ```
 
+   Note: when it reaches the constraints step, `start-rc-process` triggers the `Release
+   constraints` workflow and waits. The candidate resolves constraints of its own rather than
+   tagging the `constraints-X-Y` branch tip, and it resolves them **allowing pre-releases for the
+   providers** — the providers of the wave being voted on exist on PyPI only as `rcN` versions, so
+   constraints that refused them could not describe what a tester is asked to install. The
+   allowance is scoped to `apache-airflow-providers-*`; no other package can resolve to a
+   pre-release, so a beta of some third-party library cannot slip into what the candidate ships.
+
+   The result is committed onto the shared `constraints-X-Y` branch and tagged
+   `constraints-${VERSION_RC}`. There is no `constraints-${VERSION_RC}` branch — a branch with the
+   same name as the tag would make the name ambiguous, so the workflow fails if it finds one.
+
+   The regular constraints generation for the `vX-Y-test` branch, which runs without
+   pre-releases, keeps the `rcN` provider pins it finds on `constraints-X-Y` for as long as PyPI
+   serves them, so it does not undo the candidate's constraints while the vote is on. A pinned
+   candidate gives way once its final is published, and is dropped if it is yanked.
+
    **Testing the start-rc-process command:**
    Before running the actual release command, you can safely test it using:
 
    ```shell script
-   # Test with dry-run (shows what would be executed without doing it)
+   # Test with dry-run (shows what would be executed without doing it).
+   # --remote-name defaults to "upstream" per the project convention, so only
+   # pass it explicitly if you set apache/airflow up under a different name.
    breeze release-management start-rc-process \
        --version ${VERSION_RC} \
        --previous-version ${PREVIOUS_VERSION} \
        --task-sdk-version ${TASK_SDK_VERSION_RC} \
        --sync-branch ${SYNC_BRANCH} \
-       --remote-name upstream \
        --dry-run
    ```
 
@@ -561,6 +818,29 @@ you need to run several workflows to publish the documentation. More details abo
 emergency cases.
 
 We have two options publishing the documentation 1. Using breeze commands 2. Manually using GitHub Actions.:
+
+### Sync staging with main (skip if another vote is in progress)
+
+Before publishing the staging docs, reset the `staging` branches of
+[`apache/airflow-site`](https://github.com/apache/airflow-site) and
+[`apache/airflow-site-archive`](https://github.com/apache/airflow-site-archive) to `main`, so the staging
+site starts from the current live site rather than from whatever an earlier release left there:
+
+```shell script
+breeze workflow-run sync-staging-to-main
+```
+
+It triggers the `Reset staging to main` workflow in
+[`airflow-site`](https://github.com/apache/airflow-site/actions/workflows/reset-staging.yml) and in
+[`airflow-site-archive`](https://github.com/apache/airflow-site-archive/actions/workflows/reset-staging.yml).
+Each force-updates its repository's `staging` branch to the current `main` commit (`main` itself is not
+changed); in `airflow-site` it also rebuilds the staging site.
+
+> [!WARNING]
+> **Skip this step if a vote for any other release (Airflow, Providers, Helm Chart, airflowctl, ...) is
+> in progress.** Its release candidate docs are on the `staging` branches, and resetting `staging` to `main`
+> would overwrite the staging docs prepared for that vote. The command asks for confirmation before it
+> does anything; answer `n` to skip it.
 
 ### Using breeze commands
 
@@ -791,7 +1071,7 @@ VERSION_SUFFIX=rc1
 VERSION_RC=${VERSION}${VERSION_SUFFIX}
 TASK_SDK_VERSION=X.Y.Z
 TASK_SDK_VERSION_RC=${TASK_SDK_VERSION}${VERSION_SUFFIX}
-git fetch apache --tags
+git fetch upstream --tags
 git checkout ${VERSION_RC}
 export AIRFLOW_REPO_ROOT=$(pwd)
 rm -rf dist/*
@@ -883,13 +1163,13 @@ Optionally you can use the `breeze release-management check-release-files` comma
 present in SVN. This command may also help with verifying installation of the packages.
 
 ```shell script
-breeze release-management check-release-files airflow --version ${VERSION_RC}
+breeze release-management check-release-files airflow --version ${VERSION_RC} --path-to-airflow-svn=${PATH_TO_AIRFLOW_SVN}
 ```
 
 You will see commands that you can execute to check installation of the distributions in containers.
 
 ```shell script
-breeze release-management check-release-files task-sdk --version ${TASK_SDK_VERSION_RC}
+breeze release-management check-release-files task-sdk --version ${TASK_SDK_VERSION_RC} --path-to-airflow-svn=${PATH_TO_AIRFLOW_SVN}
 ```
 
 You will see commands that you can execute to check installation of the distributions in containers.
@@ -903,10 +1183,10 @@ Download the latest jar from https://creadur.apache.org/rat/download_rat.cgi (un
 You can run this command to do it for you (including checksum verification for your own security):
 
 ```shell script
-# Checksum value is taken from https://downloads.apache.org/creadur/apache-rat-0.17/apache-rat-0.17-bin.tar.gz.sha512
-wget -q https://archive.apache.org/dist/creadur/apache-rat-0.17/apache-rat-0.17-bin.tar.gz -O /tmp/apache-rat-0.17-bin.tar.gz
-echo "32848673dc4fb639c33ad85172dfa9d7a4441a0144e407771c9f7eb6a9a0b7a9b557b9722af968500fae84a6e60775449d538e36e342f786f20945b1645294a0  /tmp/apache-rat-0.17-bin.tar.gz" | sha512sum -c -
-tar -xzf /tmp/apache-rat-0.17-bin.tar.gz -C /tmp
+# Checksum value is taken from https://downloads.apache.org/creadur/apache-rat-0.18/apache-rat-0.18-bin.tar.gz.sha512
+wget -q https://archive.apache.org/dist/creadur/apache-rat-0.18/apache-rat-0.18-bin.tar.gz -O /tmp/apache-rat-0.18-bin.tar.gz
+echo "315b16536526838237c42b5e6b613d29adc77e25a6e44a866b2b7f8b162e03d3629d49c9faea86ceb864a36b2c42838b8ce43d6f2db544e961f2259e242748f4  /tmp/apache-rat-0.18-bin.tar.gz" | sha512sum -c -
+tar -xzf /tmp/apache-rat-0.18-bin.tar.gz -C /tmp
 ```
 
 Unpack the release source archive (the `<package + version>-source.tar.gz` file) to a folder
@@ -919,13 +1199,13 @@ Run the check:
 
 ```shell script
 cp ${AIRFLOW_REPO_ROOT}/.rat-excludes /tmp/apache-airflow-src/.rat-excludes
-java -jar /tmp/apache-rat-0.17/apache-rat-0.17.jar --input-exclude-file /tmp/apache-airflow-src/.rat-excludes /tmp/apache-airflow-src/ | grep -E "! |INFO: "
+java -jar /tmp/apache-rat-0.18/apache-rat-0.18.jar --input-exclude-file /tmp/apache-airflow-src/.rat-excludes /tmp/apache-airflow-src/ | grep -E "! |INFO: "
 ```
 
 You should see no files reported as Unknown or with wrong licence and summary of the check similar to:
 
 ```
-INFO: Apache Creadur RAT 0.17 (Apache Software Foundation)
+INFO: Apache Creadur RAT 0.18 (Apache Software Foundation)
 INFO: Excluding patterns: .git-blame-ignore-revs, .github/*, .git ...
 INFO: Excluding MISC collection.
 INFO: Excluding HIDDEN_DIR collection.
@@ -1187,7 +1467,7 @@ Optionally it can be followed with constraints
 
 ```shell script
 pip install apache-airflow==<VERSION>rc<X> \
-  --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-<VERSION>rc<X>/constraints-3.10.txt"
+  --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-<VERSION>rc<X>/constraints-3.11.txt"
 ```
 
 Note that the constraints contain python version that you are installing it with.
@@ -1199,7 +1479,7 @@ There is also an easy way of installation with Breeze if you have the latest sou
 Running the following command will use tmux inside breeze, create `admin` user and run Webserver & Scheduler:
 
 ```shell script
-breeze start-airflow --use-airflow-version 3.1.3rc1 --python 3.10 --backend postgres
+breeze start-airflow --use-airflow-version 3.1.3rc1 --python 3.11 --backend postgres
 ```
 
 You can also choose different executors and extras to install when you are installing airflow this way. For
@@ -1207,7 +1487,7 @@ example in order to run Airflow with CeleryExecutor and install celery, google a
 Airflow 2.7.0, you need to have celery provider installed to run Airflow with CeleryExecutor) you can run:
 
 ```shell script
-breeze start-airflow --use-airflow-version 3.1.3rc1 --python 3.10 --backend postgres \
+breeze start-airflow --use-airflow-version 3.1.3rc1 --python 3.11 --backend postgres \
   --executor CeleryExecutor --airflow-extras "celery,google,amazon"
 ```
 
@@ -1220,6 +1500,44 @@ simple instructions described in
 [Manually testing release candidate packages](https://github.com/apache/airflow/blob/main/contributing-docs/testing/testing-packages.rst)
 
 # Publish the final Apache Airflow release
+
+## Release or yank the outstanding provider candidates
+
+The constraints of the final release cannot pin a provider release candidate, and they will not
+silently pass over one either. If the candidate's constraints pinned providers at `rcN` versions
+(see the `start-rc-process` note above), every one of them must be cleared before `start-release`
+reaches its constraints step:
+
+* **release it** - the provider vote passed and its final version is published on PyPI, or
+* **yank it** on PyPI - it is not going to be released; yanked versions are skipped.
+
+Until then, the `Release constraints` workflow for the final version fails, listing every
+provider whose newest version on PyPI is a candidate that is neither released nor yanked. To see
+which providers the candidate pinned:
+
+```shell script
+curl -s "https://raw.githubusercontent.com/apache/airflow/constraints-${VERSION_RC}/constraints-3.13.txt" \
+  | grep -E '^apache-airflow-providers-.*(a|b|rc)[0-9]+$'
+```
+
+Agree with the providers' release manager on the decision early in the vote, so the final
+release does not wait on it.
+
+If the provider wave is independent of this release and you deliberately want to ship the final
+against the currently-released providers - for example an accelerated core release that overlaps a
+wave carrying breaking provider majors the release was not tested against - you can override the
+guard. ``start-release`` checks for pending provider candidates before anything is uploaded and
+asks whether to proceed; answer ``y`` to pin the currently-released providers, or ``n`` to stop the
+release until the candidates are released or yanked. The standalone workflow takes the same override:
+
+```shell script
+breeze workflow-run release-constraints --version ${VERSION} --ref v3-1-stable \
+  --fail-on-pending-provider-candidates false
+```
+
+The constraints still never pin a release candidate; the override only lets the run pin the newest
+*final* of each provider instead of stopping. The pending candidates are simply left out, exactly
+as they were before they were cut.
 
 ## Summarize the voting for the Apache Airflow release
 
@@ -1270,6 +1588,28 @@ https://dist.apache.org/repos/dist/release/airflow/
 
 The best way of doing this is to svn cp between the two repos (this avoids having to upload the binaries again, and gives a clearer history in the svn commit logs):
 
+Before running `start-release`, configure a short-lived PyPI token for this
+upload only. **Until Trusted Publishing is deployed for apache-airflow on
+PyPI**, the recommended practice is:
+
+1. Log in to https://pypi.org and create an API token right before the
+   upload step. **Scope caveat:** you would ideally create a project-scoped
+   token for `apache-airflow` alone, but PyPI only allows project-scoped
+   tokens for projects you already own/maintain on that account. Most
+   Airflow release managers do not have per-project owner rights on
+   `apache-airflow`, so in practice you will need to create an account-wide
+   ("all projects") token. That is acceptable **only if** you treat it as
+   single-use and delete it immediately after the upload (step 4 below).
+   Never keep an all-projects token on disk longer than the upload itself.
+2. Put it in `~/.pypirc` (or export as `TWINE_USERNAME=__token__`
+   `TWINE_PASSWORD=pypi-...`).
+3. Run the `start-release` command below — it uploads to PyPI under the hood.
+4. **Immediately delete the token** from the PyPI web UI after the upload
+   completes. Do not keep long-lived release-manager tokens on disk.
+
+This is a defence-in-depth practice: the RM machine becomes a one-time
+release vehicle, not a persistent point of compromise.
+
 ```shell script
 export VERSION=3.1.3
 export TASK_SDK_VERSION=1.1.3
@@ -1283,6 +1623,49 @@ breeze release-management start-release \
 ```
 
 Note: The `--task-sdk-version` parameter is optional. If you are releasing Airflow without a corresponding Task SDK release, you can omit this parameter.
+
+Note: When it reaches the constraints step, `start-release` resolves the constraints again rather
+than promoting the ones the RC was cut with. The RC constraints deliberately pin pre-releases -
+that wave's providers exist on PyPI only as `rcN` versions at candidate time - so they can never
+become the released constraints by retagging. The regeneration runs without pre-releases against
+the same providers now published as finals, commits the result onto the `constraints-X-Y` branch,
+pushes it, and tags it `constraints-${VERSION}`. That commit is what makes the released
+constraints the new baseline, so refreshing the branch beforehand (see
+[MANUALLY_GENERATING_IMAGE_CACHE_AND_CONSTRAINTS.md](MANUALLY_GENERATING_IMAGE_CACHE_AND_CONSTRAINTS.md))
+is no longer necessary.
+
+The resolution runs on CI runners through the `Release constraints` workflow, so the release
+manager's machine does not need a CI image for every supported Python. `start-release` triggers it
+and waits. You can also run it on its own - to redo a candidate's constraints, or to produce them
+for a release cut before this existed:
+
+```shell script
+breeze workflow-run release-constraints --version ${VERSION} --ref v3-1-stable
+```
+
+The workflow derives the stage from `--version` alone, so there is no separate switch that could
+disagree with the version:
+
+| `--version` | Provider pins | Lands on | Tagged |
+|---|---|---|---|
+| `3.3.1rc1` | newest in PyPI, `rcN` included | `constraints-3-3` (commit) | `constraints-3.3.1rc1` |
+| `3.3.1` | newest final in PyPI | `constraints-3-3` (commit) | `constraints-3.3.1` |
+
+The providers are pinned rather than resolved: every `apache-airflow-providers-*` is named with
+`==` at the newest version PyPI can install, so the constraints record what is actually published
+instead of whatever the resolver settles on. A candidate takes the wave's `rcN` versions along with
+it - a pre-release only wins by sorting above every final release, so a provider without a
+candidate in the wave keeps its release. A final never pins a candidate, which is what makes it
+impossible for a released constraints file to carry an `rc` pin - and it fails instead of passing
+one over: a provider whose newest version on PyPI is a candidate must be released or yanked first
+(see [Release or yank the outstanding provider candidates](#release-or-yank-the-outstanding-provider-candidates)).
+Yanked versions are skipped. Nothing else in the dependency graph can resolve to a pre-release,
+since no other requirement mentions one.
+
+Re-running the workflow for the same candidate adds another commit onto `constraints-X-Y` and
+re-creates the candidate's tag on it, so redoing a candidate's constraints just works. If a
+leftover `constraints-${VERSION}` branch exists (from when candidates had a branch of their own),
+the workflow stops and asks for it to be deleted first.
 
 
 4. Make sure to update Airflow version in ``v3-*-test`` branch after cherry-picking to X.Y.1 in
@@ -1313,7 +1696,7 @@ the older branches, you should set the "skip" field to true.
 ## Verify production images
 
 ```shell script
-for PYTHON in 3.10 3.11 3.12 3.13 3.14
+for PYTHON in 3.11 3.12 3.13 3.14
 do
     docker pull apache/airflow:${VERSION}-python${PYTHON}
     breeze prod-image verify --image-name apache/airflow:${VERSION}-python${PYTHON}
@@ -1507,7 +1890,7 @@ Post on social media about the release:
 
 * LinkedIn: https://www.linkedin.com/company/apache-airflow/
 * Fosstodon: https://fosstodon.org/@airflow
-* Bluesky: https://bsky.app/profile/apache-airflow.bsky.social
+* Bluesky: https://bsky.app/profile/airflow.apache.org
 
 Make sure to attach the release image generated with Figma to the post.
 If you don't have access to the account ask a PMC member to post.
@@ -1518,8 +1901,10 @@ If you don't have access to the account ask a PMC member to post.
 
 This includes:
 
-- Modify `./scripts/ci/prek/supported_versions.py` and let prek do the job.
-- For major/minor release, update version in `airflow/__init__.py` and `docs/docker-stack/` to the next likely minor version release.
+- Modify `./scripts/ci/prek/supported_versions.py` and let prek do the job (it also updates the stable
+  version pins in the `README.md` installation instructions).
+- For major/minor release, update version in `airflow/__init__.py` and `docker-stack-docs/` to the next likely major version release.
+  - New version should be, current major release + 1.0
 - Sync `RELEASE_NOTES.rst` (including deleting relevant `newsfragments`) and `README.md` changes.
 - Updating `Dockerfile` with the new version.
 - Updating `1-airflow_bug_report.yml` issue template in `.github/ISSUE_TEMPLATE/` with the new version.
@@ -1532,9 +1917,12 @@ Update the values of `airflowVersion`, `defaultAirflowTag` and `appVersion` in t
 will use the latest released version. You'll need to update `chart/values.yaml`, `chart/values.schema.json` and
 `chart/Chart.yaml`.
 
-Add or adjust significant `chart/newsfragments` to express that the default version of Airflow has changed.
+Add or adjust already existing significant `chart/newsfragments` to express that the default version of Airflow
+has changed.
 
 In `chart/Chart.yaml`, make sure the screenshot annotations are still all valid URLs.
+
+Add `backport-to-chart/v1-2x-test` for automatic backport PR creation for Helm Chart 1.2x release line. Manual backport is required when automatic one will fail.
 
 ## Update airflow/config_templates/config.yml file
 
@@ -1583,6 +1971,12 @@ According to the policy above, if we have to release clients:
 
     - [Python client](https://github.com/apache/airflow/blob/main/dev/README_RELEASE_PYTHON_CLIENT.md)
     - [Go client](https://github.com/apache/airflow-client-go/blob/main/dev/README_RELEASE_CLIENT.md)
+
+### Remove dependabot workflows for previous minor release
+
+In case you release a new minor version, you should remove the dependabot workflow for the previous minor
+version to avoid confusion and unnecessary updates. For example, if you release 3.3.0,
+you should remove the dependabot workflows for v3-2-test from `.github/workflows/dependabot.yml`
 
 # Additional processes
 

@@ -39,23 +39,49 @@ class InvalidCustomStatsd:
 
 
 class TestStats:
-    def test_load_invalid_custom_stats_client(self):
-        with conf_vars(
-            {
-                ("metrics", "statsd_on"): "True",
-                ("metrics", "statsd_custom_client_path"): f"{__name__}.InvalidCustomStatsd",
-            }
-        ):
+    @pytest.mark.parametrize(
+        ("metrics_config", "expected"),
+        [
+            pytest.param({}, False, id="disabled"),
+            pytest.param({("metrics", "statsd_on"): "True"}, True, id="statsd"),
+            pytest.param({("metrics", "statsd_datadog_enabled"): "True"}, True, id="datadog"),
+            pytest.param({("metrics", "otel_on"): "True"}, True, id="otel"),
+        ],
+    )
+    def test_is_metrics_enabled(self, metrics_config, expected):
+        with conf_vars(metrics_config):
+            assert stats_utils.is_metrics_enabled() is expected
+
+    @pytest.mark.parametrize(
+        ("extra_conf", "expected_message"),
+        [
+            (
+                {},
+                "Your custom StatsD client must extend the statsd.StatsClient in order "
+                "to ensure backwards compatibility.",
+            ),
+            (
+                {("metrics", "statsd_socket_path"): "/var/run/datadog/dsd.socket"},
+                "Your custom StatsD client must extend the statsd.UnixSocketStatsClient "
+                "when using a socket path in order to ensure backwards compatibility.",
+            ),
+        ],
+        ids=["udp", "socket"],
+    )
+    def test_load_invalid_custom_stats_client(self, extra_conf, expected_message):
+        conf = {
+            ("metrics", "statsd_on"): "True",
+            ("metrics", "statsd_custom_client_path"): f"{__name__}.InvalidCustomStatsd",
+            **extra_conf,
+        }
+        with conf_vars(conf):
             importlib.reload(airflow._shared.observability.metrics.stats)
-            factory = stats_utils.get_stats_factory(airflow.observability.stats.Stats)
-            airflow.observability.stats.Stats.initialize(factory=factory)
-            error_message = re.escape(
-                "Your custom StatsD client must extend the statsd."
-                "StatsClient in order to ensure backwards compatibility."
+            airflow.observability.stats.initialize(
+                factory=stats_utils.get_stats_factory(), export_legacy_names=True
             )
             # we assert for Exception here instead of AirflowConfigException to not import from shared configuration
-            with pytest.raises(Exception, match=error_message):
-                airflow.observability.stats.Stats.incr("empty_key")
+            with pytest.raises(Exception, match=re.escape(expected_message)):
+                airflow.observability.stats.incr("empty_key")
         importlib.reload(airflow._shared.observability.metrics.stats)
 
 
@@ -73,10 +99,12 @@ class TestDogStats:
             }
         ):
             importlib.reload(airflow.observability.stats)
-            factory = stats_utils.get_stats_factory(airflow.observability.stats.Stats)
-            airflow.observability.stats.Stats.initialize(factory=factory)
-            assert isinstance(airflow.observability.stats.Stats.dogstatsd, DogStatsd)
-            assert not hasattr(airflow.observability.stats.Stats, "statsd")
+            airflow.observability.stats.initialize(
+                factory=stats_utils.get_stats_factory(), export_legacy_names=True
+            )
+            backend = airflow._shared.observability.metrics.stats._get_backend()
+            assert isinstance(backend.dogstatsd, DogStatsd)
+            assert not hasattr(backend, "statsd")
         # Avoid side-effects
         importlib.reload(airflow.observability.stats)
 
@@ -90,8 +118,10 @@ class TestDogStats:
             }
         ):
             importlib.reload(airflow.observability.stats)
-            factory = stats_utils.get_stats_factory(airflow.observability.stats.Stats)
-            airflow.observability.stats.Stats.initialize(factory=factory)
-            assert isinstance(airflow.observability.stats.Stats.dogstatsd, DogStatsd)
-            assert not hasattr(airflow.observability.stats.Stats, "statsd")
+            airflow.observability.stats.initialize(
+                factory=stats_utils.get_stats_factory(), export_legacy_names=True
+            )
+            backend = airflow._shared.observability.metrics.stats._get_backend()
+            assert isinstance(backend.dogstatsd, DogStatsd)
+            assert not hasattr(backend, "statsd")
         importlib.reload(airflow.observability.stats)

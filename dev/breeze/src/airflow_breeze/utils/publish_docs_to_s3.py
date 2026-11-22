@@ -18,23 +18,42 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
-from functools import cached_property
+from functools import cache, cached_property
 
 import boto3
 
-from airflow_breeze.global_constants import PACKAGES_METADATA_EXCLUDE_NAMES
+from airflow_breeze.global_constants import (
+    PACKAGES_METADATA_EXCLUDE_NAMES,
+    PACKAGES_METADATA_EXCLUDE_VERSIONS,
+)
 from airflow_breeze.utils.console import console_print
 from airflow_breeze.utils.parallel import check_async_run_results, run_with_pool
 
 PROVIDER_NAME_FORMAT = "apache-airflow-providers-{}"
 
-NON_SHORT_NAME_PACKAGES = ["apache-airflow", "apache-airflow-ctl", "docker-stack", "helm-chart", "task-sdk"]
+NON_SHORT_NAME_PACKAGES = [
+    "apache-airflow",
+    "apache-airflow-ctl",
+    "apache-airflow-mypy",
+    "docker-stack",
+    "helm-chart",
+    "java-sdk",
+    "task-sdk",
+    "ts-sdk",
+]
 
 
-s3_client = boto3.client("s3")
-cloudfront_client = boto3.client("cloudfront")
+@cache
+def get_s3_client():
+    return boto3.client("s3")
+
+
+@cache
+def get_cloudfront_client():
+    return boto3.client("cloudfront")
 
 
 class VersionError:
@@ -67,6 +86,7 @@ class S3DocsPublish:
         overwrite: bool = False,
         parallelism: int = 1,
         skip_write_to_stable_folder: bool = False,
+        skip_packages_metadata: bool = False,
     ):
         self.source_dir_path = source_dir_path
         self.destination_location = destination_location
@@ -76,6 +96,7 @@ class S3DocsPublish:
         self.parallelism = parallelism
         self.source_dest_mapping: list[tuple[str, str]] = []
         self.skip_write_to_stable_folder = skip_write_to_stable_folder
+        self.skip_packages_metadata = skip_packages_metadata
 
     @cached_property
     def get_all_docs(self):
@@ -125,7 +146,7 @@ class S3DocsPublish:
 
     def doc_exists(self, s3_bucket_doc_location: str) -> bool:
         bucket, key = self.get_bucket_key(s3_bucket_doc_location)
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+        response = get_s3_client().list_objects_v2(Bucket=bucket, Prefix=key)
 
         return response["KeyCount"] > 0
 
@@ -234,8 +255,8 @@ class S3DocsPublish:
             include_success_outputs=False,
         )
 
-        # Now generate the packages-metadata.json
-        self.generate_packages_metadata()
+        if not self.skip_packages_metadata:
+            self.generate_packages_metadata()
 
         # Add redirects to package folders
         [
@@ -249,7 +270,7 @@ class S3DocsPublish:
         List 'directories' (prefixes) in an S3 path using boto3.
         """
         bucket, prefix = self.get_bucket_key(s3_path.rstrip("/"))
-        paginator = s3_client.get_paginator("list_objects_v2")
+        paginator = get_s3_client().get_paginator("list_objects_v2")
         result = []
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/", Delimiter="/"):
             for cp in page.get("CommonPrefixes", []):
@@ -285,7 +306,7 @@ class S3DocsPublish:
         bucket, _ = self.get_bucket_key(self.destination_location)
 
         console_print("[info]Uploading packages-metadata.json to S3\n")
-        s3_client.put_object(
+        get_s3_client().put_object(
             Bucket=bucket,
             Key="manifest/packages-metadata.json",
             Body=json.dumps(all_packages_infos, indent=2),
@@ -296,7 +317,7 @@ class S3DocsPublish:
         console_print(
             f"[info]Invalidating CloudFront cache for the uploaded files: distribution id {distribution_id}\n"
         )
-        cloudfront_client.create_invalidation(
+        get_cloudfront_client().create_invalidation(
             DistributionId=distribution_id,
             InvalidationBatch={
                 "Paths": {
@@ -309,15 +330,20 @@ class S3DocsPublish:
         console_print(f"[success]CloudFront cache request invalidated successfully: {distribution_id}\n")
 
     def dump_docs_package_metadata(self, package_versions: dict[str, list[str]]):
-        all_packages_infos = [
-            {
-                "package-name": package_name,
-                "all-versions": (all_versions := self.get_latest_minor_versions(package_name, versions)),
-                "stable-version": all_versions[-1],
-            }
-            for package_name, versions in package_versions.items()
-        ]
-
+        all_packages_infos = []
+        for package_name, versions in package_versions.items():
+            all_versions = self.get_latest_minor_versions(package_name, versions)
+            # A package with only development builds, such as Java SDK snapshots, has no release yet.
+            if not all_versions:
+                console_print(f"[warning]No released versions of {package_name}; left out of the metadata\n")
+                continue
+            all_packages_infos.append(
+                {
+                    "package-name": package_name,
+                    "all-versions": all_versions,
+                    "stable-version": all_versions[-1],
+                }
+            )
         return all_packages_infos
 
     @staticmethod
@@ -327,7 +353,11 @@ class S3DocsPublish:
         console_print(f"[info]Getting package versions for {package_name} from:\n")
         console_print(versions)
         all_versions: list[Version] = []
+        excluded_versions = PACKAGES_METADATA_EXCLUDE_VERSIONS.get(package_name, [])
         for v in versions:
+            if v in excluded_versions:
+                console_print(f"[info]Skipping excluded version {package_name}/{v}\n")
+                continue
             try:
                 all_versions.append(Version(v))
             except ValueError as e:
@@ -375,9 +405,134 @@ class S3DocsPublish:
    <body></body>
 </html>"""
 
-        s3_client.put_object(
+        get_s3_client().put_object(
             Bucket=bucket,
             Key=s3_key,
             Body=html_body,
             ContentType="text/html",
         )
+
+
+# Maps the published schema sub-directory to the field in the generated JSON
+# document that carries the version date (``YYYY-MM-DD``).
+SCHEMA_VERSION_FIELDS: dict[str, str] = {
+    "execution-api": "info.version",
+    "supervisor-schema": "api_version",
+    "dag": "version",
+}
+
+
+def _read_nested_field(payload: dict, dotted_field: str) -> str:
+    value: object = payload
+    for part in dotted_field.split("."):
+        if not isinstance(value, dict):
+            raise KeyError(dotted_field)
+        value = value[part]
+    return str(value)
+
+
+def _publish_single_schema(
+    *,
+    destination_location: str,
+    schema_type: str,
+    schema_path: pathlib.Path,
+    overwrite: bool,
+    dry_run: bool,
+) -> bool:
+    """
+    Publish a single dated schema file under *destination_location*.
+
+    :returns: A boolean representing whether something was actually uploaded.
+    """
+    if not schema_path.exists():
+        console_print(f"[error]Schema file not found: {schema_path}\n")
+        sys.exit(1)
+
+    with schema_path.open() as f:
+        payload = json.load(f)
+    version = _read_nested_field(payload, SCHEMA_VERSION_FIELDS[schema_type])
+
+    destination = f"{destination_location.rstrip('/')}/{schema_type}/{version}.json"
+    bucket, key = S3DocsPublish.get_bucket_key(destination)
+
+    already_published = get_s3_client().list_objects_v2(Bucket=bucket, Prefix=key).get("KeyCount", 0) > 0
+    if already_published and not overwrite:
+        console_print(
+            f"[info]Skipping {destination} — version {version} already published "
+            "(pass --overwrite to replace it).\n"
+        )
+        return False
+
+    if dry_run:
+        console_print(f"[info]Dry run: would upload {schema_path} to {destination}\n")
+        return False
+
+    console_print(f"[info]Publishing {schema_type} version {version} to {destination}\n")
+    get_s3_client().put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=schema_path.read_bytes(),
+        ContentType="application/json",
+    )
+    console_print(f"[success]Published {destination}\n")
+    return True
+
+
+def _invalidate_schemas_cache(destination_location: str) -> None:
+    distribution_id = get_cloudfront_distribution(destination_location)
+    _, base_prefix = S3DocsPublish.get_bucket_key(destination_location.rstrip("/"))
+    invalidation_path = f"/{base_prefix}/*"
+    console_print(
+        f"[info]Invalidating CloudFront cache for {invalidation_path}: distribution id {distribution_id}\n"
+    )
+    get_cloudfront_client().create_invalidation(
+        DistributionId=distribution_id,
+        InvalidationBatch={
+            "Paths": {"Quantity": 1, "Items": [invalidation_path]},
+            "CallerReference": f"schemas-{os.environ.get('GITHUB_RUN_ID', '0')}",
+        },
+    )
+    console_print(f"[success]CloudFront cache invalidation requested: {distribution_id}\n")
+
+
+def publish_schemas_to_s3(
+    *,
+    destination_location: str,
+    execution_api_schema: pathlib.Path | None,
+    supervisor_schema: pathlib.Path | None,
+    dag_schema: pathlib.Path | None = None,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> None:
+    """Publish generated schema artifacts under *destination_location*.
+
+    ``destination_location`` is an ``s3://<bucket>/<prefix>/`` location (e.g.
+    ``s3://live-docs-airflow-apache-org/schemas/``); each schema is written to
+    ``<prefix>/<schema-type>/<version>.json`` and the ``<prefix>`` is invalidated
+    in CloudFront afterwards.
+    """
+    to_publish: list[tuple[str, pathlib.Path]] = []
+    if execution_api_schema:
+        to_publish.append(("execution-api", execution_api_schema))
+    if supervisor_schema:
+        to_publish.append(("supervisor-schema", supervisor_schema))
+    if dag_schema:
+        to_publish.append(("dag", dag_schema))
+
+    if not to_publish:
+        console_print("[error]No schema files provided. Pass --execution-api, --supervisor and/or --dag.\n")
+        sys.exit(1)
+
+    uploaded_any = False
+    for schema_type, schema_path in to_publish:
+        uploaded = _publish_single_schema(
+            destination_location=destination_location,
+            schema_type=schema_type,
+            schema_path=schema_path,
+            overwrite=overwrite,
+            dry_run=dry_run,
+        )
+        uploaded_any = uploaded_any or uploaded
+
+    if uploaded_any and not dry_run:
+        _invalidate_schemas_cache(destination_location)

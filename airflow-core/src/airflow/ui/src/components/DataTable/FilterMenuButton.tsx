@@ -16,29 +16,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { IconButton } from "@chakra-ui/react";
-import { flexRender, type Header, type Table } from "@tanstack/react-table";
+import { flexRender, type Header, type RowData, type Table } from "@tanstack/react-table";
 import { useTranslation } from "react-i18next";
-import { MdFilterList } from "react-icons/md";
+import { LuColumns3 } from "react-icons/lu";
 
-import { Menu } from "src/components/ui";
-import { Checkbox } from "src/components/ui/Checkbox";
+import { Menu, IconButton, Checkbox } from "src/system-components";
 
-type Props<TData> = {
-  readonly table: Table<TData>;
+import type { DataTableFeatures } from "./features";
+
+type Props<TData extends RowData> = {
+  readonly table: Table<DataTableFeatures, TData>;
 };
 
-const FilterMenuButton = <TData,>({ table }: Props<TData>) => {
+export const FilterMenuButton = <TData extends RowData>({ table }: Props<TData>) => {
   "use no memo"; // remove if https://github.com/TanStack/table/issues/5567 is resolved
 
-  const { t: translate } = useTranslation("common");
-  const filterLabel = translate("table.filterColumns");
+  const { t: translate } = useTranslation();
 
   return (
-    <Menu.Root closeOnSelect={false} positioning={{ placement: "bottom" }}>
+    <Menu.Root closeOnSelect={false} tooltipLabel={translate("table.filterColumns")}>
       <Menu.Trigger asChild>
-        <IconButton aria-label={filterLabel} margin={1} padding={0} title={filterLabel} variant="ghost">
-          <MdFilterList size="1" />
+        <IconButton aria-label={translate("table.filterColumns")} variant="outline">
+          <LuColumns3 />
         </IconButton>
       </Menu.Trigger>
       <Menu.Content>
@@ -48,7 +47,7 @@ const FilterMenuButton = <TData,>({ table }: Props<TData>) => {
           .map((column) => {
             const text = flexRender(column.columnDef.header, {
               column,
-              header: { column } as Header<TData, unknown>,
+              header: { column } as Header<DataTableFeatures, TData>,
               table,
             });
 
@@ -71,5 +70,3 @@ const FilterMenuButton = <TData,>({ table }: Props<TData>) => {
     </Menu.Root>
   );
 };
-
-export default FilterMenuButton;

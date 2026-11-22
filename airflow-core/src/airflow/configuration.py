@@ -28,13 +28,12 @@ import warnings
 from base64 import b64encode
 from collections.abc import Callable
 from configparser import ConfigParser
+from importlib.util import find_spec
 from inspect import ismodule
 from io import StringIO
 from re import Pattern
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, overload
 from urllib.parse import urlsplit
-
-from typing_extensions import overload
 
 from airflow._shared.configuration.parser import (
     AirflowConfigParser as _SharedAirflowConfigParser,
@@ -57,14 +56,18 @@ if not sys.warnoptions:
     warnings.filterwarnings(action="default", category=DeprecationWarning, module="airflow")
     warnings.filterwarnings(action="default", category=PendingDeprecationWarning, module="airflow")
 
-_SQLITE3_VERSION_PATTERN = re.compile(r"(?P<version>^\d+(?:\.\d+)*)\D?.*$")
-
 ConfigType = str | int | float | bool
 ConfigOptionsDictType = dict[str, ConfigType]
 ConfigSectionSourcesType = dict[str, str | tuple[str, str]]
 ConfigSourcesType = dict[str, ConfigSectionSourcesType]
 
 ENV_VAR_PREFIX = "AIRFLOW__"
+
+_AIRFLOW_V2_SENSITIVE_OPTIONS = {
+    ("core", "dataset_manager_kwargs"),
+    ("core", "internal_api_secret_key"),
+    ("smtp", "smtp_password"),
+}
 
 
 class _SecretKeys:
@@ -96,13 +99,6 @@ class ConfigModifications:
 
     def add_default_update(self, section: str, option: str, new_default: str) -> None:
         self.default_updates[(section, option)] = new_default
-
-
-def _parse_sqlite_version(s: str) -> tuple[int, ...]:
-    match = _SQLITE3_VERSION_PATTERN.match(s)
-    if match is None:
-        return ()
-    return tuple(int(p) for p in match.group("version").split("."))
 
 
 @overload
@@ -196,17 +192,17 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         *args,
         **kwargs,
     ):
-        configuration_description = retrieve_configuration_description(include_providers=False)
+        _configuration_description = retrieve_configuration_description(include_providers=False)
         # For those who would like to use a different data structure to keep defaults:
         # We have to keep the default values in a ConfigParser rather than in any other
         # data structure, because the values we have might contain %% which are ConfigParser
         # interpolation placeholders. The _default_values config parser will interpolate them
         # properly when we call get() on it.
-        _default_values = create_default_config_parser(configuration_description)
+        _default_values = create_default_config_parser(_configuration_description)
         from airflow.providers_manager import ProvidersManager
 
         super().__init__(
-            configuration_description,
+            _configuration_description,
             _default_values,
             ProvidersManager,
             create_default_config_parser,
@@ -214,14 +210,13 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
             *args,
             **kwargs,
         )
-        self.configuration_description = configuration_description
+        self._configuration_description = _configuration_description
         self._default_values = _default_values
         if default_config is not None:
             self._update_defaults_from_string(default_config)
         self._update_logging_deprecated_template_to_one_from_defaults()
         self.is_validated = False
         self._suppress_future_warnings = False
-        self._providers_configuration_loaded = False
 
     @property
     def _validators(self) -> list[Callable[[], None]]:
@@ -280,6 +275,7 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         ("logging", "gunicorn_logging_level"): _available_logging_levels,
         ("webserver", "analytical_tool"): ["google_analytics", "metarouter", "segment", "matomo", ""],
         ("api", "grid_view_sorting_order"): ["topological", "hierarchical_alphabetical"],
+        ("logging", "dag_processor_log_target"): ["file", "stdout"],
     }
 
     upgraded_values: dict[tuple[str, str], str]
@@ -292,6 +288,7 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         include_descriptions: bool = True,
         extra_spacing: bool = True,
         modifications: ConfigModifications | None = None,
+        hide_sensitive: bool = False,
     ) -> None:
         """
         Write a configuration file using a ConfigModifications object.
@@ -308,6 +305,8 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         :param include_descriptions: Whether to include section descriptions.
         :param extra_spacing: Whether to insert an extra blank line after each option.
         :param modifications: ConfigModifications instance with rename, remove, and default updates.
+        :param hide_sensitive: If True, values of options registered as sensitive are written as
+            ``< hidden >``. Only suitable for preview output, never for a real configuration file.
         """
         modifications = modifications or ConfigModifications()
         output: dict[str, list[tuple[str, str, bool, str]]] = {}
@@ -337,8 +336,15 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
 
                 default_value = self.get_default_value(effective_section, effective_option, fallback="")
                 is_default = str(value) == str(default_value)
+                value_to_write = str(value)
+                if hide_sensitive and (
+                    key in _AIRFLOW_V2_SENSITIVE_OPTIONS
+                    or self.is_sensitive_option(section, option)
+                    or self.is_sensitive_option(effective_section, effective_option)
+                ):
+                    value_to_write = "< hidden >"
                 output.setdefault(effective_section.lower(), []).append(
-                    (effective_option, str(value), is_default, mod_comment)
+                    (effective_option, value_to_write, is_default, mod_comment)
                 )
 
         for section, options in output.items():
@@ -367,44 +373,37 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
             if content:
                 file.write(f"{content}\n\n")
 
-    def _ensure_providers_config_loaded(self) -> None:
-        """Ensure providers configurations are loaded."""
-        if not self._providers_configuration_loaded:
-            from airflow.providers_manager import ProvidersManager
-
-            ProvidersManager().initialize_providers_configuration()
-
-    def _ensure_providers_config_unloaded(self) -> bool:
-        """Ensure providers configurations are unloaded temporarily to load core configs. Returns True if providers get unloaded."""
-        if self._providers_configuration_loaded:
-            self.restore_core_default_configuration()
-            return True
-        return False
-
-    def _reload_provider_configs(self) -> None:
-        """Reload providers configuration."""
-        self.load_providers_configuration()
-
     def _upgrade_postgres_metastore_conn(self):
         """
-        Upgrade SQL schemas.
+        Normalize the metadata DB URL scheme.
 
-        As of SQLAlchemy 1.4, schemes `postgres+psycopg2` and `postgres`
-        must be replaced with `postgresql`.
+        SQLAlchemy does not accept the schemes `postgres+psycopg2` and `postgres`;
+        they are replaced with `postgresql+psycopg` if the psycopg (v3) driver
+        is installed, or `postgresql+psycopg2` otherwise, and a warning is emitted.
+        The valid bare `postgresql` scheme is rewritten the same way, without a
+        warning, to make the driver explicit.
         """
         section, key = "database", "sql_alchemy_conn"
         old_value = self.get(section, key, _extra_stacklevel=1)
-        bad_schemes = ["postgres+psycopg2", "postgres"]
-        good_scheme = "postgresql"
+        bad_schemes = ["postgres+psycopg2", "postgres", "postgresql"]
+        # The provider-side hooks (common.sql / postgres / amazon) also gate psycopg (v3) on an
+        # ``_is_sqlalchemy_2()`` check, because they support Airflow 2.11 on SQLAlchemy 1.4, which has
+        # no native ``postgresql+psycopg`` dialect. airflow-core pins ``sqlalchemy>=2.0``, so that
+        # dialect is always present when the package is importable — ``find_spec`` alone suffices here.
+        good_scheme = "postgresql+psycopg" if find_spec("psycopg") is not None else "postgresql+psycopg2"
         parsed = urlsplit(old_value)
         if parsed.scheme in bad_schemes:
-            warnings.warn(
-                f"Bad scheme in Airflow configuration [database] sql_alchemy_conn: `{parsed.scheme}`. "
-                "As of SQLAlchemy 1.4 (adopted in Airflow 2.3) this is no longer supported.  You must "
-                f"change to `{good_scheme}` before the next Airflow release.",
-                FutureWarning,
-                stacklevel=1,
-            )
+            # The bare ``postgresql`` scheme is valid in SQLAlchemy; we only make the driver explicit,
+            # so don't warn about it. ``postgres`` and ``postgres+psycopg2`` are really unsupported.
+            if parsed.scheme != "postgresql":
+                warnings.warn(
+                    f"Unsupported scheme `{parsed.scheme}` in Airflow configuration [database] "
+                    "sql_alchemy_conn: SQLAlchemy no longer accepts it. "
+                    f"Airflow is using `{good_scheme}` instead for now; change the scheme to "
+                    f"`postgresql` (Airflow picks the driver) or `{good_scheme}`.",
+                    FutureWarning,
+                    stacklevel=1,
+                )
             self.upgraded_values[(section, key)] = old_value
             new_value = re.sub("^" + re.escape(f"{parsed.scheme}://"), f"{good_scheme}://", old_value)
             self._update_env_var(section=section, name=key, new_value=new_value)
@@ -437,7 +436,7 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         import sqlite3
 
         min_sqlite_version = (3, 15, 0)
-        if _parse_sqlite_version(sqlite3.sqlite_version) >= min_sqlite_version:
+        if sqlite3.sqlite_version_info >= min_sqlite_version:
             return
 
         from airflow.utils.docs import get_docs_url
@@ -514,7 +513,7 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
             for key, value in self.items(section):
                 if value is not None:
                     if self.has_option(section, key):
-                        self.remove_option(section, key)
+                        self.remove_option(section, key, remove_default=False)
                     if self.is_template(section, key) or not isinstance(value, str):
                         self.set(section, key, value)
                     else:
@@ -524,11 +523,6 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
         """Remove all read configurations, leaving only default values in the config."""
         for section in self.sections():
             self.remove_section(section)
-
-    @property
-    def providers_configuration_loaded(self) -> bool:
-        """Checks if providers have been loaded."""
-        return self._providers_configuration_loaded
 
     def _get_config_value_from_secret_backend(self, config_key: str) -> str | None:
         """
@@ -644,16 +638,18 @@ def write_default_airflow_configuration_if_needed() -> AirflowConfigParser:
             # We know that fernet_key is not set, so we can generate it, set as global key
             # and also write it to the config file so that same key will be used next time
             _SecretKeys.fernet_key = _generate_fernet_key()
-            conf.configuration_description["core"]["options"]["fernet_key"]["default"] = (
+            conf._configuration_description["core"]["options"]["fernet_key"]["default"] = (
                 _SecretKeys.fernet_key
             )
             conf._default_values.set("core", "fernet_key", _SecretKeys.fernet_key)
 
         _SecretKeys.jwt_secret_key = b64encode(os.urandom(16)).decode("utf-8")
-        conf.configuration_description["api_auth"]["options"]["jwt_secret"]["default"] = (
+        conf._configuration_description["api_auth"]["options"]["jwt_secret"]["default"] = (
             _SecretKeys.jwt_secret_key
         )
         conf._default_values.set("api_auth", "jwt_secret", _SecretKeys.jwt_secret_key)
+        # Invalidate cached configuration_description so it recomputes with the updated base
+        conf.invalidate_cache()
         pathlib.Path(airflow_config.__fspath__()).touch()
         make_group_other_inaccessible(airflow_config.__fspath__())
         with open(airflow_config, "w") as file:

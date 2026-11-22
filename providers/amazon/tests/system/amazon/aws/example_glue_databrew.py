@@ -44,7 +44,7 @@ except ImportError:
     # Compatibility for Airflow < 3.1
     from airflow.utils.trigger_rule import TriggerRule  # type: ignore[no-redef,attr-defined]
 
-from system.amazon.aws.utils import SystemTestContextBuilder
+from system.amazon.aws.utils import SystemTestContextBuilder, print_and_delete_log_group_task
 
 DAG_ID = "example_glue_databrew"
 
@@ -165,6 +165,8 @@ with DAG(DAG_ID, schedule="@once", start_date=pendulum.datetime(2023, 1, 1, tz="
         delete_dataset(dataset_name),
         delete_bucket,
         delete_output_bucket,
+        # DataBrew names the log group after the job and does not delete it with the job.
+        print_and_delete_log_group_task(f"/aws-glue-databrew/jobs-{job_name}"),
     )
 
     from tests_common.test_utils.watcher import watcher
@@ -175,5 +177,5 @@ with DAG(DAG_ID, schedule="@once", start_date=pendulum.datetime(2023, 1, 1, tz="
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

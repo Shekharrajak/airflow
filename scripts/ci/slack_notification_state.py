@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # ///
 """
 Determine whether to send a Slack notification based on previous state.
@@ -44,7 +44,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REMINDER_INTERVAL_HOURS = 24
@@ -54,10 +54,15 @@ PREV_STATE_DIR = Path("./prev-slack-state")
 
 def download_previous_state(artifact_name: str, repo: str) -> dict | None:
     """Download previous notification state artifact from GitHub Actions."""
+    # `gh api` defaults to POST when -f/-F parameters are passed, which makes
+    # the artifacts list endpoint return 404. Force GET so the parameters are
+    # encoded as query string.
     result = subprocess.run(
         [
             "gh",
             "api",
+            "--method",
+            "GET",
             f"repos/{repo}/actions/artifacts",
             "-f",
             f"name={artifact_name}",
@@ -135,7 +140,7 @@ def determine_action(current_failures: list[str], prev_state: dict | None) -> st
     """
     prev_failures = sorted(prev_state.get("failures", [])) if prev_state else []
     prev_notified = prev_state.get("last_notified") if prev_state else None
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     if current_failures:
         if not prev_failures:
@@ -159,7 +164,7 @@ def determine_action(current_failures: list[str], prev_state: dict | None) -> st
 
 def save_state(current_failures: list[str], action: str, prev_notified: str | None) -> None:
     """Save current state to file for upload as artifact."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     new_state = {

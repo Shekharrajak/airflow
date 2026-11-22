@@ -19,13 +19,58 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from datetime import datetime
+from functools import cache
 from typing import Annotated, Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from airflow._shared.secrets_masker import redact, should_hide_value_for_key
 from airflow.api_fastapi.core_api.base import BaseModel, StrictBaseModel, make_partial_model
+from airflow.configuration import conf
+
+_MASK = "***"
+
+
+@cache
+def _sensitive_extra_keys() -> frozenset[str]:
+    """
+    Return the ``extra`` keys any provider declares sensitive, as plain and ``extra__<type>__`` names.
+
+    Providers mark a connection field as a secret with ``format: password`` in their
+    ``conn-fields``. The name-based masking in ``redact`` cannot use that knowledge, because it
+    only knows a fixed list of secret names, and ``config`` is not one of them. Read from provider
+    metadata, without importing any hook.
+
+    Not limited to the connection's current type: after a ``conn_type`` change the stored
+    ``extra`` still holds the previous type's secrets, and the new type does not declare them.
+    """
+    from airflow.providers_manager import ProvidersManager
+
+    keys: set[str] = set()
+    for prefixed_name, widget in ProvidersManager()._connection_form_widgets_from_metadata.items():
+        if widget.is_sensitive:
+            keys.update((widget.field_name, prefixed_name))
+    return frozenset(keys)
+
+
+def restore_provider_sensitive_extra(extra: Any, stored_extra: Any) -> Any:
+    """
+    Put back the stored value of provider-declared sensitive ``extra`` fields submitted as the mask.
+
+    ``merge`` only restores keys on its fixed list of secret names, so the keys masked by
+    ``ConnectionResponse.redact_provider_sensitive_extra`` would otherwise be saved as the mask
+    when a client sends a response's ``extra`` back.
+    """
+    if not isinstance(extra, dict) or not isinstance(stored_extra, dict):
+        return extra
+    return {
+        key: stored_extra[key]
+        if value == _MASK and key in stored_extra and key in _sensitive_extra_keys()
+        else value
+        for key, value in extra.items()
+    }
 
 
 # Response Models
@@ -50,19 +95,33 @@ class ConnectionResponse(BaseModel):
             return None
         return str(redact(v, field_info.field_name))
 
+    @model_validator(mode="after")
+    def redact_provider_sensitive_extra(self) -> ConnectionResponse:
+        """Mask the ``extra`` fields any provider declares sensitive."""
+        if not self.extra or not _sensitive_extra_keys():
+            return self
+        extra = json.loads(self.extra)
+        if not isinstance(extra, dict):
+            return self
+        for key, value in extra.items():
+            if key in _sensitive_extra_keys() and value not in (None, ""):
+                extra[key] = _MASK
+        self.extra = json.dumps(extra)
+        return self
+
     @field_validator("extra", mode="before")
     @classmethod
     def redact_extra(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
+        if v is None or v == "":
+            return v
         try:
             extra_dict = json.loads(v)
             redacted_dict = redact(extra_dict)
             return json.dumps(redacted_dict)
         except json.JSONDecodeError:
             # Do not return un-redacted extra because this could cause sensitive information to be exposed.
-            # This code path should never been hit as ``Connection._validate_extra`` sure that ``extra`` is
-            # always a valid JSON string. We add this safeguard just in case and to make the coupling
+            # This code path should never be hit as ``Connection._validate_extra`` makes sure that ``extra`` is
+            # always a valid JSON string (if truthy). We add this safeguard just in case and to make the coupling
             # explicit.
             raise ValueError(
                 "This code path should never happen as persisted Connections (DB layer) should always enforce `extra` as a JSON string."
@@ -77,10 +136,28 @@ class ConnectionCollectionResponse(BaseModel):
 
 
 class ConnectionTestResponse(BaseModel):
-    """Connection Test serializer for responses."""
+    """Connection Test serializer for synchronous test responses."""
 
     status: bool
     message: str
+
+
+class ConnectionTestQueuedResponse(BaseModel):
+    """Response returned when a connection test has been enqueued for worker execution."""
+
+    token: str
+    connection_id: str
+    state: str
+
+
+class AsyncConnectionTestResponse(BaseModel):
+    """Response returned when polling for the status of an enqueued connection test."""
+
+    token: str
+    connection_id: str
+    state: str
+    result_message: str | None = None
+    created_at: datetime
 
 
 class ConnectionHookFieldBehavior(BaseModel):
@@ -199,5 +276,36 @@ class ConnectionBody(StrictBaseModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def validate_team_name(self) -> ConnectionBody:
+        if self.team_name is not None and not conf.getboolean("core", "multi_team"):
+            raise ValueError(
+                "team_name cannot be set when multi_team mode is disabled. Please contact your administrator."
+            )
+        return self
+
 
 ConnectionBodyPartial = make_partial_model(ConnectionBody)
+
+
+class ConnectionTestRequestBody(ConnectionBody):
+    """
+    Request body for enqueueing a connection test on a worker.
+
+    Inherits ``connection_id`` pattern, ``extra`` JSON validation, and
+    ``team_name`` handling from ``ConnectionBody`` so tested connections share
+    the same input contract as persisted ones.
+    """
+
+    commit_on_success: bool = Field(
+        default=False,
+        description="If True, save or update the connection in the connection table when the test succeeds.",
+    )
+    executor: str | None = Field(
+        default=None,
+        description="Executor name to dispatch the connection test to.",
+    )
+    queue: str | None = Field(
+        default=None,
+        description="Worker queue to route the connection test to (executor-dependent).",
+    )

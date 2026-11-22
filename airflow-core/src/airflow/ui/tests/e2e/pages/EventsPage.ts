@@ -18,7 +18,9 @@
  */
 import type { Locator, Page } from "@playwright/test";
 import { expect } from "@playwright/test";
+
 import { BasePage } from "tests/e2e/pages/BasePage";
+import { DATA_ROWS } from "tests/e2e/utils/ui/selectors";
 
 export class EventsPage extends BasePage {
   public readonly eventColumn: Locator;
@@ -32,7 +34,8 @@ export class EventsPage extends BasePage {
 
   public constructor(page: Page) {
     super(page);
-    this.eventsPageTitle = page.getByRole("heading", { level: 2, name: "Audit Log" });
+    // DataTable's row count is the page heading, so this reads "950 Events" rather than "Audit Log"
+    this.eventsPageTitle = page.getByRole("heading", { name: /events/i });
     this.eventsTable = page.getByTestId("table-list");
     this.eventColumn = this.eventsTable.getByRole("columnheader").filter({ hasText: "Event" });
     this.extraColumn = this.eventsTable.getByRole("columnheader").filter({ hasText: "Extra" });
@@ -41,7 +44,7 @@ export class EventsPage extends BasePage {
       .filter({ has: page.getByTestId("add-filter-button") })
       .first();
     this.ownerColumn = this.eventsTable.getByRole("columnheader").filter({ hasText: "User" });
-    this.tableRows = this.eventsTable.locator("tbody").getByRole("row");
+    this.tableRows = this.eventsTable.locator(DATA_ROWS);
     this.whenColumn = this.eventsTable.getByRole("columnheader").filter({ hasText: "When" });
   }
 
@@ -52,11 +55,12 @@ export class EventsPage extends BasePage {
   public async addFilter(filterName: string): Promise<void> {
     const filterButton = this.page.getByTestId("add-filter-button");
 
+    await expect(filterButton).toBeVisible({ timeout: 30_000 });
     await filterButton.click();
 
     const filterMenu = this.page.getByRole("menu");
 
-    await expect(filterMenu).toBeVisible({ timeout: 10_000 });
+    await expect(filterMenu).toBeVisible({ timeout: 30_000 });
 
     const menuItem = filterMenu.getByRole("menuitem", { name: filterName });
 
@@ -77,11 +81,7 @@ export class EventsPage extends BasePage {
   public async getEventLogRows(): Promise<Array<Locator>> {
     const count = await this.tableRows.count();
 
-    if (count === 0) {
-      return [];
-    }
-
-    return this.tableRows.all();
+    return count === 0 ? [] : this.tableRows.all();
   }
 
   public async getEventTypes(): Promise<Array<string>> {
@@ -114,8 +114,10 @@ export class EventsPage extends BasePage {
   }
 
   public async navigate(): Promise<void> {
-    await this.navigateTo("/events");
-    await this.waitForTableLoad();
+    await expect(async () => {
+      await this.navigateTo("/events");
+      await this.waitForTableLoad();
+    }).toPass({ intervals: [2000], timeout: 60_000 });
   }
 
   public async navigateToAuditLog(dagId: string): Promise<void> {
@@ -124,7 +126,7 @@ export class EventsPage extends BasePage {
         timeout: 10_000,
         waitUntil: "domcontentloaded",
       });
-      await this.eventsTable.waitFor({ state: "visible", timeout: 5000 });
+      await expect(this.eventsTable).toBeVisible();
     }).toPass({ intervals: [2000], timeout: 60_000 });
     await this.waitForTableLoad();
   }
@@ -142,10 +144,39 @@ export class EventsPage extends BasePage {
       .locator("input")
       .first();
 
-    await expect(filterInput).toBeVisible({ timeout: 10_000 });
+    await expect(filterInput).toBeVisible({ timeout: 30_000 });
     await filterInput.fill(value);
+
+    const responsePromise = this.page.waitForResponse(
+      (res) => res.url().includes("/api/v2/eventLogs") && res.ok(),
+      { timeout: 30_000 },
+    );
+
     await filterInput.press("Enter");
+    await responsePromise;
     await this.waitForTableLoad();
+  }
+
+  public async verifyFilterMenuHasOptions(): Promise<void> {
+    const filterButton = this.page.getByTestId("add-filter-button");
+
+    await expect(filterButton).toBeVisible();
+    await filterButton.click();
+
+    const filterMenu = this.page.getByRole("menu");
+
+    await expect(filterMenu).toBeVisible({ timeout: 5000 });
+
+    const textSearchOptions = this.page.getByRole("menuitem").filter({
+      hasText: /DAG ID|Event Type|User/,
+    });
+
+    const textSearchOptionsCount = await textSearchOptions.count();
+
+    expect(textSearchOptionsCount).toBeGreaterThan(0);
+    await expect(textSearchOptions.first()).toBeVisible();
+
+    await this.page.keyboard.press("Escape");
   }
 
   public async verifyLogEntriesWithData(): Promise<void> {

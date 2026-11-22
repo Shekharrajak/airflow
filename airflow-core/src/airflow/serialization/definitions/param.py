@@ -22,10 +22,16 @@ import collections.abc
 import copy
 from typing import TYPE_CHECKING, Any, Literal
 
+from airflow._shared.timezones.rfc3339 import is_iso8601_datetime, is_rfc3339_datetime
+from airflow.exceptions import ParamValidationError
 from airflow.serialization.definitions.notset import NOTSET, is_arg_set
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+
+
+def _check_date_time(value: Any) -> bool:
+    return is_rfc3339_datetime(value) or is_iso8601_datetime(value)
 
 
 class SerializedParam:
@@ -55,12 +61,18 @@ class SerializedParam:
         :param raises: All exceptions during validation are suppressed by
             default. They are only raised if this is set to *True* instead.
         """
-        import jsonschema
+        from jsonschema import FormatChecker, validate
 
+        format_checker = FormatChecker()
+        format_checker.checks("date-time")(_check_date_time)
         try:
             if not is_arg_set(value := self.value):
                 raise ValueError("No value passed")
-            jsonschema.validate(value, self.schema, format_checker=jsonschema.FormatChecker())
+            validate(
+                value,
+                self.schema,
+                format_checker=format_checker,
+            )
         except Exception:
             if not raises:
                 return None
@@ -143,7 +155,7 @@ class SerializedParamsDict(collections.abc.Mapping[str, Any]):
             try:
                 return v.resolve(raises=True)
             except Exception as e:
-                raise ValueError(f"Invalid input for param {k}: {e}") from None
+                raise ParamValidationError(f"Invalid input for param {k}: {e}") from None
 
         return {k: _validate_one(k, v) for k, v in self.__dict.items()}
 

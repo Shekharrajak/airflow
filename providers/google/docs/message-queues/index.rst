@@ -32,9 +32,27 @@ The Google Cloud Pub/Sub Queue Provider is a message queue provider that uses Go
 It allows you to send and receive messages using Cloud Pub/Sub in your Airflow workflows
 with :class:`~airflow.providers.common.messaging.triggers.msg_queue.MessageQueueTrigger` common message queue interface.
 
-.. include:: /../src/airflow/providers/google/event_scheduling/events/pubsub.py
-    :start-after: [START pubsub_message_queue_provider_description]
-    :end-before: [END pubsub_message_queue_provider_description]
+* It uses ``google+pubsub`` as the scheme for identifying the provider.
+* For parameter definitions, take a look at :class:`~airflow.providers.google.cloud.triggers.pubsub.PubsubPullTrigger`.
+
+.. code-block:: python
+
+    from airflow.providers.common.messaging.triggers.msg_queue import MessageQueueTrigger
+    from airflow.sdk import Asset, AssetWatcher
+
+    trigger = MessageQueueTrigger(
+        scheme="google+pubsub",
+        # Additional PubsubPullTrigger parameters as needed
+        project_id="my_project",
+        subscription="my_subscription",
+        ack_messages=True,
+        max_messages=1,
+        gcp_conn_id="google_cloud_default",
+        poke_interval=60.0,
+        return_immediately=False,
+    )
+
+    asset = Asset("pubsub_queue_asset", watchers=[AssetWatcher(name="pubsub_watcher", trigger=trigger)])
 
 Pub/Sub Message Queue Trigger
 -----------------------------
@@ -47,7 +65,7 @@ Inherited from :class:`~airflow.providers.common.messaging.triggers.msg_queue.Me
 Wait for a message in a queue
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Below is an example of how you can configure an Airflow DAG to be triggered by a message in Pub/Sub.
+Below is an example of how you can configure an Airflow Dag to be triggered by a message in Pub/Sub.
 
 .. exampleinclude:: /../tests/system/google/event_scheduling/example_event_schedule_pubsub.py
     :language: python
@@ -63,7 +81,7 @@ How it works
    The ``AssetWatcher`` associate a trigger with a name. This name helps you identify which trigger is associated to which
    asset.
 
-3. **Event-Driven DAG**: Instead of running on a fixed schedule, the DAG executes when the asset receives an update
+3. **Event-Driven Dag**: Instead of running on a fixed schedule, the Dag executes when the asset receives an update
    (e.g., a new message in the queue).
 
 For how to use the trigger, refer to the documentation of the

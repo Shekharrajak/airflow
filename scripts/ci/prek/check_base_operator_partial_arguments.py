@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "rich>=13.6.0",
 # ]
@@ -49,8 +49,6 @@ IGNORED = {
     "default_args",
     # Deprecated and is aliased to max_active_tis_per_dag.
     "task_concurrency",
-    # attrs internals.
-    "HIDE_ATTRS_FROM_UI",
     # Only on BaseOperator.
     "_dag",
     "output",

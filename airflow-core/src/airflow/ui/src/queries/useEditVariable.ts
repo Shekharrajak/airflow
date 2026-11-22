@@ -16,12 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { useVariableServiceGetVariablesKey, useVariableServicePatchVariable } from "openapi/queries";
-import { toaster } from "src/components/ui";
+
+import { toaster } from "src/system-components";
+
 import type { VariableBody } from "src/pages/Variables/ManageVariable/VariableForm";
 
 export const useEditVariable = (
@@ -78,12 +81,13 @@ export const useEditVariable = (
 
     const parsedDescription =
       editVariableRequestBody.description === "" ? undefined : editVariableRequestBody.description;
+    const teamName = editVariableRequestBody.team_name === "" ? undefined : editVariableRequestBody.team_name;
 
     mutate({
       requestBody: {
         description: parsedDescription,
         key: editVariableRequestBody.key,
-        team_name: editVariableRequestBody.team_name,
+        team_name: teamName,
         value: editVariableRequestBody.value,
       },
       updateMask,

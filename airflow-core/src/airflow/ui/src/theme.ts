@@ -16,18 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 /* eslint-disable perfectionist/sort-objects */
+import type { CSSProperties } from "react";
 
-/* eslint-disable max-lines */
 import {
   createSystem,
   defaultConfig,
   defineConfig,
   mergeConfigs,
   type SystemStyleObject,
+  type ThemingConfig,
 } from "@chakra-ui/react";
-import type { CSSProperties } from "react";
 
 import type { Theme } from "openapi/requests/types.gen";
 
@@ -41,7 +40,7 @@ const generateSemanticTokens = (color: string, darkContrast: string = "white") =
   focusRing: { value: { _light: `{colors.${color}.800}`, _dark: `{colors.${color}.200}` } },
 });
 
-const defaultAirflowTheme = {
+const defaultAirflowTheme: ThemingConfig = {
   // See https://chakra-ui.com/docs/theming/colors for more information on the colors used here.
   tokens: {
     colors: {
@@ -352,6 +351,81 @@ const defaultAirflowTheme = {
       },
     },
   },
+  recipes: {
+    // IconButton in Chakra v3 uses the button recipe (it is a Button with px/py:0).
+    // Overriding defaultVariants here sets the default size for both Button and IconButton.
+    button: {
+      base: {
+        colorPalette: "brand",
+      },
+      defaultVariants: { size: "sm" } as Record<string, string>,
+    },
+  },
+  slotRecipes: {
+    // Nearly all dialogs in the app use size="xl"; make it the default.
+    dialog: {
+      slots: [],
+      base: {
+        body: { padding: 4 },
+        // Chakra's recipe floats the close button over the content; ours sits inside
+        // the flex header instead, so it must lay out in flow or it overlaps header
+        // content such as the import-error search bar.
+        closeTrigger: { position: "static" },
+        // Chakra defaults the content to `bg.panel`, which resolves to gray.950 in
+        // dark mode — far darker than the page. Use the standard background so a
+        // dialog sits at the same level as everything else.
+        content: { bg: "bg" },
+        // Sized dialogs are `width: 100%` under a `maxW` cap, so below that cap they run
+        // edge to edge. Inset the positioner (the same lever Chakra's own `cover` size
+        // uses) to keep a gutter on narrow viewports.
+        positioner: { paddingInline: 4 },
+        // Only rendered when a dialog actually has footer content, so the rule doubles
+        // as "separate the actions from the body whenever actions exist".
+        footer: { borderTopColor: "border", borderTopWidth: "1px", paddingX: 4, paddingY: 3 },
+        // Mirror the Nav sidebar so the header reads as chrome rather than content.
+        // `inherit` keeps the tinted band inside the content's rounded top corners.
+        header: { bg: "brand.muted", borderTopRadius: "inherit", paddingX: 4, paddingY: 3 },
+        title: { fontSize: "lg" },
+      },
+      variants: {
+        size: {
+          // `cover` and `full` are meant to reach the viewport edges, so they opt out
+          // of the gutter (`cover` keeps the inset its own variant already defines).
+          cover: { positioner: { paddingInline: 10 } },
+          full: { positioner: { paddingInline: 0 } },
+        },
+      },
+      defaultVariants: { size: "xl" } as Record<string, string>,
+    },
+    checkbox: {
+      slots: [],
+      base: {
+        root: {
+          colorPalette: "brand",
+        },
+      },
+      defaultVariants: { size: "sm" } as Record<string, string>,
+    },
+    select: {
+      slots: [],
+      defaultVariants: { size: "sm" } as Record<string, string>,
+    },
+    switch: {
+      slots: [],
+      base: {
+        control: {
+          shadow: "inset 0 0 0px 1px var(--shadow-color)",
+          shadowColor: { _dark: "gray.500", _light: "gray.400" },
+        },
+      },
+      defaultVariants: { size: "sm" } as Record<string, string>,
+    },
+    // size="sm" gives px/py:2 on cell and columnHeader vs px/py:3 for "md".
+    table: {
+      slots: [],
+      defaultVariants: { size: "sm" } as Record<string, string>,
+    },
+  },
   semanticTokens: {
     colors: {
       // Brand colors for consistent theming
@@ -369,12 +443,14 @@ const defaultAirflowTheme = {
       skipped: generateSemanticTokens("pink"),
       up_for_reschedule: generateSemanticTokens("sky"),
       up_for_retry: generateSemanticTokens("yellow"),
-      upstream_failed: generateSemanticTokens("orange"),
+      upstream_failed: generateSemanticTokens("amber"),
       running: generateSemanticTokens("cyan"),
       restarting: generateSemanticTokens("violet"),
       deferred: generateSemanticTokens("purple"),
+      awaiting_input: generateSemanticTokens("orange"),
       scheduled: generateSemanticTokens("zinc"),
       none: generateSemanticTokens("gray"),
+      no_status: generateSemanticTokens("gray"),
       removed: generateSemanticTokens("slate"),
       // TAILWIND 4.0 COLORS
       red: generateSemanticTokens("red"),
@@ -406,16 +482,20 @@ const defaultAirflowTheme = {
 export const createTheme = (userTheme?: Theme) => {
   const defaultAirflowConfig = defineConfig({ theme: defaultAirflowTheme });
 
-  const userConfig = defineConfig(
-    userTheme
-      ? {
-          theme: { tokens: userTheme.tokens },
+  const userConfig = userTheme
+    ? defineConfig({
+        ...(userTheme.tokens !== undefined && {
+          theme: { tokens: userTheme.tokens as Record<string, unknown> },
+        }),
+        ...(userTheme.globalCss !== undefined && {
           globalCss: userTheme.globalCss as Record<string, SystemStyleObject>,
-        }
-      : {},
-  );
+        }),
+      })
+    : undefined;
 
-  const mergedConfig = mergeConfigs(defaultConfig, defaultAirflowConfig, userConfig);
+  const mergedConfig = userConfig
+    ? mergeConfigs(defaultConfig, defaultAirflowConfig, userConfig)
+    : mergeConfigs(defaultConfig, defaultAirflowConfig);
 
   return createSystem(mergedConfig);
 };

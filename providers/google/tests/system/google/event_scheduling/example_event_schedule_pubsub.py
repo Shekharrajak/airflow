@@ -74,6 +74,7 @@ trigger = MessageQueueTrigger(
     max_messages=1,
     gcp_conn_id="google_cloud_default",
     poke_interval=60.0,
+    return_immediately=False,
 )
 
 # Define an asset that watches for messages on the Pub/Sub subscription
@@ -92,5 +93,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

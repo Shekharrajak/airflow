@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "pyyaml>=6.0.3",
 #   "termcolor==2.5.0",
@@ -46,8 +46,14 @@ if CONFIG_KEY not in cyborg_config:
     raise SystemExit(f"Missing section {CONFIG_KEY}")
 
 errors = []
-# Check if all patterns in the cyborg config are existing in the repository
-for label, patterns in cyborg_config[CONFIG_KEY].items():
+# Each label rule is either a list of glob patterns (legacy form) or an object
+# with `paths` and an optional `targetBranchFilter` (see kaxil/boring-cyborg#112).
+# Only the glob patterns in `paths` need to exist in the repository.
+for label, rule in cyborg_config[CONFIG_KEY].items():
+    if isinstance(rule, dict):
+        patterns = rule.get("paths", [])
+    else:
+        patterns = rule
     for pattern in patterns:
         try:
             next(Path(AIRFLOW_ROOT_PATH).glob(pattern))
@@ -72,7 +78,8 @@ for p in providers_root.glob("**/provider.yaml"):
 # Check for missing translations
 EXCEPTIONS = ["en"]
 for p in AIRFLOW_ROOT_PATH.glob("airflow-core/src/airflow/ui/public/i18n/locales/*"):
-    if p.is_dir():
+    # Locale codes never start with a dot; skip tool scratch dirs (.claude, .DS_Store, ...)
+    if p.is_dir() and not p.name.startswith("."):
         lang_id = p.name
         expected_key = f"translation:{lang_id}"
         if lang_id not in EXCEPTIONS and expected_key not in cyborg_config[CONFIG_KEY]:

@@ -40,8 +40,11 @@ from airflow.triggers.base import BaseTrigger, TriggerEvent
 if TYPE_CHECKING:
     from io import BytesIO
 
+    import jinja2
     from kiota_abstractions.request_adapter import RequestAdapter
     from msgraph_core import APIVersion
+
+    from airflow.sdk import Context
 
 
 class ResponseSerializer:
@@ -95,6 +98,13 @@ class MSGraphTrigger(BaseTrigger):
         or you can pass a string as `v1.0` or `beta`.
     :param serializer: Class which handles response serialization (default is ResponseSerializer).
         Bytes will be base64 encoded into a string, so it can be stored as an XCom.
+    :param pagination_link: Whether `url` was taken from a pagination link of a previous response
+        (default is False). When True, its host is verified against the configured Microsoft Graph
+        endpoint before the request is made.
+    :param rendered: Whether the templated fields already hold their rendered values (default is False).
+        A task which starts from the triggerer gets every one of its triggers rendered by the triggerer,
+        also the ones a worker deferred with values it rendered itself or took from a response, such as
+        a pagination link. When True, the triggerer leaves the fields as they are.
     """
 
     def __init__(
@@ -113,6 +123,8 @@ class MSGraphTrigger(BaseTrigger):
         scopes: str | list[str] | None = None,
         api_version: APIVersion | str | None = None,
         serializer: type[ResponseSerializer] = ResponseSerializer,
+        pagination_link: bool = False,
+        rendered: bool = False,
     ):
         super().__init__()
         self.conn_id = conn_id
@@ -129,6 +141,8 @@ class MSGraphTrigger(BaseTrigger):
         self.headers = headers
         self.data = data
         self.serializer: ResponseSerializer = self.resolve_type(serializer, default=ResponseSerializer)()
+        self.pagination_link = pagination_link
+        self.rendered = rendered
 
     @classmethod
     def resolve_type(cls, value: str | type, default) -> type:
@@ -157,8 +171,14 @@ class MSGraphTrigger(BaseTrigger):
                 "headers": self.headers,
                 "data": self.data,
                 "response_type": self.response_type,
+                "pagination_link": self.pagination_link,
+                "rendered": self.rendered,
             },
         )
+
+    def render_template_fields(self, context: Context, jinja_env: jinja2.Environment | None = None) -> None:
+        if not self.rendered:
+            super().render_template_fields(context=context, jinja_env=jinja_env)
 
     def get_conn(self) -> RequestAdapter:
         """
@@ -182,6 +202,9 @@ class MSGraphTrigger(BaseTrigger):
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Make a series of asynchronous HTTP calls via a KiotaRequestAdapterHook."""
         try:
+            if self.pagination_link:
+                await self.hook.assert_allowed_host(self.url)
+
             response = await self.hook.run(
                 url=self.url,
                 response_type=self.response_type,

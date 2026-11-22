@@ -20,10 +20,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from google.api_core.client_options import ClientOptions
 from google.api_core.gapic_v1.method import DEFAULT, _MethodDefault
 from google.cloud.aiplatform import (
     CustomContainerTrainingJob,
@@ -76,17 +76,25 @@ class CustomJobHook(GoogleBaseHook, OperationHelper):
             CustomContainerTrainingJob | CustomPythonPackageTrainingJob | CustomTrainingJob
         ) = None
 
+    def _get_api_endpoint(
+        self,
+        region: str | None = None,
+    ) -> str | None:
+        if region and region != "global" and self.is_default_universe():
+            return f"{region}-aiplatform.googleapis.com:443"
+        return None
+
     def get_pipeline_service_client(
         self,
         region: str | None = None,
     ) -> PipelineServiceClient:
         """Return PipelineServiceClient object."""
-        if region and region != "global":
-            client_options = ClientOptions(api_endpoint=f"{region}-aiplatform.googleapis.com:443")
-        else:
-            client_options = ClientOptions()
         return PipelineServiceClient(
-            credentials=self.get_credentials(), client_info=CLIENT_INFO, client_options=client_options
+            credentials=self.get_credentials(),
+            client_info=CLIENT_INFO,
+            client_options=self.get_client_options(
+                api_endpoint_override=self._get_api_endpoint(region=region)
+            ),
         )
 
     def get_job_service_client(
@@ -94,13 +102,12 @@ class CustomJobHook(GoogleBaseHook, OperationHelper):
         region: str | None = None,
     ) -> JobServiceClient:
         """Return JobServiceClient object."""
-        if region and region != "global":
-            client_options = ClientOptions(api_endpoint=f"{region}-aiplatform.googleapis.com:443")
-        else:
-            client_options = ClientOptions()
-
         return JobServiceClient(
-            credentials=self.get_credentials(), client_info=CLIENT_INFO, client_options=client_options
+            credentials=self.get_credentials(),
+            client_info=CLIENT_INFO,
+            client_options=self.get_client_options(
+                api_endpoint_override=self._get_api_endpoint(region=region)
+            ),
         )
 
     def get_custom_container_training_job(
@@ -3087,17 +3094,63 @@ class CustomJobHook(GoogleBaseHook, OperationHelper):
         )
         return result
 
+    @GoogleBaseHook.fallback_to_default_project_id
+    def wait_for_custom_job(
+        self,
+        project_id: str,
+        region: str,
+        custom_job_id: str,
+        poll_interval: int = 10,
+        retry: Retry | _MethodDefault = DEFAULT,
+        timeout: float | None = None,
+        metadata: Sequence[tuple[str, str]] = (),
+    ) -> CustomJob:
+        """
+        Wait until an VertexAI Custom job completes.
+
+        :param project_id: Required. The ID of the Google Cloud project.
+        :param region: Required. The ID of the Google Cloud location that the service belongs to.
+        :param custom_job_id: Required. The ID of the CustomJob to wait.
+        :param poll_interval: Time, in seconds, to wait between checks.
+        :param retry: Designation of what errors, if any, should be retried.
+        :param timeout: The timeout for this request.
+        :param metadata: Strings which should be sent along with the request as metadata.
+        """
+        CUSTOB_JOB_FAILED_STATES = {
+            JobState.JOB_STATE_FAILED: lambda: custom_job.error.message,  # type: ignore
+            JobState.JOB_STATE_CANCELLED: lambda: "The CustomJob has been cancelled.",
+            JobState.JOB_STATE_PAUSED: lambda: "The CustomJob has been stopped, and can be resumed.",
+            JobState.JOB_STATE_EXPIRED: lambda: "The CustomJob has expired.",
+            JobState.JOB_STATE_PARTIALLY_SUCCEEDED: lambda: custom_job.error.message,  # type: ignore
+        }
+
+        while True:
+            self.log.info("Waiting for custom job with id %s", custom_job_id)
+            try:
+                custom_job = self.get_custom_job(
+                    project_id=project_id,
+                    region=region,
+                    custom_job=custom_job_id,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+            except Exception as ex:
+                self.log.exception("Exception occurred while waiting job %s", custom_job_id)
+                raise AirflowException(ex)
+            self.log.info("Status of the custom job %s is %s", custom_job.name, custom_job.state.name)
+            if custom_job.state == JobState.JOB_STATE_SUCCEEDED:
+                return custom_job
+            if custom_job.state in CUSTOB_JOB_FAILED_STATES:
+                raise RuntimeError(CUSTOB_JOB_FAILED_STATES[custom_job.state]())
+            self.log.info("Sleeping for %s seconds.", poll_interval)
+            time.sleep(poll_interval)
+
 
 class CustomJobAsyncHook(GoogleBaseAsyncHook):
     """Async hook for Custom Job Service Client."""
 
     sync_hook_class = CustomJobHook
-    JOB_COMPLETE_STATES = {
-        JobState.JOB_STATE_CANCELLED,
-        JobState.JOB_STATE_FAILED,
-        JobState.JOB_STATE_PAUSED,
-        JobState.JOB_STATE_SUCCEEDED,
-    }
     PIPELINE_COMPLETE_STATES = (
         PipelineState.PIPELINE_STATE_CANCELLED,
         PipelineState.PIPELINE_STATE_FAILED,
@@ -3128,14 +3181,14 @@ class CustomJobAsyncHook(GoogleBaseAsyncHook):
         region: str | None = None,
     ) -> JobServiceAsyncClient:
         """Retrieve Vertex AI JobServiceAsyncClient object."""
-        if region and region != "global":
-            client_options = ClientOptions(api_endpoint=f"{region}-aiplatform.googleapis.com:443")
-        else:
-            client_options = ClientOptions()
+        sync_hook = await self.get_sync_hook()
+
         return JobServiceAsyncClient(
-            credentials=(await self.get_credentials()),
+            credentials=sync_hook.get_credentials(),
             client_info=CLIENT_INFO,
-            client_options=client_options,
+            client_options=sync_hook.get_client_options(
+                api_endpoint_override=sync_hook._get_api_endpoint(region=region)
+            ),
         )
 
     async def get_pipeline_service_client(
@@ -3143,14 +3196,14 @@ class CustomJobAsyncHook(GoogleBaseAsyncHook):
         region: str | None = None,
     ) -> PipelineServiceAsyncClient:
         """Retrieve Vertex AI PipelineServiceAsyncClient object."""
-        if region and region != "global":
-            client_options = ClientOptions(api_endpoint=f"{region}-aiplatform.googleapis.com:443")
-        else:
-            client_options = ClientOptions()
+        sync_hook = await self.get_sync_hook()
+
         return PipelineServiceAsyncClient(
-            credentials=(await self.get_credentials()),
+            credentials=sync_hook.get_credentials(),
             client_info=CLIENT_INFO,
-            client_options=client_options,
+            client_options=sync_hook.get_client_options(
+                api_endpoint_override=sync_hook._get_api_endpoint(region=region)
+            ),
         )
 
     async def get_custom_job(
@@ -3232,6 +3285,14 @@ class CustomJobAsyncHook(GoogleBaseAsyncHook):
         poll_interval: int = 10,
     ) -> types.CustomJob:
         """Make async calls to Vertex AI to check the custom job state until it is complete."""
+        CUSTOB_JOB_FAILED_STATES = {
+            JobState.JOB_STATE_FAILED: lambda: job.error.message,
+            JobState.JOB_STATE_CANCELLED: lambda: "The CustomJob has been cancelled.",
+            JobState.JOB_STATE_PAUSED: lambda: "The CustomJob has been stopped, and can be resumed.",
+            JobState.JOB_STATE_EXPIRED: lambda: "The CustomJob has expired.",
+            JobState.JOB_STATE_PARTIALLY_SUCCEEDED: lambda: job.error.message,
+        }
+
         client = await self.get_job_service_client(region=location)
         while True:
             try:
@@ -3249,8 +3310,10 @@ class CustomJobAsyncHook(GoogleBaseAsyncHook):
                 self.log.exception("Exception occurred while requesting job %s", job_id)
                 raise AirflowException(ex)
             self.log.info("Status of the custom job %s is %s", job.name, job.state.name)
-            if job.state in self.JOB_COMPLETE_STATES:
+            if job.state == JobState.JOB_STATE_SUCCEEDED:
                 return job
+            if job.state in CUSTOB_JOB_FAILED_STATES:
+                raise RuntimeError(CUSTOB_JOB_FAILED_STATES[job.state]())
             self.log.info("Sleeping for %s seconds.", poll_interval)
             await asyncio.sleep(poll_interval)
 

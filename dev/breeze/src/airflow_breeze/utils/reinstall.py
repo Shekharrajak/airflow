@@ -75,6 +75,17 @@ def reinstall_breeze(breeze_sources: Path, re_run: bool = True):
         subprocess.check_call(
             ["pipx", "install", "-e", breeze_sources.as_posix(), "--force"], stderr=subprocess.STDOUT
         )
+    else:
+        # Recommended setup: breeze is invoked through the shim (see ADR 0017), which runs
+        # `uv run --locked` against the worktree. There is no global install to reinstall —
+        # the next call re-syncs the environment whenever pyproject.toml / uv.lock change.
+        console_print(
+            "[info]No global breeze install detected (uv tool / pipx). "
+            "Assuming the recommended shim-based setup — nothing to reinstall.[/]\n"
+            "[info]If you suspect a broken environment, remove it and let the next call "
+            "rebuild it:[/]\n"
+            "    rm -rf dev/breeze/.venv\n"
+        )
 
     if re_run:
         # Make sure we don't loop forever if the metadata hash hasn't been updated yet (else it is tricky to

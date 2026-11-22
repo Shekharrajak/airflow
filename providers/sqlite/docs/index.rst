@@ -1,4 +1,3 @@
-
  .. Licensed to the Apache Software Foundation (ASF) under one
     or more contributor license agreements.  See the NOTICE file
     distributed with this work for additional information
@@ -77,7 +76,7 @@ apache-airflow-providers-sqlite package
 `SQLite <https://www.sqlite.org/>`__
 
 
-Release: 4.3.1
+Release: 4.3.4
 
 Provider package
 ----------------
@@ -104,30 +103,11 @@ PIP package                              Version required
 ``apache-airflow-providers-common-sql``  ``>=1.32.0``
 =======================================  ==================
 
-Cross provider package dependencies
------------------------------------
-
-Those are dependencies that might be needed in order to use all the features of the package.
-You need to install the specified provider distributions in order to use them.
-
-You can install such cross-provider dependencies when installing from PyPI. For example:
-
-.. code-block:: bash
-
-    pip install apache-airflow-providers-sqlite[common.sql]
-
-
-============================================================================================================  ==============
-Dependent package                                                                                             Extra
-============================================================================================================  ==============
-`apache-airflow-providers-common-sql <https://airflow.apache.org/docs/apache-airflow-providers-common-sql>`_  ``common.sql``
-============================================================================================================  ==============
-
 Downloading official packages
 -----------------------------
 
 You can download officially released packages and verify their checksums and signatures from the
 `Official Apache Download site <https://downloads.apache.org/airflow/providers/>`_
 
-* `The apache-airflow-providers-sqlite 4.3.1 sdist package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1.tar.gz>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1.tar.gz.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1.tar.gz.sha512>`__)
-* `The apache-airflow-providers-sqlite 4.3.1 wheel package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1-py3-none-any.whl>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1-py3-none-any.whl.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.1-py3-none-any.whl.sha512>`__)
+* `The apache-airflow-providers-sqlite 4.3.4 sdist package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4.tar.gz>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4.tar.gz.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4.tar.gz.sha512>`__)
+* `The apache-airflow-providers-sqlite 4.3.4 wheel package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4-py3-none-any.whl>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4-py3-none-any.whl.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_sqlite-4.3.4-py3-none-any.whl.sha512>`__)

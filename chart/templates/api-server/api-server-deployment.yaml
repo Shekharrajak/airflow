@@ -20,7 +20,7 @@
 ################################
 ## Airflow API Server Deployment
 #################################
-{{- if and .Values.apiServer.enabled (semverCompare ">=3.0.0" .Values.airflowVersion) }}
+{{- if .Values.apiServer.enabled }}
 {{- $nodeSelector := or .Values.apiServer.nodeSelector .Values.nodeSelector }}
 {{- $affinity := or .Values.apiServer.affinity .Values.affinity }}
 {{- $tolerations := or .Values.apiServer.tolerations .Values.tolerations }}
@@ -55,7 +55,7 @@ spec:
   {{- end }}
   strategy:
     {{- if .Values.apiServer.strategy }}
-    {{- toYaml .Values.apiServer.strategy | nindent 4 }}
+      {{- toYaml .Values.apiServer.strategy | nindent 4 }}
     {{- else }}
     # Here we define the rolling update strategy
     # - maxSurge define how many pod we can add at a time
@@ -80,13 +80,16 @@ spec:
         tier: airflow
         component: api-server
         release: {{ .Release.Name }}
-        {{- if or (.Values.labels) (.Values.apiServer.labels) }}
+        {{- if or .Values.labels .Values.apiServer.labels }}
           {{- mustMerge .Values.apiServer.labels .Values.labels | toYaml | nindent 8 }}
         {{- end }}
       annotations:
         checksum/metadata-secret: {{ include (print $.Template.BasePath "/secrets/metadata-connection-secret.yaml") . | sha256sum }}
         checksum/pgbouncer-config-secret: {{ include (print $.Template.BasePath "/secrets/pgbouncer-config-secret.yaml") . | sha256sum }}
         checksum/airflow-config: {{ include (print $.Template.BasePath "/configmaps/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.apiServer.apiServerConfig (not .Values.apiServer.apiServerConfigConfigMapName) }}
+        checksum/api-server-config: {{ include (print $.Template.BasePath "/configmaps/api-server-configmap.yaml") . | sha256sum }}
+        {{- end }}
         checksum/extra-configmaps: {{ include (print $.Template.BasePath "/configmaps/extra-configmaps.yaml") . | sha256sum }}
         checksum/extra-secrets: {{ include (print $.Template.BasePath "/secrets/extra-secrets.yaml") . | sha256sum }}
         {{- if not .Values.jwtSecretName }}
@@ -103,6 +106,7 @@ spec:
       hostAliases: {{- toYaml .Values.apiServer.hostAliases | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "apiServer.serviceAccountName" . }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
       {{- if .Values.apiServer.priorityClassName }}
       priorityClassName: {{ .Values.apiServer.priorityClassName }}
       {{- end }}
@@ -126,7 +130,10 @@ spec:
       tolerations: {{- toYaml $tolerations | nindent 8 }}
       topologySpreadConstraints: {{- toYaml $topologySpreadConstraints | nindent 8 }}
       restartPolicy: Always
+      terminationGracePeriodSeconds: {{ .Values.apiServer.terminationGracePeriodSeconds }}
+      {{- if $securityContext }}
       securityContext: {{ $securityContext | nindent 8 }}
+      {{- end }}
       imagePullSecrets: {{- include "image_pull_secrets" . | nindent 8 }}
       initContainers:
         {{- if .Values.apiServer.waitForMigrations.enabled }}
@@ -134,11 +141,13 @@ spec:
           resources: {{- toYaml .Values.apiServer.resources | nindent 12 }}
           image: {{ template "airflow_image_for_migrations" . }}
           imagePullPolicy: {{ .Values.images.airflow.pullPolicy }}
+          {{- if $containerSecurityContextWaitForMigrations }}
           securityContext: {{ $containerSecurityContextWaitForMigrations | nindent 12 }}
+          {{- end }}
           volumeMounts:
             {{- include "airflow_config_mount" . | nindent 12 }}
             {{- if .Values.volumeMounts }}
-              {{- toYaml .Values.volumeMounts | nindent 12 }}
+              {{- tpl (toYaml .Values.volumeMounts) . | nindent 12 }}
             {{- end }}
             {{- if .Values.apiServer.extraVolumeMounts }}
               {{- tpl (toYaml .Values.apiServer.extraVolumeMounts) . | nindent 12 }}
@@ -147,7 +156,8 @@ spec:
           envFrom: {{- include "custom_airflow_environment_from" . | default "\n  []" | indent 10 }}
           env:
             {{- include "custom_airflow_environment" . | indent 10 }}
-            {{- include "standard_airflow_environment" (merge (dict "IncludeJwtSecret" false) .) | indent 10 }}
+            {{- include "standard_airflow_environment" . | indent 10 }}
+            {{- include "metadata_db_sql_alchemy_environment" . | indent 10 }}
             {{- if .Values.apiServer.waitForMigrations.env }}
               {{- tpl (toYaml .Values.apiServer.waitForMigrations.env) $ | nindent 12 }}
             {{- end }}
@@ -159,7 +169,9 @@ spec:
         - name: api-server
           image: {{ template "airflow_image" . }}
           imagePullPolicy: {{ .Values.images.airflow.pullPolicy }}
+          {{- if $containerSecurityContext }}
           securityContext: {{ $containerSecurityContext | nindent 12 }}
+          {{- end }}
           {{- if $containerLifecycleHooks  }}
           lifecycle: {{- tpl (toYaml $containerLifecycleHooks) . | nindent 12 }}
           {{- end }}
@@ -183,7 +195,7 @@ spec:
               {{- end }}
             {{- end }}
             {{- if .Values.volumeMounts }}
-              {{- toYaml .Values.volumeMounts | nindent 12 }}
+              {{- tpl (toYaml .Values.volumeMounts) . | nindent 12 }}
             {{- end }}
             {{- if .Values.apiServer.extraVolumeMounts }}
               {{- tpl (toYaml .Values.apiServer.extraVolumeMounts) . | nindent 12 }}
@@ -221,7 +233,9 @@ spec:
           envFrom: {{- include "custom_airflow_environment_from" . | default "\n  []" | indent 10 }}
           env:
             {{- include "custom_airflow_environment" . | indent 10 }}
-            {{- include "standard_airflow_environment" (merge (dict "IncludeJwtSecret" true) .) | indent 10 }}
+            {{- include "standard_airflow_environment" . | indent 10 }}
+            {{- include "metadata_db_sql_alchemy_environment" . | indent 10 }}
+            {{- include "jwt_secret_environment" . | indent 10 }}
             {{- include "container_extra_envs" (list . .Values.apiServer.env) | indent 10 }}
         {{- if .Values.apiServer.extraContainers }}
           {{- tpl (toYaml .Values.apiServer.extraContainers) . | nindent 8 }}
@@ -241,7 +255,7 @@ spec:
             claimName: {{ template "airflow_logs_volume_claim" . }}
         {{- end }}
         {{- if .Values.volumes }}
-          {{- toYaml .Values.volumes | nindent 8 }}
+          {{- tpl (toYaml .Values.volumes) . | nindent 8 }}
         {{- end }}
         {{- if .Values.apiServer.extraVolumes }}
           {{- tpl (toYaml .Values.apiServer.extraVolumes) . | nindent 8 }}

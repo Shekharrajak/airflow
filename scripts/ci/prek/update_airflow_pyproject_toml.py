@@ -17,11 +17,10 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "packaging>=25",
 #   "rich>=13.6.0",
-#   "tomli>=2.0.1",
 #   "pyyaml",
 # ]
 # ///
@@ -33,11 +32,18 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+import tomllib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from common_prek_utils import AIRFLOW_ROOT_PATH, console, get_all_provider_ids, insert_documentation
+from common_prek_utils import (
+    AIRFLOW_ROOT_PATH,
+    EXCLUDED_PLATFORM_MACHINES,
+    console,
+    get_all_provider_ids,
+    insert_documentation,
+)
 from packaging.version import Version, parse as parse_version
 
 AIRFLOW_PYPROJECT_TOML_FILE = AIRFLOW_ROOT_PATH / "pyproject.toml"
@@ -67,25 +73,33 @@ START_PROVIDER_WORKSPACE_MEMBERS = (
 )
 END_PROVIDER_WORKSPACE_MEMBERS = "    # End of automatically generated provider workspace members"
 
+START_EXCLUDE_NEWER_PACKAGE = (
+    "# Automatically generated exclude-newer-package entries (update_airflow_pyproject_toml.py)"
+)
+END_EXCLUDE_NEWER_PACKAGE = "# End of automatically generated exclude-newer-package entries"
+
+START_EXCLUDE_NEWER_PACKAGE_PIP = (
+    "# Automatically generated exclude-newer-package-pip entries (update_airflow_pyproject_toml.py)"
+)
+END_EXCLUDE_NEWER_PACKAGE_PIP = "# End of automatically generated exclude-newer-package-pip entries"
+
 CUT_OFF_TIMEDELTA = timedelta(days=6 * 30)
+
 
 # Temporary override for providers that are not yet included in constraints or when they need
 # minimum versions for compatibility with Airflow 3
 MIN_VERSION_OVERRIDE: dict[str, Version] = {
     "amazon": parse_version("2.1.3"),
-    "fab": parse_version("2.2.0"),
+    "fab": parse_version("3.6.0"),
     "openlineage": parse_version("2.3.0"),
     "git": parse_version("0.0.2"),
     "common.messaging": parse_version("2.0.0"),
-    "elasticsearch": parse_version("6.5.0"),
+    "elasticsearch": parse_version("6.6.0"),
+    "opensearch": parse_version("1.9.3"),
 }
 
 
 def get_optional_dependencies(pyproject_toml_path: Path) -> list[str]:
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib
     airflow_core_toml_dict = tomllib.loads(pyproject_toml_path.read_text())
     return airflow_core_toml_dict["project"]["optional-dependencies"].keys()
 
@@ -102,18 +116,19 @@ PROVIDER_METADATA_FILE_PATH = AIRFLOW_ROOT_PATH / "generated" / "provider_metada
 PROVIDER_DEPENDENCIES_FILE_PATH = AIRFLOW_ROOT_PATH / "generated" / "provider_dependencies.json"
 
 file_list = sys.argv[1:]
-console.print("[bright_blue]Updating min-provider versions in apache-airflow\n")
-
-all_providers_metadata = json.loads(PROVIDER_METADATA_FILE_PATH.read_text())
-all_providers_dependencies = json.loads(PROVIDER_DEPENDENCIES_FILE_PATH.read_text())
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib
     return tomllib.loads(path.read_text())
+
+
+def get_all_workspace_component_names() -> list[str]:
+    """Get all workspace component names from [tool.uv.sources] in pyproject.toml."""
+    toml_dict = _read_toml(AIRFLOW_PYPROJECT_TOML_FILE)
+    sources = toml_dict.get("tool", {}).get("uv", {}).get("sources", {})
+    return sorted(
+        name for name, value in sources.items() if isinstance(value, dict) and value.get("workspace")
+    )
 
 
 def get_local_provider_version(provider_id: str) -> Version | None:
@@ -145,19 +160,20 @@ def _fallback_provider_version(
             f"[yellow]Provider id {provider_id} min version fallback:[/] "
             f"local provider pyproject.toml -> {local_version}"
         )
-        return local_version, " # Set from local provider pyproject.toml"
+        # No trailing comment: a local-fallback version flips to a real PyPI release
+        # without any other change to the pin, and a stale comment would then trigger
+        # the update-pyproject-toml prek hook on unrelated PRs / on main.
+        return local_version, ""
     return None, ""
 
 
-def find_min_provider_version(provider_id: str) -> tuple[Version | None, str]:
+def find_min_provider_version(
+    provider_id: str, provider_metadata: dict[str, Any]
+) -> tuple[Version | None, str]:
     console.print(f"[bright_blue]Finding min version for provider id:[/] {provider_id}")
-    metadata = all_providers_metadata.get(provider_id)
+    metadata = provider_metadata.get(provider_id)
     # We should periodically update the starting date to avoid pip install resolution issues
-    # TODO: when min Python version is 3.11 change back the code to fromisoformat
-    # https://github.com/apache/airflow/pull/49155/files
-    cut_off_date = datetime.strptime("2024-10-12T00:00:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
-    )
+    cut_off_date = datetime.fromisoformat("2024-10-12T00:00:00Z")
     last_version_newer_than_cutoff: Version | None = None
     date_released: datetime | None = None
     min_version_override = MIN_VERSION_OVERRIDE.get(provider_id)
@@ -171,7 +187,7 @@ def find_min_provider_version(provider_id: str) -> tuple[Version | None, str]:
         for version in versions:
             provider_info = metadata[str(version)]
             date_released = datetime.strptime(provider_info["date_released"], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
+                tzinfo=UTC
             )
             if date_released < cut_off_date:
                 break
@@ -204,27 +220,37 @@ def find_min_provider_version(provider_id: str) -> tuple[Version | None, str]:
 PROVIDER_MIN_VERSIONS: dict[str, str | None] = {}
 
 
-def get_python_exclusion(provider_dependencies: dict[str, Any]) -> str:
+def get_exclusion_marker(provider_dependencies: dict[str, Any]) -> str:
     """
-    Return a Python version exclusion marker string based on provider metadata.
+    Return an environment marker string for a provider's supported environments.
 
-    If there are excluded Python versions in the metadata, this function returns a
-    marker string like: '; python_version != "3.8" and python_version != "3.11"'
+    Combines ``excluded-python-versions`` and ``excluded-platforms`` from the
+    provider metadata into a single PEP 508 marker.
 
-    If none are found, it returns an empty str.
+    If none is set, it returns an empty str.
     """
     if not provider_dependencies:
         return ""
-    python_exclusions = provider_dependencies.get("excluded-python-versions", [])
-    if python_exclusions:
-        python_exclusions_str = "and ".join(
-            f'python_version !=\\"{version}\\"' for version in python_exclusions
+    conditions = []
+    for version in provider_dependencies.get("excluded-python-versions", []):
+        if version.count(".") == 2:
+            conditions.append(f'python_full_version !=\\"{version}.*\\"')
+        else:
+            conditions.append(f'python_version !=\\"{version}\\"')
+    for platform in provider_dependencies.get("excluded-platforms", []):
+        conditions.extend(
+            f'platform_machine !=\\"{machine}\\"' for machine in EXCLUDED_PLATFORM_MACHINES.get(platform, [])
         )
-        return f"; {python_exclusions_str}"
+    if conditions:
+        return f"; {' and '.join(conditions)}"
     return ""
 
 
 if __name__ == "__main__":
+    console.print("[bright_blue]Updating min-provider versions in apache-airflow\n")
+    all_providers_metadata = json.loads(PROVIDER_METADATA_FILE_PATH.read_text())
+    all_providers_dependencies = json.loads(PROVIDER_DEPENDENCIES_FILE_PATH.read_text())
+
     all_optional_dependencies = []
     optional_airflow_core_dependencies = get_optional_dependencies(AIRFLOW_CORE_PYPROJECT_TOML_FILE)
     for optional in sorted(optional_airflow_core_dependencies):
@@ -234,29 +260,45 @@ if __name__ == "__main__":
             all_optional_dependencies.append(f'"{optional}" = [\n    "apache-airflow-core[{optional}]"\n]\n')
     optional_airflow_task_sdk_dependencies = get_optional_dependencies(AIRFLOW_TASK_SDK_PYPROJECT_TOML_FILE)
     all_optional_dependencies.append('"all-task-sdk" = [\n    "apache-airflow-task-sdk[all]"\n]\n')
+    # Two lists, because the sections below describe two different things.
+    #
+    # `all_providers` describes the source tree: mypy has to type-check a not-ready provider and uv
+    # has to keep it in the workspace, which is how CI installs it. Only suspended providers drop out.
+    #
+    # `released_providers` describes what is installable from PyPI. A not-ready provider has never
+    # been published, so naming it in an extra makes that extra unsatisfiable - there is no version
+    # of it to resolve to.
     all_providers = sorted(get_all_provider_ids(exclude_suspended_providers=True))
+    released_providers = sorted(
+        get_all_provider_ids(exclude_suspended_providers=True, exclude_not_ready_providers=True)
+    )
     all_provider_lines = []
-    for provider_id in all_providers:
+    for provider_id in released_providers:
         distribution_name = provider_distribution_name(provider_id)
-        min_provider_version, comment = find_min_provider_version(provider_id)
-        python_exclusion = get_python_exclusion(all_providers_dependencies.get(provider_id, {}))
+        min_provider_version, comment = find_min_provider_version(provider_id, all_providers_metadata)
+        exclusion_marker = get_exclusion_marker(all_providers_dependencies.get(provider_id, {}))
 
         if min_provider_version:
             all_provider_lines.append(
-                f'    "{distribution_name}>={min_provider_version}{python_exclusion}",{comment}\n'
+                f'    "{distribution_name}>={min_provider_version}{exclusion_marker}",{comment}\n'
             )
             all_optional_dependencies.append(
-                f'"{provider_id}" = [\n    "{distribution_name}>={min_provider_version}{python_exclusion}"{comment}\n]\n'
+                f'"{provider_id}" = [\n    "{distribution_name}>={min_provider_version}{exclusion_marker}"{comment}\n]\n'
             )
         else:
             all_optional_dependencies.append(f'"{provider_id}" = [\n    "{distribution_name}"\n]\n')
             all_provider_lines.append(f'    "{distribution_name}",\n')
     all_optional_dependencies.append('"all" = [\n')
     optional_apache_airflow_dependencies = get_optional_dependencies(AIRFLOW_PYPROJECT_TOML_FILE)
+    # Filtered against every provider id rather than against `all_providers`: a provider left out of
+    # `all_providers` still has an extra named after it, and testing only against the included ones
+    # would sweep that extra in here instead of dropping it - which is how a not-ready provider would
+    # come back into `all` through the side door.
+    every_provider_id = set(get_all_provider_ids())
     all_local_extras = [
         extra
         for extra in sorted(optional_apache_airflow_dependencies)
-        if extra not in all_providers and not extra.startswith("all")
+        if extra not in every_provider_id and not extra.startswith("all")
     ]
     all_optional_dependencies.append(f'    "apache-airflow[{",".join(all_local_extras)}]",\n')
     all_optional_dependencies.append('    "apache-airflow-core[all]",\n')
@@ -299,4 +341,24 @@ if __name__ == "__main__":
         END_PROVIDER_WORKSPACE_MEMBERS,
         False,
         "provider workspace members",
+    )
+    all_workspace_components = get_all_workspace_component_names()
+    exclude_newer_entries = []
+    for component in all_workspace_components:
+        exclude_newer_entries.append(f"{component} = false\n")
+    insert_documentation(
+        AIRFLOW_PYPROJECT_TOML_FILE,
+        exclude_newer_entries,
+        START_EXCLUDE_NEWER_PACKAGE,
+        END_EXCLUDE_NEWER_PACKAGE,
+        False,
+        "exclude-newer-package entries",
+    )
+    insert_documentation(
+        AIRFLOW_PYPROJECT_TOML_FILE,
+        exclude_newer_entries,
+        START_EXCLUDE_NEWER_PACKAGE_PIP,
+        END_EXCLUDE_NEWER_PACKAGE_PIP,
+        False,
+        "exclude-newer-package-pip entries",
     )

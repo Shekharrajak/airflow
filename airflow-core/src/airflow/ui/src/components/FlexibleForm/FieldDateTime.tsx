@@ -27,14 +27,15 @@ export const FieldDateTime = ({
   name,
   namespace = "default",
   onUpdate,
+  type,
   ...rest
 }: FlexibleFormElementProps & InputProps) => {
   const { disabled, paramsDict, setParamsDict } = useParamStore(namespace);
   const param = paramsDict[name] ?? paramPlaceholder;
+  const isTime = type === "time";
   const handleChange = (value: string) => {
     // "undefined" values are removed from params, so we set it to null to avoid falling back to DAG defaults.
     if (paramsDict[name]) {
-      // eslint-disable-next-line unicorn/no-null
       paramsDict[name].value = value === "" ? null : value;
     }
 
@@ -42,7 +43,7 @@ export const FieldDateTime = ({
     onUpdate(value);
   };
 
-  if (rest.type === "datetime-local") {
+  if (type === "datetime-local") {
     return (
       <DateTimeInput
         disabled={disabled}
@@ -50,7 +51,7 @@ export const FieldDateTime = ({
         name={`element_${name}`}
         onChange={(event) => handleChange(event.target.value)}
         size="sm"
-        value={(param.value as string) || ""}
+        value={typeof param.value === "string" ? param.value : ""}
       />
     );
   }
@@ -63,8 +64,11 @@ export const FieldDateTime = ({
       onChange={(event) => handleChange(event.target.value)}
       required={rest.required}
       size="sm"
-      type={rest.type}
-      value={((param.value ?? "") as string).slice(0, 16)}
+      step={isTime ? 1 : undefined}
+      type={type}
+      // A non-string value (e.g. an object leaking in from a malformed param) must degrade to an
+      // empty input rather than throw and take the whole form down.
+      value={typeof param.value === "string" ? param.value.slice(0, 16) : ""}
     />
   );
 };

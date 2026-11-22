@@ -27,6 +27,8 @@ from airflow.providers.common.compat.connection import get_async_connection
 from airflow.providers.http.hooks.http import HttpAsyncHook, HttpHook
 
 if TYPE_CHECKING:
+    from requests import Session
+
     from airflow.providers.common.compat.sdk import Connection
     from airflow.providers.discord.notifications.embed import Embed
 
@@ -86,7 +88,7 @@ class DiscordCommonHandler:
                 raise ValueError("Discord embed footer text must be 2048 or fewer characters")
         # Validate author
         if "author" in embed:
-            if len(embed["author"]["name"]) > 2048:
+            if len(embed["author"]["name"]) > 256:
                 raise ValueError("Discord embed author name must be 256 or fewer characters")
         # Validate fields
         if "fields" in embed:
@@ -217,6 +219,14 @@ class DiscordWebhookHook(HttpHook):
         if not webhook_endpoint and http_conn_id:
             conn = self.get_connection(http_conn_id)
         return self.handler.get_webhook_endpoint(conn, webhook_endpoint)
+
+    def get_conn(
+        self, headers: dict[Any, Any] | None = None, extra_options: dict[str, Any] | None = None
+    ) -> Session:
+        session = super().get_conn(headers=headers, extra_options=extra_options)
+        # HttpHook promotes leftover extra fields to headers; strip the Discord-specific one.
+        session.headers.pop("webhook_endpoint", None)
+        return session
 
     def execute(self) -> None:
         """Execute the Discord webhook call."""

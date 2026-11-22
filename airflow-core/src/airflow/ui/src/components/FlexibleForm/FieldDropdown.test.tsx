@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { Wrapper } from "src/utils/Wrapper";
@@ -30,7 +30,6 @@ const mockSetParamsDict = vi.fn();
 vi.mock("src/queries/useParamStore", () => ({
   paramPlaceholder: {
     schema: {},
-    // eslint-disable-next-line unicorn/no-null
     value: null,
   },
   useParamStore: () => ({
@@ -51,11 +50,9 @@ describe("FieldDropdown", () => {
   it("renders dropdown with null value in enum", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: [1, 2, 3, null],
         type: ["number", "null"],
       },
-      // eslint-disable-next-line unicorn/no-null
       value: null,
     };
 
@@ -69,7 +66,6 @@ describe("FieldDropdown", () => {
   it("displays custom label for null value via values_display", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: [1, 2, 3, null],
         type: ["number", "null"],
         values_display: {
@@ -92,7 +88,6 @@ describe("FieldDropdown", () => {
   it("handles string enum with null value", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: ["option1", "option2", null],
         type: ["string", "null"],
       },
@@ -109,11 +104,9 @@ describe("FieldDropdown", () => {
   it("handles enum with only null value", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: [null],
         type: ["null"],
       },
-      // eslint-disable-next-line unicorn/no-null
       value: null,
     };
 
@@ -127,11 +120,9 @@ describe("FieldDropdown", () => {
   it("renders when current value is null", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: ["value1", "value2", "value3", null],
         type: ["string", "null"],
       },
-      // eslint-disable-next-line unicorn/no-null
       value: null,
     };
 
@@ -142,10 +133,101 @@ describe("FieldDropdown", () => {
     expect(screen.getByRole("combobox")).toBeDefined();
   });
 
+  it("renders the selected object enum value by its JSON form", () => {
+    const envs = [
+      { name: "dev", replicas: 1 },
+      { name: "prod", replicas: 5 },
+    ];
+
+    mockParamsDict.test_param = {
+      schema: { enum: envs, type: "object" },
+      value: envs[1],
+    };
+
+    render(<FieldDropdown name="test_param" onUpdate={vi.fn()} />, { wrapper: Wrapper });
+
+    expect(screen.getByText(JSON.stringify(envs[1]))).toBeDefined();
+  });
+
+  it("labels object enum options via values_display keyed by their JSON form", () => {
+    const envs = [
+      { name: "dev", replicas: 1 },
+      { name: "prod", replicas: 5 },
+    ];
+
+    mockParamsDict.test_param = {
+      schema: {
+        enum: envs,
+        type: "object",
+        values_display: { [JSON.stringify(envs[0])]: "Development" },
+      },
+      value: envs[0],
+    };
+
+    render(<FieldDropdown name="test_param" onUpdate={vi.fn()} />, { wrapper: Wrapper });
+
+    expect(screen.getByText("Development")).toBeDefined();
+  });
+
+  it("labels object enum options when the values_display key differs in spacing and key order", () => {
+    const envs = [
+      { name: "dev", replicas: 1 },
+      { name: "prod", replicas: 5 },
+    ];
+
+    mockParamsDict.test_param = {
+      schema: {
+        enum: envs,
+        type: "object",
+        values_display: { '{"replicas": 1, "name": "dev"}': "Development" },
+      },
+      value: envs[0],
+    };
+
+    render(<FieldDropdown name="test_param" onUpdate={vi.fn()} />, { wrapper: Wrapper });
+
+    expect(screen.getByText("Development")).toBeDefined();
+  });
+
+  it("selects the current object value regardless of its key order", () => {
+    const envs = [
+      { name: "dev", replicas: 1 },
+      { name: "prod", replicas: 5 },
+    ];
+
+    mockParamsDict.test_param = {
+      schema: { enum: envs, type: "object" },
+      value: JSON.parse('{"replicas": 5, "name": "prod"}') as unknown,
+    };
+
+    render(<FieldDropdown name="test_param" onUpdate={vi.fn()} />, { wrapper: Wrapper });
+
+    expect(screen.getByText(JSON.stringify(envs[1]))).toBeDefined();
+  });
+
+  it("stores the original object when an object enum option is selected", () => {
+    const envs = [
+      { name: "dev", replicas: 1 },
+      { name: "prod", replicas: 5 },
+    ];
+
+    mockParamsDict.test_param = {
+      schema: { enum: envs, type: "object" },
+      value: null,
+    };
+
+    render(<FieldDropdown name="test_param" onUpdate={vi.fn()} />, { wrapper: Wrapper });
+
+    fireEvent.keyDown(screen.getByRole("combobox"), { key: "ArrowDown" });
+    fireEvent.click(screen.getByText(JSON.stringify(envs[1])));
+
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    expect(mockParamsDict.test_param.value).toStrictEqual(envs[1]);
+  });
+
   it("preserves numeric type when selecting a number enum value (prevents 400 Bad Request)", () => {
     mockParamsDict.test_param = {
       schema: {
-        // eslint-disable-next-line unicorn/no-null
         enum: [1, 2, 3, 4, 5, 6, 7, 8, 9, null],
         type: ["number", "null"],
         values_display: {
@@ -153,7 +235,6 @@ describe("FieldDropdown", () => {
           "6": "Six",
         },
       },
-      // eslint-disable-next-line unicorn/no-null
       value: null,
     };
 

@@ -17,16 +17,19 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
+import time
 from asyncio import CancelledError, Future, sleep
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from google.api_core.exceptions import AlreadyExists, NotFound, PermissionDenied
 from google.cloud.dataproc_v1 import Batch, Cluster, ClusterStatus, Job, JobStatus
 from google.protobuf.any_pb2 import Any
 from google.rpc.status_pb2 import Status
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.cloud.triggers.dataproc import (
     DataprocBatchTrigger,
     DataprocClusterTrigger,
@@ -36,6 +39,9 @@ from airflow.providers.google.cloud.triggers.dataproc import (
 )
 from airflow.providers.google.cloud.utils.dataproc import DataprocOperationType
 from airflow.triggers.base import TriggerEvent
+from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_3_PLUS
 
 TEST_PROJECT_ID = "project-id"
 TEST_REGION = "region"
@@ -144,6 +150,8 @@ TEST_JOB = {
     "pyspark_job": {"main_python_file_uri": "gs://test"},
 }
 TEST_REQUEST_ID = "test-request-id"
+TEST_TI_UUID = "01999b0e-0000-7000-8000-000000000001"
+OTHER_TI_UUID = "01999b0e-0000-7000-8000-000000000002"
 
 
 @pytest.fixture
@@ -157,6 +165,22 @@ def submit_job_direct_trigger():
         polling_interval_seconds=TEST_POLL_INTERVAL,
         cancel_on_kill=True,
     )
+
+
+def attach_trigger_identity(trigger, trigger_id=42, ti_uuid=TEST_TI_UUID, **task_instance_overrides):
+    """Give the trigger the row id and task instance the triggerer attaches before running it."""
+    task_instance = {
+        "dag_id": "test-dag",
+        "task_id": "test-task",
+        "run_id": "test-run",
+        "map_index": -1,
+        "try_number": 1,
+    }
+    if ti_uuid is not None:
+        # Airflow 2 task instances have a composite primary key and no uuid to carry here.
+        task_instance["id"] = ti_uuid
+    trigger.trigger_id = trigger_id
+    trigger.task_instance = SimpleNamespace(**{**task_instance, **task_instance_overrides})
 
 
 @pytest.fixture
@@ -355,10 +379,7 @@ class TestDataprocClusterTrigger:
     ):
         """Test the trigger's cancellation behavior when it is not safe to cancel."""
         mock_safe_to_cancel.return_value = False
-        cluster = Cluster(status=ClusterStatus(state=ClusterStatus.State.RUNNING))
-        future_cluster = asyncio.Future()
-        future_cluster.set_result(cluster)
-        mock_get_async_hook.return_value.get_cluster.return_value = future_cluster
+        mock_get_async_hook.return_value.get_cluster.return_value = Future()
 
         mock_delete_cluster = mock.MagicMock()
         mock_get_sync_hook.return_value.delete_cluster = mock_delete_cluster
@@ -370,11 +391,104 @@ class TestDataprocClusterTrigger:
         await sleep(0)
         task.cancel()
 
-        with contextlib.suppress(CancelledError):
+        with pytest.raises(CancelledError):
             await task
 
         assert mock_delete_cluster.call_count == 0
         mock_delete_cluster.assert_not_called()
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.get_async_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.get_sync_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.safe_to_cancel")
+    @mock.patch.object(DataprocClusterTrigger, "log")
+    async def test_cluster_trigger_run_cancelled_safe_to_cancel(
+        self, mock_log, mock_safe_to_cancel, mock_get_sync_hook, mock_get_async_hook, cluster_trigger
+    ):
+        """Cancellation must delete the cluster and still propagate so migration stays transparent."""
+        mock_safe_to_cancel.return_value = True
+        mock_get_async_hook.return_value.get_cluster.return_value = Future()
+
+        mock_delete_cluster = mock.MagicMock()
+        mock_get_sync_hook.return_value.delete_cluster = mock_delete_cluster
+
+        cluster_trigger.delete_on_error = True
+
+        async_gen = cluster_trigger.run()
+        task = asyncio.create_task(async_gen.__anext__())
+        await sleep(0)
+        task.cancel()
+
+        with pytest.raises(CancelledError):
+            await task
+
+        mock_delete_cluster.assert_called_once_with(
+            region=cluster_trigger.region,
+            cluster_name=cluster_trigger.cluster_name,
+            project_id=cluster_trigger.project_id,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not AIRFLOW_V_3_0_PLUS, reason="The task state is read through the task SDK on Airflow 3 only"
+    )
+    @pytest.mark.parametrize("map_index", [-1, 3])
+    @mock.patch("airflow.sdk.execution_time.task_runner.RuntimeTaskInstance.get_task_states", autospec=True)
+    async def test_get_task_state_missing_task_instance_reports_identifiers(
+        self, mock_get_task_states, cluster_trigger, map_index
+    ):
+        cluster_trigger.task_instance = SimpleNamespace(
+            dag_id="test_dag", task_id="test_task", run_id="test_run", map_index=map_index
+        )
+        mock_get_task_states.return_value = {}
+
+        with pytest.raises(AirflowException) as exc_info:
+            await cluster_trigger.get_task_state()
+
+        assert str(exc_info.value) == (
+            "TaskInstance with dag_id: test_dag, task_id: test_task, "
+            f"run_id: test_run and map_index: {map_index} is not found"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not AIRFLOW_V_3_0_PLUS, reason="The task state is read through the task SDK on Airflow 3 only"
+    )
+    @pytest.mark.parametrize(
+        ("map_index", "state_key"), [(-1, "test_task"), (3, "test_task_3")], ids=["unmapped", "mapped"]
+    )
+    @mock.patch("airflow.sdk.execution_time.task_runner.RuntimeTaskInstance.get_task_states", autospec=True)
+    async def test_get_task_state_uses_map_index_key(
+        self, mock_get_task_states, cluster_trigger, map_index, state_key
+    ):
+        """The execution API keys a mapped task instance as ``<task_id>_<map_index>``."""
+        cluster_trigger.task_instance = SimpleNamespace(
+            dag_id="test_dag", task_id="test_task", run_id="test_run", map_index=map_index
+        )
+        mock_get_task_states.return_value = {"test_run": {state_key: TaskInstanceState.DEFERRED}}
+
+        assert await cluster_trigger.get_task_state() == TaskInstanceState.DEFERRED
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.get_async_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.get_sync_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger.safe_to_cancel")
+    async def test_cluster_trigger_cancellation_failure_reports_cause(
+        self, mock_safe_to_cancel, mock_get_sync_hook, mock_get_async_hook, cluster_trigger
+    ):
+        mock_safe_to_cancel.return_value = True
+        mock_get_async_hook.return_value.get_cluster.return_value = Future()
+        mock_get_sync_hook.return_value.delete_cluster.side_effect = ValueError("cluster is already deleted")
+
+        async_gen = cluster_trigger.run()
+        task = asyncio.create_task(async_gen.__anext__())
+        await sleep(0)
+        task.cancel()
+
+        with pytest.raises(AirflowException) as exc_info:
+            await task
+
+        assert str(exc_info.value) == "Error during cancellation handling: cluster is already deleted"
 
 
 class TestDataprocBatchTrigger:
@@ -411,6 +525,7 @@ class TestDataprocBatchTrigger:
 
         future = asyncio.Future()
         future.set_result(mock_batch)
+        mock_get_async_hook.return_value.get_batch_client = mock.AsyncMock()
         mock_get_async_hook.return_value.get_batch.return_value = future
 
         expected_event = TriggerEvent(
@@ -437,6 +552,7 @@ class TestDataprocBatchTrigger:
 
         future = asyncio.Future()
         future.set_result(mock_batch)
+        mock_get_async_hook.return_value.get_batch_client = mock.AsyncMock()
         mock_get_async_hook.return_value.get_batch.return_value = future
 
         expected_event = TriggerEvent(
@@ -461,6 +577,7 @@ class TestDataprocBatchTrigger:
 
         future = asyncio.Future()
         future.set_result(mock_batch)
+        mock_get_async_hook.return_value.get_batch_client = mock.AsyncMock()
         mock_get_async_hook.return_value.get_batch.return_value = future
 
         expected_event = TriggerEvent(
@@ -485,6 +602,7 @@ class TestDataprocBatchTrigger:
 
         future = asyncio.Future()
         future.set_result(mock_batch)
+        mock_get_async_hook.return_value.get_batch_client = mock.AsyncMock()
         mock_get_async_hook.return_value.get_batch.return_value = future
 
         task = asyncio.create_task(batch_trigger.run().__anext__())
@@ -492,6 +610,37 @@ class TestDataprocBatchTrigger:
 
         assert not task.done()
         mock_log.info.assert_called()
+
+    @pytest.mark.db_test
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocBatchTrigger.get_async_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.asyncio.sleep", new_callable=mock.AsyncMock)
+    async def test_create_batch_trigger_reuses_async_hook_while_polling(
+        self, mock_sleep, mock_get_async_hook, batch_trigger
+    ):
+        running_batch = mock.MagicMock()
+        running_batch.state = Batch.State.RUNNING
+        running_batch.state_message = TEST_BATCH_STATE_MESSAGE
+        succeeded_batch = mock.MagicMock()
+        succeeded_batch.state = Batch.State.SUCCEEDED
+        succeeded_batch.state_message = TEST_BATCH_STATE_MESSAGE
+
+        mock_get_async_hook.return_value.get_batch = mock.AsyncMock(
+            side_effect=[running_batch, succeeded_batch]
+        )
+
+        actual_event = await batch_trigger.run().asend(None)
+
+        assert actual_event == TriggerEvent(
+            {
+                "batch_id": TEST_BATCH_ID,
+                "batch_state": Batch.State.SUCCEEDED.name,
+                "batch_state_message": TEST_BATCH_STATE_MESSAGE,
+            }
+        )
+        mock_get_async_hook.assert_called_once_with()
+        assert mock_get_async_hook.return_value.get_batch.await_count == 2
+        mock_sleep.assert_awaited_once_with(TEST_POLL_INTERVAL)
 
 
 class TestDataprocOperationTrigger:
@@ -598,6 +747,7 @@ class TestDataprocSubmitTrigger:
             "polling_interval_seconds": TEST_POLL_INTERVAL,
             "cancel_on_kill": True,
             "impersonation_chain": None,
+            "execution_deadline": None,
         }
 
     @pytest.mark.asyncio
@@ -634,6 +784,126 @@ class TestDataprocSubmitTrigger:
         assert event.payload == expected_event.payload
 
     @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_async_hook")
+    async def test_submit_trigger_run_execution_deadline_cancels_job(
+        self, mock_get_async_hook, mock_get_sync_hook
+    ):
+        """Test the trigger cancels a still-running job once the execution deadline passes."""
+        trigger = DataprocSubmitTrigger(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=TEST_POLL_INTERVAL,
+            execution_deadline=time.time() - 1,
+        )
+        mock_job = Job(status=JobStatus(state=JobStatus.State.RUNNING))
+        mock_get_async_hook.return_value.get_job_client = mock.AsyncMock()
+        mock_get_async_hook.return_value.get_job = mock.AsyncMock(return_value=mock_job)
+        mock_get_sync_hook.return_value.cancel_job = mock.MagicMock()
+
+        event = await trigger.run().asend(None)
+
+        mock_get_async_hook.return_value.get_job.assert_not_awaited()
+        mock_get_sync_hook.return_value.cancel_job.assert_called_once_with(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+        )
+        assert event.payload["job_id"] == TEST_JOB_ID
+        assert event.payload["job_state"] == "TIMED_OUT"
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_async_hook")
+    async def test_submit_trigger_run_execution_deadline_respects_cancel_on_kill_false(
+        self, mock_get_async_hook, mock_get_sync_hook
+    ):
+        """Test the deadline event is emitted without cancelling when cancel_on_kill is False."""
+        trigger = DataprocSubmitTrigger(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=TEST_POLL_INTERVAL,
+            cancel_on_kill=False,
+            execution_deadline=time.time() - 1,
+        )
+        mock_job = Job(status=JobStatus(state=JobStatus.State.RUNNING))
+        mock_get_async_hook.return_value.get_job_client = mock.AsyncMock()
+        mock_get_async_hook.return_value.get_job = mock.AsyncMock(return_value=mock_job)
+
+        event = await trigger.run().asend(None)
+
+        mock_get_async_hook.return_value.get_job.assert_not_awaited()
+        mock_get_sync_hook.return_value.cancel_job.assert_not_called()
+        assert event.payload["job_state"] == "TIMED_OUT"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hanging_call", ["get_job", "sleep"])
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_async_hook")
+    async def test_submit_trigger_run_execution_deadline_bounds_poll_and_sleep(
+        self, mock_get_async_hook, mock_get_sync_hook, hanging_call
+    ):
+        """Test a slow get_job or a long polling sleep cannot run past the execution deadline."""
+        trigger = DataprocSubmitTrigger(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=60,
+            execution_deadline=time.time() + 0.2,
+        )
+        running_job = Job(status=JobStatus(state=JobStatus.State.RUNNING))
+
+        async def slow_get_job(**kwargs):
+            await asyncio.sleep(60)
+
+        mock_get_async_hook.return_value.get_job_client = mock.AsyncMock()
+        mock_get_async_hook.return_value.get_job = mock.AsyncMock(
+            side_effect=slow_get_job if hanging_call == "get_job" else None, return_value=running_job
+        )
+        mock_get_sync_hook.return_value.cancel_job = mock.MagicMock()
+
+        event = await asyncio.wait_for(trigger.run().asend(None), timeout=5)
+
+        mock_get_sync_hook.return_value.cancel_job.assert_called_once_with(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+        )
+        assert event.payload["job_state"] == "TIMED_OUT"
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
+    async def test_on_kill_cancels_job(self, mock_get_sync_hook, submit_trigger):
+        mock_sync_hook = mock_get_sync_hook.return_value
+        mock_sync_hook.cancel_job = mock.MagicMock()
+        await submit_trigger.on_kill()
+        mock_sync_hook.cancel_job.assert_called_once_with(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+        )
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
+    async def test_on_kill_respects_cancel_on_kill_false(self, mock_get_sync_hook):
+        trigger = DataprocSubmitTrigger(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=TEST_POLL_INTERVAL,
+            cancel_on_kill=False,
+        )
+        await trigger.on_kill()
+        mock_get_sync_hook.return_value.cancel_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(AIRFLOW_V_3_3_PLUS, reason="on_kill() handles cancellation for Airflow 3.3.0+")
     @pytest.mark.parametrize("is_safe_to_cancel", [True, False])
     @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_async_hook")
     @mock.patch("airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger.get_sync_hook")
@@ -641,33 +911,21 @@ class TestDataprocSubmitTrigger:
     async def test_submit_trigger_run_cancelled(
         self, mock_safe_to_cancel, mock_get_sync_hook, mock_get_async_hook, submit_trigger, is_safe_to_cancel
     ):
-        """Test the trigger correctly handles an asyncio.CancelledError."""
+        """Test the trigger correctly handles an asyncio.CancelledError on Airflow < 3.3.0."""
         mock_safe_to_cancel.return_value = is_safe_to_cancel
         mock_async_hook = mock_get_async_hook.return_value
         mock_async_hook.get_job_client = mock.AsyncMock()
-
         mock_async_hook.get_job.side_effect = asyncio.CancelledError
-
         mock_sync_hook = mock_get_sync_hook.return_value
         mock_sync_hook.cancel_job = mock.MagicMock()
 
         async_gen = submit_trigger.run()
-
-        try:
+        if is_safe_to_cancel:
+            event = await async_gen.asend(None)
+            assert event.payload["job_state"] == ClusterStatus.State.DELETING.name
+        with pytest.raises(asyncio.CancelledError):
             await async_gen.asend(None)
-            # Should raise StopAsyncIteration if no more items to yield
-            await async_gen.asend(None)
-        except asyncio.CancelledError:
-            # Handle the cancellation as expected
-            pass
-        except StopAsyncIteration:
-            # The generator should be properly closed after handling the cancellation
-            pass
-        except Exception as e:
-            # Catch any other exceptions that should not occur
-            pytest.fail(f"Unexpected exception raised: {e}")
 
-        # Check if cancel_job was correctly called
         if submit_trigger.cancel_on_kill and is_safe_to_cancel:
             mock_sync_hook.cancel_job.assert_called_once_with(
                 job_id=submit_trigger.job_id,
@@ -677,8 +935,27 @@ class TestDataprocSubmitTrigger:
         else:
             mock_sync_hook.cancel_job.assert_not_called()
 
-        # Clean up the generator
         await async_gen.aclose()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not AIRFLOW_V_3_0_PLUS or AIRFLOW_V_3_3_PLUS,
+        reason="The task state is read through the task SDK on Airflow 3.0 to 3.2 only",
+    )
+    @pytest.mark.parametrize(
+        ("map_index", "state_key"), [(-1, "test_task"), (3, "test_task_3")], ids=["unmapped", "mapped"]
+    )
+    @mock.patch("airflow.sdk.execution_time.task_runner.RuntimeTaskInstance.get_task_states", autospec=True)
+    async def test_get_task_state_uses_map_index_key(
+        self, mock_get_task_states, submit_trigger, map_index, state_key
+    ):
+        """The execution API keys a mapped task instance as ``<task_id>_<map_index>``."""
+        submit_trigger.task_instance = SimpleNamespace(
+            dag_id="test_dag", task_id="test_task", run_id="test_run", map_index=map_index
+        )
+        mock_get_task_states.return_value = {"test_run": {state_key: TaskInstanceState.DEFERRED}}
+
+        assert await submit_trigger.get_task_state() == TaskInstanceState.DEFERRED
 
 
 class TestDataprocSubmitJobDirectTrigger:
@@ -760,6 +1037,50 @@ class TestDataprocSubmitJobDirectTrigger:
         assert event.payload == expected_event.payload
 
     @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    async def test_on_kill_cancels_job(self, mock_get_sync_hook, submit_job_direct_trigger):
+        submit_job_direct_trigger.job_id = TEST_JOB_ID
+        mock_sync_hook = mock_get_sync_hook.return_value
+        mock_sync_hook.cancel_job = mock.MagicMock()
+        await submit_job_direct_trigger.on_kill()
+        mock_sync_hook.cancel_job.assert_called_once_with(
+            job_id=TEST_JOB_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+        )
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    async def test_on_kill_no_job_id_does_not_cancel(self, mock_get_sync_hook, submit_job_direct_trigger):
+        # job_id is None before submission completes; on_kill must be a no-op
+        assert submit_job_direct_trigger.job_id is None
+        await submit_job_direct_trigger.on_kill()
+        mock_get_sync_hook.return_value.cancel_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    async def test_on_kill_respects_cancel_on_kill_false(self, mock_get_sync_hook):
+        trigger = DataprocSubmitJobDirectTrigger(
+            job=TEST_JOB,
+            request_id=TEST_REQUEST_ID,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=TEST_POLL_INTERVAL,
+            cancel_on_kill=False,
+        )
+        trigger.job_id = TEST_JOB_ID
+        await trigger.on_kill()
+        mock_get_sync_hook.return_value.cancel_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(AIRFLOW_V_3_3_PLUS, reason="on_kill() handles cancellation for Airflow 3.3.0+")
     @pytest.mark.parametrize("is_safe_to_cancel", [True, False])
     @mock.patch(
         "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
@@ -778,29 +1099,24 @@ class TestDataprocSubmitJobDirectTrigger:
         submit_job_direct_trigger,
         is_safe_to_cancel,
     ):
+        """Test CancelledError handling for Airflow < 3.3.0."""
         mock_safe_to_cancel.return_value = is_safe_to_cancel
         mock_hook = mock_get_async_hook.return_value
-
         mock_submitted_job = mock.MagicMock()
         mock_submitted_job.reference.job_id = TEST_JOB_ID
         submit_future = asyncio.Future()
         submit_future.set_result(mock_submitted_job)
         mock_hook.submit_job.return_value = submit_future
-
         mock_hook.get_job.side_effect = asyncio.CancelledError
-
         mock_sync_hook = mock_get_sync_hook.return_value
         mock_sync_hook.cancel_job = mock.MagicMock()
 
         async_gen = submit_job_direct_trigger.run()
-
-        try:
+        if is_safe_to_cancel:
+            event = await async_gen.asend(None)
+            assert event.payload["job_state"] == ClusterStatus.State.DELETING.name
+        with pytest.raises(asyncio.CancelledError):
             await async_gen.asend(None)
-            await async_gen.asend(None)
-        except (asyncio.CancelledError, StopAsyncIteration):
-            pass
-        except Exception as e:
-            pytest.fail(f"Unexpected exception raised: {e}")
 
         if submit_job_direct_trigger.cancel_on_kill and is_safe_to_cancel:
             mock_sync_hook.cancel_job.assert_called_once_with(
@@ -812,3 +1128,234 @@ class TestDataprocSubmitJobDirectTrigger:
             mock_sync_hook.cancel_job.assert_not_called()
 
         await async_gen.aclose()
+
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"task_instance": None},
+            {"trigger_id": None},
+            {"job": {**TEST_JOB, "reference": {"job_id": "caller-job-id"}}},
+        ],
+    )
+    def test_build_assigned_job_id_leaves_the_job_unnamed(self, submit_job_direct_trigger, identity):
+        attach_trigger_identity(submit_job_direct_trigger)
+        for attribute, value in identity.items():
+            setattr(submit_job_direct_trigger, attribute, value)
+
+        assert submit_job_direct_trigger._build_assigned_job_id() is None
+
+    @pytest.mark.parametrize(
+        "difference",
+        [{"trigger_id": 43}, {"ti_uuid": OTHER_TI_UUID}],
+    )
+    def test_build_assigned_job_id_identifies_one_deferral(self, submit_job_direct_trigger, difference):
+        attach_trigger_identity(submit_job_direct_trigger)
+        job_id = submit_job_direct_trigger._build_assigned_job_id()
+
+        attach_trigger_identity(submit_job_direct_trigger)
+        assert submit_job_direct_trigger._build_assigned_job_id() == job_id
+
+        attach_trigger_identity(submit_job_direct_trigger, **difference)
+        assert submit_job_direct_trigger._build_assigned_job_id() != job_id
+
+    @pytest.mark.parametrize(
+        "difference",
+        [
+            {"trigger_id": 43},
+            {"dag_id": "other-dag"},
+            {"task_id": "other-task"},
+            {"run_id": "other-run"},
+            {"map_index": 0},
+            {"try_number": 2},
+        ],
+    )
+    def test_build_assigned_job_id_falls_back_to_the_task_identity(
+        self, submit_job_direct_trigger, difference
+    ):
+        attach_trigger_identity(submit_job_direct_trigger, ti_uuid=None)
+        job_id = submit_job_direct_trigger._build_assigned_job_id()
+
+        attach_trigger_identity(submit_job_direct_trigger, ti_uuid=None)
+        assert submit_job_direct_trigger._build_assigned_job_id() == job_id
+
+        attach_trigger_identity(submit_job_direct_trigger, ti_uuid=None, **difference)
+        assert submit_job_direct_trigger._build_assigned_job_id() != job_id
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
+    )
+    async def test_run_names_the_job_before_submitting_it(
+        self, mock_get_async_hook, submit_job_direct_trigger
+    ):
+        attach_trigger_identity(submit_job_direct_trigger)
+        expected_job_id = submit_job_direct_trigger._build_assigned_job_id()
+        submitted = {}
+
+        def submit_job(**kwargs):
+            submitted["job_id_known_by_trigger"] = submit_job_direct_trigger.job_id
+            submitted["job"] = kwargs["job"]
+            submitted["request_id"] = kwargs["request_id"]
+            future = asyncio.Future()
+            future.set_result(Job(reference={"job_id": expected_job_id}))
+            return future
+
+        mock_hook = mock_get_async_hook.return_value
+        mock_hook.submit_job.side_effect = submit_job
+        get_future = asyncio.Future()
+        get_future.set_result(Job(status=JobStatus(state=JobStatus.State.DONE)))
+        mock_hook.get_job.return_value = get_future
+
+        await submit_job_direct_trigger.run().asend(None)
+
+        assert submitted["job_id_known_by_trigger"] == expected_job_id
+        assert submitted["job"]["reference"] == {"job_id": expected_job_id}
+        assert submitted["request_id"] == TEST_REQUEST_ID
+        assert submit_job_direct_trigger.job == TEST_JOB
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
+    )
+    async def test_run_defaults_the_request_id_to_the_assigned_job_id(self, mock_get_async_hook):
+        trigger = DataprocSubmitJobDirectTrigger(
+            job=TEST_JOB,
+            project_id=TEST_PROJECT_ID,
+            region=TEST_REGION,
+            gcp_conn_id=TEST_GCP_CONN_ID,
+            polling_interval_seconds=TEST_POLL_INTERVAL,
+        )
+        attach_trigger_identity(trigger)
+        mock_hook = mock_get_async_hook.return_value
+        submit_future = asyncio.Future()
+        submit_future.set_result(Job(reference={"job_id": TEST_JOB_ID}))
+        mock_hook.submit_job.return_value = submit_future
+        get_future = asyncio.Future()
+        get_future.set_result(Job(status=JobStatus(state=JobStatus.State.DONE)))
+        mock_hook.get_job.return_value = get_future
+
+        await trigger.run().asend(None)
+
+        assert mock_hook.submit_job.call_args.kwargs["request_id"] == trigger._build_assigned_job_id()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_id", [TEST_REQUEST_ID, None])
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
+    )
+    async def test_run_polls_the_job_it_already_submitted(
+        self, mock_get_async_hook, submit_job_direct_trigger, request_id
+    ):
+        attach_trigger_identity(submit_job_direct_trigger)
+        submit_job_direct_trigger.request_id = request_id
+        expected_job_id = submit_job_direct_trigger._build_assigned_job_id()
+        mock_hook = mock_get_async_hook.return_value
+        mock_hook.submit_job.side_effect = AlreadyExists("job already exists")
+        get_future = asyncio.Future()
+        get_future.set_result(Job(status=JobStatus(state=JobStatus.State.DONE)))
+        mock_hook.get_job.return_value = get_future
+
+        event = await submit_job_direct_trigger.run().asend(None)
+
+        assert event.payload["job_id"] == expected_job_id
+        mock_hook.get_job.assert_called_once_with(
+            project_id=TEST_PROJECT_ID, region=TEST_REGION, job_id=expected_job_id
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_id", [TEST_REQUEST_ID, None])
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
+    )
+    async def test_run_reraises_already_exists_for_a_job_the_caller_named(
+        self, mock_get_async_hook, submit_job_direct_trigger, request_id
+    ):
+        attach_trigger_identity(submit_job_direct_trigger)
+        submit_job_direct_trigger.job = {**TEST_JOB, "reference": {"job_id": "caller-job-id"}}
+        submit_job_direct_trigger.request_id = request_id
+        mock_hook = mock_get_async_hook.return_value
+        mock_hook.submit_job.side_effect = AlreadyExists("job already exists")
+
+        with pytest.raises(AlreadyExists):
+            await submit_job_direct_trigger.run().asend(None)
+
+        mock_hook.get_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    async def test_on_kill_tolerates_a_job_dataproc_never_received(
+        self, mock_get_sync_hook, submit_job_direct_trigger
+    ):
+        submit_job_direct_trigger.job_id = TEST_JOB_ID
+        mock_get_sync_hook.return_value.cancel_job.side_effect = NotFound("no such job")
+
+        await submit_job_direct_trigger.on_kill()
+
+        mock_get_sync_hook.return_value.cancel_job.assert_called_once()
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    async def test_on_kill_propagates_a_failure_to_cancel(
+        self, mock_get_sync_hook, submit_job_direct_trigger
+    ):
+        submit_job_direct_trigger.job_id = TEST_JOB_ID
+        mock_get_sync_hook.return_value.cancel_job.side_effect = PermissionDenied("not allowed")
+
+        with pytest.raises(PermissionDenied):
+            await submit_job_direct_trigger.on_kill()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(AIRFLOW_V_3_3_PLUS, reason="on_kill() handles cancellation for Airflow 3.3.0+")
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_async_hook"
+    )
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.get_sync_hook"
+    )
+    @mock.patch(
+        "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger.safe_to_cancel"
+    )
+    async def test_run_cancelled_tolerates_a_job_dataproc_never_received(
+        self,
+        mock_safe_to_cancel,
+        mock_get_sync_hook,
+        mock_get_async_hook,
+        submit_job_direct_trigger,
+    ):
+        mock_safe_to_cancel.return_value = True
+        mock_hook = mock_get_async_hook.return_value
+        submit_future = asyncio.Future()
+        submit_future.set_result(Job(reference={"job_id": TEST_JOB_ID}))
+        mock_hook.submit_job.return_value = submit_future
+        mock_hook.get_job.side_effect = asyncio.CancelledError
+        mock_get_sync_hook.return_value.cancel_job.side_effect = NotFound("no such job")
+
+        async_gen = submit_job_direct_trigger.run()
+        with pytest.raises(asyncio.CancelledError):
+            await async_gen.asend(None)
+
+        mock_get_sync_hook.return_value.cancel_job.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not AIRFLOW_V_3_0_PLUS or AIRFLOW_V_3_3_PLUS,
+        reason="The task state is read through the task SDK on Airflow 3.0 to 3.2 only",
+    )
+    @pytest.mark.parametrize(
+        ("map_index", "state_key"), [(-1, "test_task"), (3, "test_task_3")], ids=["unmapped", "mapped"]
+    )
+    @mock.patch("airflow.sdk.execution_time.task_runner.RuntimeTaskInstance.get_task_states", autospec=True)
+    async def test_get_task_state_uses_map_index_key(
+        self, mock_get_task_states, submit_job_direct_trigger, map_index, state_key
+    ):
+        """The execution API keys a mapped task instance as ``<task_id>_<map_index>``."""
+        submit_job_direct_trigger.task_instance = SimpleNamespace(
+            dag_id="test_dag", task_id="test_task", run_id="test_run", map_index=map_index
+        )
+        mock_get_task_states.return_value = {"test_run": {state_key: TaskInstanceState.DEFERRED}}
+
+        assert await submit_job_direct_trigger.get_task_state() == TaskInstanceState.DEFERRED

@@ -18,11 +18,13 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from typing import Literal
+from unittest import mock
 
 import pytest
+from jsonschema import FormatChecker
 
 from airflow.sdk.definitions.param import Param, ParamsDict
-from airflow.sdk.exceptions import ParamValidationError
+from airflow.sdk.exceptions import ParamValidationError, RemovedInAirflow4Warning
 from airflow.serialization.definitions.param import SerializedParam
 from airflow.serialization.serialized_objects import BaseSerialization
 
@@ -99,6 +101,19 @@ class TestParam:
         with pytest.raises(ParamValidationError, match="is not a 'date-time'"):
             Param(dt, type="string", format="date-time").resolve()
 
+    @mock.patch.dict(FormatChecker.checkers)
+    def test_string_datetime_validated_without_rfc3339_validator(self):
+        """A default install has no rfc3339-validator, so jsonschema registers no date-time checker."""
+        FormatChecker.checkers.pop("date-time", None)
+        with pytest.raises(ParamValidationError, match="is not a 'date-time'"):
+            Param("garbage", type="string", format="date-time").resolve()
+        assert Param("2024-01-01t00:00:00z", type="string", format="date-time").resolve()
+
+    @pytest.mark.parametrize("value", ["2024-01-01T00:00:00", "2024-01-01 00:00:00+00:00"])
+    def test_string_iso8601_datetime_warns_and_is_accepted_unchanged(self, value):
+        with pytest.warns(RemovedInAirflow4Warning, match="is deprecated"):
+            assert Param(value, type="string", format="date-time").resolve() == value
+
     def test_string_time_format(self):
         """Test string time format."""
         assert Param("03:04:05", type="string", format="time").resolve() == "03:04:05"
@@ -137,6 +152,39 @@ class TestParam:
         """Test string date format failures."""
         with pytest.raises(ParamValidationError, match="is not a 'date'"):
             Param(date_string, type="string", format="date").resolve()
+
+    @pytest.mark.parametrize(
+        "duration",
+        [
+            pytest.param("PT15M", id="minutes-only"),
+            pytest.param("P1Y", id="years-only"),
+            pytest.param("P1W", id="weeks-only"),
+            pytest.param("P1D", id="days-only"),
+            pytest.param("PT1H", id="hours-only"),
+            pytest.param("PT30S", id="seconds-only"),
+            pytest.param("P1DT2H", id="days-and-hours"),
+            pytest.param("P1Y2M3DT4H5M6S", id="full-duration"),
+            pytest.param("PT1.5H", id="fractional-hours-dot"),
+        ],
+    )
+    def test_string_duration_format(self, duration):
+        """Test valid ISO 8601 duration strings."""
+        assert Param(duration, type="string", format="duration").resolve() == duration
+
+    @pytest.mark.parametrize(
+        "duration",
+        [
+            pytest.param("P", id="bare-P"),
+            pytest.param("PT", id="bare-PT"),
+            pytest.param("invalid", id="plain-text"),
+            pytest.param("15M", id="missing-P-prefix"),
+            pytest.param("1Y2M", id="no-P-prefix"),
+        ],
+    )
+    def test_string_duration_format_error(self, duration):
+        """Test invalid ISO 8601 duration strings."""
+        with pytest.raises(ParamValidationError, match="is not a 'duration'"):
+            Param(duration, type="string", format="duration").resolve()
 
     def test_int_param(self):
         p = Param(5)

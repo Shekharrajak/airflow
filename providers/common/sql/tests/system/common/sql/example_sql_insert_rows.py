@@ -18,8 +18,8 @@
 from __future__ import annotations
 
 from airflow import DAG
+from airflow.providers.common.compat.sdk import timezone
 from airflow.providers.common.sql.operators.sql import SQLInsertRowsOperator
-from airflow.utils.timezone import datetime
 
 AIRFLOW_DB_METADATA_TABLE = "ab_user"
 connection_args = {
@@ -36,7 +36,7 @@ with DAG(
     "example_sql_insert_rows",
     description="Example DAG for SQLInsertRowsOperator.",
     default_args=connection_args,
-    start_date=datetime(2021, 1, 1),
+    start_date=timezone.datetime(2021, 1, 1),
     schedule=None,
     catchup=False,
 ) as dag:
@@ -86,5 +86,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

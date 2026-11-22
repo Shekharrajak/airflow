@@ -16,13 +16,17 @@
 # under the License.
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+import secrets
+import string
 import tempfile
 from contextlib import redirect_stdout
 from importlib import reload
 from io import StringIO
+from unittest import mock
 
 import pytest
 
@@ -37,6 +41,18 @@ pytestmark = pytest.mark.db_test
 TEST_USER1_EMAIL = "test-user1@example.com"
 TEST_USER2_EMAIL = "test-user2@example.com"
 TEST_USER3_EMAIL = "test-user3@example.com"
+
+
+@mock.patch(
+    "airflow.providers.fab.auth_manager.cli_commands.user_command.secrets.choice",
+    side_effect=secrets.choice,
+)
+def test_create_password_uses_csprng_without_whitespace(mock_choice):
+    args = argparse.Namespace(use_random_password=True, password=None)
+    password = user_command._create_password(args)
+    assert mock_choice.call_count == 16
+    assert len(password) == 16
+    assert not any(char in string.whitespace for char in password)
 
 
 def _does_user_belong_to_role(appbuilder, email, rolename):
@@ -489,6 +505,34 @@ class TestCliUsers:
     def test_cli_import_users_exceptions(self, user, message):
         with pytest.raises(SystemExit, match=re.escape(message)):
             self._import_users_from_file([user])
+
+    def test_cli_import_users_fails_when_user_cannot_be_created(self):
+        self._import_users_from_file(
+            [
+                {
+                    "username": "imported_user1",
+                    "lastname": "doe1",
+                    "firstname": "jon",
+                    "email": TEST_USER1_EMAIL,
+                    "roles": ["Admin"],
+                }
+            ]
+        )
+        # Usernames are unique case-insensitively, so this insert fails even though the email is new.
+        with pytest.raises(
+            SystemExit, match=re.escape(f"Failed to create user with email {TEST_USER2_EMAIL!r}")
+        ):
+            self._import_users_from_file(
+                [
+                    {
+                        "username": "IMPORTED_USER1",
+                        "lastname": "doe2",
+                        "firstname": "jon",
+                        "email": TEST_USER2_EMAIL,
+                        "roles": ["Admin"],
+                    }
+                ]
+            )
 
     def test_cli_reset_user_password(self):
         args = self.parser.parse_args(

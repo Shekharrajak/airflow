@@ -35,7 +35,6 @@ def minimal_app_for_auth_api():
             "init_appbuilder",
             "init_api_auth",
             "init_airflow_session_interface",
-            "init_appbuilder_views",
         ]
     )
     def factory():
@@ -51,7 +50,15 @@ def minimal_app_for_auth_api():
             _app.config["AUTH_ROLE_PUBLIC"] = None
             return _app
 
-    return factory()
+    flask_app = factory()
+    try:
+        yield flask_app
+    finally:
+        # Dispose the flask_sqlalchemy per-app engine so its pooled connections
+        # don't survive the session in long CI runs.
+        with flask_app.app_context():
+            for fab_engine in flask_app.extensions["sqlalchemy"].engines.values():
+                fab_engine.dispose()
 
 
 @pytest.fixture

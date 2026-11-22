@@ -30,9 +30,8 @@
 
 | Version | Build Status                                                                                                                                                    |
 |---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Main    | [![GitHub Build main](https://github.com/apache/airflow/actions/workflows/ci-amd-arm.yml/badge.svg)](https://github.com/apache/airflow/actions)                 |
-| 3.x     | [![GitHub Build 3.1](https://github.com/apache/airflow/actions/workflows/ci-amd-arm.yml/badge.svg?branch=v3-1-test)](https://github.com/apache/airflow/actions) |
-| 2.x     | [![GitHub Build 2.11](https://github.com/apache/airflow/actions/workflows/ci.yml/badge.svg?branch=v2-11-test)](https://github.com/apache/airflow/actions)       |
+| Main    | [![Tests AMD main](https://github.com/apache/airflow/actions/workflows/ci-amd.yml/badge.svg)](https://github.com/apache/airflow/actions/workflows/ci-amd.yml) [![Tests ARM main](https://github.com/apache/airflow/actions/workflows/ci-arm.yml/badge.svg)](https://github.com/apache/airflow/actions/workflows/ci-arm.yml) |
+| 3.x     | [![Tests AMD 3.2](https://github.com/apache/airflow/actions/workflows/ci-amd.yml/badge.svg?branch=v3-2-test)](https://github.com/apache/airflow/actions/workflows/ci-amd.yml) [![Tests ARM 3.2](https://github.com/apache/airflow/actions/workflows/ci-arm.yml/badge.svg?branch=v3-2-test)](https://github.com/apache/airflow/actions/workflows/ci-arm.yml) |
 
 
 
@@ -69,6 +68,7 @@ Use Airflow to author workflows (Dags) that orchestrate tasks. The Airflow sched
 - [Base OS support for reference Airflow images](#base-os-support-for-reference-airflow-images)
 - [Approach to dependencies of Airflow](#approach-to-dependencies-of-airflow)
 - [Contributing](#contributing)
+- [Community standards](#community-standards)
 - [Voting Policy](#voting-policy)
 - [Who uses Apache Airflow?](#who-uses-apache-airflow)
 - [Who maintains Apache Airflow?](#who-maintains-apache-airflow)
@@ -82,6 +82,8 @@ Use Airflow to author workflows (Dags) that orchestrate tasks. The Airflow sched
 ## Project Focus
 
 Airflow works best with workflows that are mostly static and slowly changing. When the Dag structure is similar from one run to the next, it clarifies the unit of work and continuity. Other similar projects include [Luigi](https://github.com/spotify/luigi), [Oozie](https://oozie.apache.org/) and [Azkaban](https://azkaban.github.io/).
+
+Beyond traditional data pipelines, Airflow is widely used to orchestrate machine learning workflows — training, retraining, evaluation, and deployment — and increasingly to orchestrate agentic and LLM-based workloads, coordinating the steps of an AI pipeline (data prep, tool calls, model invocation, evaluation) rather than acting as the agent itself. This isn't a new direction: teams have run ML and AI workloads on Airflow for years, and the ecosystem of providers supporting these use cases (see the [AI & ML section of the Airflow registry](https://airflow.apache.org/registry/providers/?category=ai-ml)) continues to grow.
 
 Airflow is commonly used to process data, but has the opinion that tasks should ideally be idempotent (i.e., results of the task will be the same, and will not create duplicated data in a destination system), and should not pass large quantities of data from one task to the next (though tasks can pass metadata using Airflow's [XCom feature](https://airflow.apache.org/docs/apache-airflow/stable/concepts/xcoms.html)). For high-volume, data-intensive tasks, a best practice is to delegate to external services specializing in that type of work.
 
@@ -98,16 +100,14 @@ Airflow is not a streaming solution, but it is often used to process real-time d
 
 Apache Airflow is tested with:
 
-|            | Main version (dev)                 | Stable version (3.1.8) | Stable version (2.11.2)      |
-|------------|------------------------------------|------------------------|------------------------------|
-| Python     | 3.10, 3.11, 3.12, 3.13, 3.14       | 3.10, 3.11, 3.12, 3.13 | 3.10, 3.11, 3.12             |
-| Platform   | AMD64/ARM64                        | AMD64/ARM64            | AMD64/ARM64(\*)              |
-| Kubernetes | 1.30, 1.31, 1.32, 1.33, 1.34, 1.35 | 1.30, 1.31, 1.32, 1.33 | 1.26, 1.27, 1.28, 1.29, 1.30 |
-| PostgreSQL | 14, 15, 16, 17, 18                 | 13, 14, 15, 16, 17     | 12, 13, 14, 15, 16           |
-| MySQL      | 8.0, 8.4, Innovation               | 8.0, 8.4, Innovation   | 8.0, Innovation              |
-| SQLite     | 3.15.0+                            | 3.15.0+                | 3.15.0+                      |
-
-\* Experimental
+|            | Main version (dev)                       | Stable version (3.4.0)                   |
+|------------|------------------------------------------|------------------------------------------|
+| Python     | 3.11, 3.12, 3.13, 3.14                   | 3.11, 3.12, 3.13, 3.14                   |
+| Platform   | AMD64/ARM64                              | AMD64/ARM64                              |
+| Kubernetes | 1.31, 1.32, 1.33, 1.34, 1.35, 1.36, 1.37 | 1.31, 1.32, 1.33, 1.34, 1.35, 1.36, 1.37 |
+| PostgreSQL | 15, 16, 17, 18                           | 14, 15, 16, 17, 18                       |
+| MySQL      | 8.0, 8.4, Innovation                     | 8.0, 8.4, Innovation                     |
+| SQLite     | 3.15.0+                                  | 3.15.0+                                  |
 
 **Note**: MariaDB is not tested/recommended.
 
@@ -159,7 +159,7 @@ correct Airflow tag/version/branch and Python versions in the URL.
 
 1. Installing just Airflow:
 
-> Note: Only `pip` installation is currently officially supported.
+> Note: Only `pip` and `uv` installation is currently officially supported.
 
 While it is possible to install Airflow with tools like [Poetry](https://python-poetry.org) or
 [pip-tools](https://pypi.org/project/pip-tools), they do not share the same workflow as
@@ -171,19 +171,19 @@ them to the appropriate format and workflow that your tool requires.
 
 
 ```bash
-pip install 'apache-airflow==3.1.8' \
- --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.10.txt"
+pip install 'apache-airflow==3.4.0' \
+ --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.4.0/constraints-3.10.txt"
 ```
 
 2. Installing with extras (i.e., postgres, google)
 
 ```bash
-pip install 'apache-airflow[postgres,google]==3.1.8' \
- --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.10.txt"
+pip install 'apache-airflow[postgres,google]==3.4.0' \
+ --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.4.0/constraints-3.10.txt"
 ```
 
 For information on installing provider distributions, check
-[providers](http://airflow.apache.org/docs/apache-airflow-providers/index.html).
+[providers](https://airflow.apache.org/docs/apache-airflow-providers/index.html).
 
 <!-- END Installing from PyPI, please keep comment here to allow auto update of PyPI readme.md -->
 
@@ -291,14 +291,14 @@ Apache Airflow version life cycle:
 <!-- This table is automatically updated by prek scripts/ci/prek/supported_versions.py -->
 <!-- Beginning of auto-generated table -->
 
-| Version   | Current Patch/Minor   | State               | First Release   | Limited Maintenance   | EOL/Terminated   |
-|-----------|-----------------------|---------------------|-----------------|-----------------------|------------------|
-| 3         | 3.1.8                 | Maintenance         | Apr 22, 2025    | TBD                   | TBD              |
-| 2         | 2.11.2                | Limited maintenance | Dec 17, 2020    | Oct 22, 2025          | Apr 22, 2026     |
-| 1.10      | 1.10.15               | EOL                 | Aug 27, 2018    | Dec 17, 2020          | June 17, 2021    |
-| 1.9       | 1.9.0                 | EOL                 | Jan 03, 2018    | Aug 27, 2018          | Aug 27, 2018     |
-| 1.8       | 1.8.2                 | EOL                 | Mar 19, 2017    | Jan 03, 2018          | Jan 03, 2018     |
-| 1.7       | 1.7.1.2               | EOL                 | Mar 28, 2016    | Mar 19, 2017          | Mar 19, 2017     |
+| Version   | Current Patch/Minor   | State       | First Release   | Limited Maintenance   | EOL/Terminated   |
+|-----------|-----------------------|-------------|-----------------|-----------------------|------------------|
+| 3         | 3.4.0                 | Maintenance | Apr 22, 2025    | TBD                   | TBD              |
+| 2         | 2.11.2                | EOL         | Dec 17, 2020    | Oct 22, 2025          | Apr 22, 2026     |
+| 1.10      | 1.10.15               | EOL         | Aug 27, 2018    | Dec 17, 2020          | June 17, 2021    |
+| 1.9       | 1.9.0                 | EOL         | Jan 03, 2018    | Aug 27, 2018          | Aug 27, 2018     |
+| 1.8       | 1.8.2                 | EOL         | Mar 19, 2017    | Jan 03, 2018          | Jan 03, 2018     |
+| 1.7       | 1.7.1.2               | EOL         | Mar 28, 2016    | Mar 19, 2017          | Mar 19, 2017     |
 
 <!-- End of auto-generated table -->
 
@@ -340,7 +340,7 @@ we publish an Apache Airflow release. Those images contain:
   on the MINOR version of Airflow)
 * Predefined set of popular providers (for details see the [Dockerfile](https://raw.githubusercontent.com/apache/airflow/main/Dockerfile)).
 * Possibility of building your own, custom image where the user can choose their own set of providers
-  and libraries (see [Building the image](https://airflow.apache.org/docs/docker-stack/build.html))
+  and libraries (see [Building your image](https://airflow.apache.org/docs/docker-stack/build.html))
 * In the future Airflow might also support a "slim" version without providers nor database clients installed
 
 The version of the base OS image is the stable version of Debian. Airflow supports using all currently active
@@ -431,6 +431,23 @@ If you can't wait to contribute, and want to get started asap, check out the [co
 Official Docker (container) images for Apache Airflow are described in [images](https://github.com/apache/airflow/blob/main/dev/breeze/doc/ci/02_images.md).
 
 <!-- END Contributing, please keep comment here to allow auto update of PyPI readme.md -->
+
+## Community standards
+
+Everyone interacting with the Apache Airflow project — on GitHub, the
+mailing lists, Slack, the CWiki, or anywhere else — is expected to
+follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+When repeated Code of Conduct breaches, spamming, abuse of project
+resources, or other sustained disruptive behaviour cannot be resolved
+through normal review and mentoring, the project applies the
+[Community escalation process](COMMUNITY_ESCALATION.md). It describes
+the steps maintainers and the PMC may take — from direct feedback,
+through closing PRs, up to PMC-level or ASF-Infrastructure-level
+blocks and reporting accounts to GitHub — and how affected
+contributors can appeal a decision by emailing the PMC at
+`private@airflow.apache.org`.
+
 <!-- START Who uses Apache Airflow, please keep comment here to allow auto update of PyPI readme.md -->
 
 ## Voting Policy
@@ -542,3 +559,5 @@ The CI infrastructure for Apache Airflow has been sponsored by:
 
 <a href="https://astronomer.io"><img src="https://assets2.astronomer.io/logos/logoForLIGHTbackground.png" alt="astronomer.io" width="250px"></a>
 <a href="https://aws.amazon.com/opensource/"><img src="https://github.com/apache/airflow/blob/main/providers/amazon/docs/integration-logos/AWS-Cloud-alt_light-bg@4x.png?raw=true" alt="AWS OpenSource" width="130px"></a>
+
+The self-hosted CI runners on AWS are managed by [RunsOn](https://runs-on.com), which is free for open-source projects.

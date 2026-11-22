@@ -28,8 +28,7 @@ from airflow.serialization.dag_dependency import DagDependency
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, MutableSequence
-
-    from typing_extensions import Self
+    from typing import Self
 
     from airflow.models.asset import AssetModel
 
@@ -70,6 +69,11 @@ class SerializedAssetBase:
 
     :meta private:
     """
+
+    @property
+    def requires_batching(self) -> bool:
+        """Whether this condition needs multiple asset events to be satisfied."""
+        return False
 
     def __bool__(self) -> bool:
         return True
@@ -120,6 +124,7 @@ class SerializedAsset(SerializedAssetBase):
     group: str
     extra: dict[str, Any]
     watchers: MutableSequence[SerializedAssetWatcher]
+    access_control: dict[str, Any] = attrs.field(factory=dict)
 
     def as_expression(self) -> Any:
         """
@@ -260,6 +265,10 @@ class SerializedAssetBooleanCondition(SerializedAssetBase):
 
     agg_func: ClassVar[Callable[[Iterable], bool]]
 
+    @property
+    def requires_batching(self) -> bool:
+        return any(obj.requires_batching for obj in self.objects)
+
     def iter_assets(self) -> Iterator[tuple[SerializedAssetUniqueKey, SerializedAsset]]:
         for o in self.objects:
             yield from o.iter_assets()
@@ -300,6 +309,10 @@ class SerializedAssetAll(SerializedAssetBooleanCondition):
     """Serialized representation of an asset "and" relationship."""
 
     agg_func = all
+
+    @property
+    def requires_batching(self) -> bool:
+        return len(self.objects) > 1 or super().requires_batching
 
     def __repr__(self) -> str:
         return f"AssetAny({', '.join(map(str, self.objects))})"

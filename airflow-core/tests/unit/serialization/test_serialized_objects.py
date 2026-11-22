@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
 import sys
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -27,32 +28,30 @@ from typing import TYPE_CHECKING
 import pendulum
 import pytest
 from dateutil import relativedelta
-from kubernetes.client import models as k8s
+from kubernetes.client import Configuration, models as k8s
 from pendulum.tz.timezone import FixedTimezone, Timezone
 from uuid6 import uuid7
 
 from airflow._shared.timezones import timezone
+from airflow.api_fastapi.execution_api.datamodels import taskinstance as ti_datamodel
 from airflow.callbacks.callback_requests import DagCallbackRequest, TaskCallbackRequest
 from airflow.exceptions import (
     AirflowException,
     AirflowFailException,
     AirflowRescheduleException,
     SerializationError,
-    TaskDeferred,
 )
 from airflow.models.connection import Connection
 from airflow.models.dag import DAG
-from airflow.models.dagrun import DagRun
-from airflow.models.taskinstance import TaskInstance
 from airflow.models.xcom_arg import XComArg
 from airflow.partition_mappers.identity import IdentityMapper as CoreIdentityMapper
 from airflow.partition_mappers.temporal import (
-    ToDailyMapper as CoreToDailyMapper,
-    ToHourlyMapper as CoreToHourlyMapper,
-    ToMonthlyMapper as CoreToMonthlyMapper,
-    ToQuarterlyMapper as CoreToQuarterlyMapper,
-    ToWeeklyMapper as CoreToWeeklyMapper,
-    ToYearlyMapper as CoreToYearlyMapper,
+    StartOfDayMapper as CoreStartOfDayMapper,
+    StartOfHourMapper as CoreStartOfHourMapper,
+    StartOfMonthMapper as CoreStartOfMonthMapper,
+    StartOfQuarterMapper as CoreStartOfQuarterMapper,
+    StartOfWeekMapper as CoreStartOfWeekMapper,
+    StartOfYearMapper as CoreStartOfYearMapper,
 )
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.standard.operators.empty import EmptyOperator
@@ -61,12 +60,12 @@ from airflow.providers.standard.triggers.file import FileDeleteTrigger
 from airflow.sdk import (
     BaseOperator,
     IdentityMapper,
-    ToDailyMapper,
-    ToHourlyMapper,
-    ToMonthlyMapper,
-    ToQuarterlyMapper,
-    ToWeeklyMapper,
-    ToYearlyMapper,
+    StartOfDayMapper,
+    StartOfHourMapper,
+    StartOfMonthMapper,
+    StartOfQuarterMapper,
+    StartOfWeekMapper,
+    StartOfYearMapper,
 )
 from airflow.sdk.definitions.asset import (
     Asset,
@@ -80,12 +79,16 @@ from airflow.sdk.definitions.deadline import (
     AsyncCallback,
     DeadlineAlert,
     DeadlineReference,
+    SyncCallback,
+    VariableInterval,
 )
 from airflow.sdk.definitions.decorators import task
 from airflow.sdk.definitions.operator_resources import Resources
 from airflow.sdk.definitions.param import Param
+from airflow.sdk.definitions.retry_policy import ExceptionRetryPolicy, RetryAction, RetryRule
 from airflow.sdk.definitions.taskgroup import TaskGroup
 from airflow.sdk.execution_time.context import OutletEventAccessor, OutletEventAccessors
+from airflow.serialization import serialized_objects
 from airflow.serialization.definitions.assets import (
     SerializedAsset,
     SerializedAssetAlias,
@@ -94,7 +97,11 @@ from airflow.serialization.definitions.assets import (
     SerializedAssetBase,
     SerializedAssetRef,
 )
-from airflow.serialization.definitions.deadline import DeadlineAlertFields, SerializedDeadlineAlert
+from airflow.serialization.definitions.deadline import (
+    DeadlineAlertFields,
+    SerializedDeadlineAlert,
+    SerializedVariableInterval,
+)
 from airflow.serialization.encoders import ensure_serialized_asset, ensure_serialized_deadline_alert
 from airflow.serialization.enums import DagAttributeTypes as DAT, Encoding
 from airflow.serialization.helpers import PartitionMapperNotFound
@@ -103,12 +110,8 @@ from airflow.serialization.serialized_objects import (
     DagSerialization,
     LazyDeserializedDAG,
     _has_kubernetes,
-    create_scheduler_operator,
 )
-from airflow.triggers.base import BaseTrigger
 from airflow.utils.db import LazySelectSequence
-from airflow.utils.state import DagRunState, State
-from airflow.utils.types import DagRunType
 
 from unit.models import DEFAULT_DATE
 
@@ -224,31 +227,14 @@ def test_serde_validate_schema_valid_json():
     assert t.obj == {"foo": "bar"}
 
 
-TI = TaskInstance(
-    task=create_scheduler_operator(EmptyOperator(task_id="test-task")),
+TASK_CALLBACK_TI = ti_datamodel.TaskInstance(
+    id=uuid7(),
+    task_id="test-task",
+    dag_id="test-dag",
     run_id="fake_run",
-    state=State.RUNNING,
+    try_number=1,
     dag_version_id=uuid7(),
 )
-
-TI_WITH_START_DAY = TaskInstance(
-    task=create_scheduler_operator(EmptyOperator(task_id="test-task")),
-    run_id="fake_run",
-    state=State.RUNNING,
-    dag_version_id=uuid7(),
-)
-TI_WITH_START_DAY.start_date = timezone.datetime(2020, 1, 1, 0, 0, 0)
-
-DAG_RUN = DagRun(
-    dag_id="test_dag_id",
-    run_id="test_dag_run_id",
-    run_type=DagRunType.MANUAL,
-    logical_date=timezone.utcnow(),
-    start_date=timezone.utcnow(),
-    state=DagRunState.SUCCESS,
-)
-DAG_RUN.id = 1
-
 
 # we add the tasks out of order, to ensure they are deserialized in the correct order
 DAG_WITH_TASKS = DAG(dag_id="test_dag", start_date=datetime.now())
@@ -400,14 +386,9 @@ class MockLazySelectSequence(LazySelectSequence):
             equal_serialized_asset,
         ),
         (
-            Connection(conn_id="TEST_ID", uri="mysql://"),
-            DAT.CONNECTION,
-            lambda a, b: a.get_uri() == b.get_uri(),
-        ),
-        (
             TaskCallbackRequest(
                 filepath="filepath",
-                ti=TI,
+                ti=TASK_CALLBACK_TI,
                 bundle_name="testing",
                 bundle_version=None,
             ),
@@ -503,14 +484,50 @@ def test_serialize_deserialize(input, encoded_type, cmp_func):
     json.dumps(serialized)  # does not raise
 
 
+@pytest.mark.db_test
+def test_serialize_deserialize_connection():
+    from airflow.serialization.serialized_objects import BaseSerialization
+
+    connection = Connection(conn_id="TEST_ID", uri="mysql://")
+    serialized = BaseSerialization.serialize(connection)
+    json.dumps(serialized)
+    assert serialized[Encoding.TYPE] == DAT.CONNECTION
+
+    deserialized = BaseSerialization.deserialize(serialized)
+    assert deserialized.get_uri() == connection.get_uri()
+
+
 @pytest.mark.parametrize("reference", REFERENCE_TYPES)
-def test_serialize_deserialize_deadline_alert(reference):
+@pytest.mark.parametrize(
+    ("alert_class", "interval", "expected_interval"),
+    [
+        pytest.param(
+            DeadlineAlert,
+            timedelta(hours=1),
+            timedelta(hours=1),
+            id="timedelta",
+        ),
+        pytest.param(
+            DeadlineAlert,
+            VariableInterval("deadline_seconds"),
+            SerializedVariableInterval("deadline_seconds"),
+            id="sdk_variable_interval",
+        ),
+        pytest.param(
+            SerializedDeadlineAlert,
+            SerializedVariableInterval("deadline_seconds"),
+            SerializedVariableInterval("deadline_seconds"),
+            id="core_serialized_alert",
+        ),
+    ],
+)
+def test_serialize_deserialize_deadline_alert(reference, alert_class, interval, expected_interval):
     public_deadline_alert_fields = {
         field.lower() for field in vars(DeadlineAlertFields) if not field.startswith("_")
     }
-    original = DeadlineAlert(
+    original = alert_class(
         reference=reference,
-        interval=timedelta(hours=1),
+        interval=interval,
         callback=AsyncCallback(empty_callback_for_deadline, kwargs=TEST_CALLBACK_KWARGS),
     )
 
@@ -521,8 +538,24 @@ def test_serialize_deserialize_deadline_alert(reference):
 
     deserialized = BaseSerialization.deserialize(serialized)
     assert deserialized.reference.serialize_reference() == reference.serialize_reference()
-    assert deserialized.interval == original.interval
+    assert deserialized.interval == expected_interval
     assert deserialized.callback == original.callback
+
+
+def test_deserialize_deadline_alert_none_interval_raises():
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+
+    serialized = BaseSerialization.serialize(valid)
+
+    # Inject downgrade corruption.
+    serialized[Encoding.VAR][DeadlineAlertFields.INTERVAL] = None
+
+    with pytest.raises(ValueError, match="interval"):
+        BaseSerialization.deserialize(serialized)
 
 
 @pytest.mark.parametrize(
@@ -540,6 +573,7 @@ def test_serialize_deserialize_deadline_alert(reference):
         ),
     ],
 )
+@pytest.mark.db_test
 def test_backcompat_deserialize_connection(conn_uri):
     """Test deserialize connection which serialised by previous serializer implementation."""
     from airflow.serialization.serialized_objects import BaseSerialization
@@ -565,42 +599,14 @@ def test_ser_of_asset_event_accessor():
     assert d[Asset(name="yo", uri="test://yo")].extra == {"this": "that", "the": "other"}
 
 
-class MyTrigger(BaseTrigger):
-    def __init__(self, hi):
-        self.hi = hi
-
-    def serialize(self):
-        return "unit.serialization.test_serialized_objects.MyTrigger", {"hi": self.hi}
-
-    async def run(self):
-        yield
-
-
 def test_roundtrip_exceptions():
-    """
-    This is for AIP-44 when we need to send certain non-error exceptions
-    as part of an RPC call e.g. TaskDeferred or AirflowRescheduleException.
-    """
+    """Non-error AirflowExceptions (e.g. AirflowRescheduleException) round-trip through BaseSerialization."""
     some_date = pendulum.now()
     resched_exc = AirflowRescheduleException(reschedule_date=some_date)
     ser = BaseSerialization.serialize(resched_exc)
     deser = BaseSerialization.deserialize(ser)
     assert isinstance(deser, AirflowRescheduleException)
     assert deser.reschedule_date == some_date
-    del ser
-    del deser
-    exc = TaskDeferred(
-        trigger=MyTrigger(hi="yo"),
-        method_name="meth_name",
-        kwargs={"have": "pie"},
-        timeout=timedelta(seconds=30),
-    )
-    ser = BaseSerialization.serialize(exc)
-    deser = BaseSerialization.deserialize(ser)
-    assert deser.trigger.hi == "yo"
-    assert deser.method_name == "meth_name"
-    assert deser.kwargs == {"have": "pie"}
-    assert deser.timeout == timedelta(seconds=30)
 
 
 @pytest.mark.parametrize(
@@ -755,6 +761,195 @@ def test_serde_decode_asset_condition_unknown_type():
         decode_asset_like({"__type": "UNKNOWN_TYPE"})
 
 
+def test_encode_asset_with_access_control():
+    from airflow.sdk import Asset, AssetAccessControl
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(
+        name="test",
+        uri="s3://bucket/key",
+        access_control=AssetAccessControl(producer_teams=["team_a"], allow_global=False),
+    )
+    encoded = encode_asset_like(asset)
+    assert encoded["access_control"] == {
+        "producer_teams": ["team_a"],
+        "allow_global": False,
+    }
+
+
+def test_encode_asset_with_consumer_teams():
+    from airflow.sdk import Asset, AssetAccessControl
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(
+        name="test",
+        uri="s3://bucket/key",
+        access_control=AssetAccessControl(consumer_teams=["team_ml", "team_data"]),
+    )
+    encoded = encode_asset_like(asset)
+    assert encoded["access_control"] == {
+        "producer_teams": [],
+        "consumer_teams": ["team_ml", "team_data"],
+        "allow_global": True,
+    }
+
+
+def test_encode_asset_with_both_producer_and_consumer_teams():
+    from airflow.sdk import Asset, AssetAccessControl
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(
+        name="test",
+        uri="s3://bucket/key",
+        access_control=AssetAccessControl(
+            producer_teams=["team_a"], consumer_teams=["team_b"], allow_global=False
+        ),
+    )
+    encoded = encode_asset_like(asset)
+    assert encoded["access_control"] == {
+        "producer_teams": ["team_a"],
+        "consumer_teams": ["team_b"],
+        "allow_global": False,
+    }
+
+
+def test_encode_asset_without_access_control_omits_key():
+    from airflow.sdk import Asset
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(name="test", uri="s3://bucket/key")
+    encoded = encode_asset_like(asset)
+    assert "access_control" not in encoded
+
+
+def test_decode_asset_with_access_control():
+    from airflow.serialization.decoders import decode_asset_like
+
+    decoded = decode_asset_like(
+        {
+            "__type": "asset",
+            "name": "test",
+            "uri": "s3://bucket/key",
+            "group": "asset",
+            "extra": {},
+            "watchers": [],
+            "access_control": {"producer_teams": ["team_a"], "allow_global": False},
+        }
+    )
+    assert decoded.access_control == {"producer_teams": ["team_a"], "allow_global": False}
+
+
+def test_decode_asset_with_consumer_teams():
+    from airflow.serialization.decoders import decode_asset_like
+
+    decoded = decode_asset_like(
+        {
+            "__type": "asset",
+            "name": "test",
+            "uri": "s3://bucket/key",
+            "group": "asset",
+            "extra": {},
+            "watchers": [],
+            "access_control": {
+                "producer_teams": ["team_a"],
+                "consumer_teams": ["team_ml"],
+                "allow_global": False,
+            },
+        }
+    )
+    assert decoded.access_control == {
+        "producer_teams": ["team_a"],
+        "consumer_teams": ["team_ml"],
+        "allow_global": False,
+    }
+
+
+@pytest.mark.parametrize("q_val", [None, "my_q"])
+def test_decode_asset_preserves_watcher_trigger_queue(q_val: str | None):
+    from airflow.serialization.decoders import decode_asset_like
+
+    decoded = decode_asset_like(
+        {
+            "__type": "asset",
+            "name": "test",
+            "uri": "s3://bucket/key",
+            "group": "asset",
+            "extra": {},
+            "watchers": [
+                {
+                    "name": "watcher",
+                    "trigger": {
+                        "classpath": "airflow.providers.standard.triggers.file.FileDeleteTrigger",
+                        "kwargs": {"filepath": "/tmp"},
+                        **({"queue": q_val} if q_val else {}),
+                    },
+                }
+            ],
+        }
+    )
+    assert isinstance(decoded, SerializedAsset)
+    if q_val:
+        assert decoded.watchers[0].trigger["queue"] == q_val
+    else:
+        assert "queue" not in decoded.watchers[0].trigger
+
+
+def test_decode_asset_defaults_access_control_to_empty_dict():
+    from airflow.serialization.decoders import decode_asset_like
+
+    decoded = decode_asset_like(
+        {
+            "__type": "asset",
+            "name": "test",
+            "uri": "s3://bucket/key",
+            "group": "asset",
+            "extra": {},
+            "watchers": [],
+        }
+    )
+    assert decoded.access_control == {}
+
+
+def test_access_control_round_trip_with_consumer_teams():
+    from airflow.sdk import Asset, AssetAccessControl
+    from airflow.serialization.decoders import decode_asset_like
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(
+        name="test",
+        uri="s3://bucket/key",
+        access_control=AssetAccessControl(
+            producer_teams=["team_a"], consumer_teams=["team_ml", "team_data"], allow_global=False
+        ),
+    )
+    encoded = encode_asset_like(asset)
+    decoded = decode_asset_like(encoded)
+
+    assert decoded.access_control == {
+        "producer_teams": ["team_a"],
+        "consumer_teams": ["team_ml", "team_data"],
+        "allow_global": False,
+    }
+
+
+def test_access_control_round_trip_consumer_teams_only():
+    from airflow.sdk import Asset, AssetAccessControl
+    from airflow.serialization.decoders import decode_asset_like
+    from airflow.serialization.encoders import encode_asset_like
+
+    asset = Asset(
+        name="test",
+        uri="s3://bucket/key",
+        access_control=AssetAccessControl(consumer_teams=["team_ml"]),
+    )
+    encoded = encode_asset_like(asset)
+    decoded = decode_asset_like(encoded)
+
+    assert decoded.access_control["consumer_teams"] == ["team_ml"]
+    assert decoded.access_control["producer_teams"] == []
+    assert decoded.access_control["allow_global"] is True
+
+
 def test_encode_timezone():
     from airflow.serialization.serialized_objects import encode_timezone
 
@@ -764,51 +959,95 @@ def test_encode_timezone():
 
 
 @pytest.mark.parametrize(
-    ("cls", "args", "encode_type", "encode_var"),
+    ("cls", "kwargs", "encode_type", "encode_var"),
     [
-        (IdentityMapper, [], "airflow.partition_mappers.identity.IdentityMapper", {}),
+        (IdentityMapper, {}, "airflow.partition_mappers.identity.IdentityMapper", {}),
         (
-            ToHourlyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToHourlyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%dT%H"},
+            StartOfHourMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfHourMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%dT%H"},
         ),
         (
-            ToDailyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToDailyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%d"},
+            StartOfHourMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfHourMapper",
+            {"timezone": "Asia/Taipei", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%dT%H"},
         ),
         (
-            ToWeeklyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToWeeklyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%d (W%V)"},
+            StartOfDayMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfDayMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%d"},
         ),
         (
-            ToMonthlyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToMonthlyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m"},
+            StartOfDayMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfDayMapper",
+            {"timezone": "Asia/Taipei", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%d"},
         ),
         (
-            ToQuarterlyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToQuarterlyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-Q{quarter}"},
+            StartOfWeekMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfWeekMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m-%d (W%V)"},
         ),
         (
-            ToYearlyMapper,
-            [],
-            "airflow.partition_mappers.temporal.ToYearlyMapper",
-            {"input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y"},
+            StartOfWeekMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfWeekMapper",
+            {
+                "timezone": "Asia/Taipei",
+                "input_format": "%Y-%m-%dT%H:%M:%S",
+                "output_format": "%Y-%m-%d (W%V)",
+            },
+        ),
+        (
+            StartOfMonthMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfMonthMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m"},
+        ),
+        (
+            StartOfMonthMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfMonthMapper",
+            {"timezone": "Asia/Taipei", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-%m"},
+        ),
+        (
+            StartOfQuarterMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfQuarterMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y-Q{quarter}"},
+        ),
+        (
+            StartOfQuarterMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfQuarterMapper",
+            {
+                "timezone": "Asia/Taipei",
+                "input_format": "%Y-%m-%dT%H:%M:%S",
+                "output_format": "%Y-Q{quarter}",
+            },
+        ),
+        (
+            StartOfYearMapper,
+            {},
+            "airflow.partition_mappers.temporal.StartOfYearMapper",
+            {"timezone": "UTC", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y"},
+        ),
+        (
+            StartOfYearMapper,
+            {"timezone": "Asia/Taipei"},
+            "airflow.partition_mappers.temporal.StartOfYearMapper",
+            {"timezone": "Asia/Taipei", "input_format": "%Y-%m-%dT%H:%M:%S", "output_format": "%Y"},
         ),
     ],
 )
-def test_encode_partition_mapper(cls, args, encode_type, encode_var):
+def test_encode_partition_mapper(cls, kwargs, encode_type, encode_var):
     from airflow.serialization.encoders import encode_partition_mapper
 
-    partition_mapper = cls(*args)
+    partition_mapper = cls(**kwargs)
     assert encode_partition_mapper(partition_mapper) == {
         Encoding.TYPE: encode_type,
         Encoding.VAR: encode_var,
@@ -819,12 +1058,12 @@ def test_encode_partition_mapper(cls, args, encode_type, encode_var):
     ("sdk_cls", "core_cls"),
     [
         (IdentityMapper, CoreIdentityMapper),
-        (ToHourlyMapper, CoreToHourlyMapper),
-        (ToDailyMapper, CoreToDailyMapper),
-        (ToWeeklyMapper, CoreToWeeklyMapper),
-        (ToMonthlyMapper, CoreToMonthlyMapper),
-        (ToQuarterlyMapper, CoreToQuarterlyMapper),
-        (ToYearlyMapper, CoreToYearlyMapper),
+        (StartOfHourMapper, CoreStartOfHourMapper),
+        (StartOfDayMapper, CoreStartOfDayMapper),
+        (StartOfWeekMapper, CoreStartOfWeekMapper),
+        (StartOfMonthMapper, CoreStartOfMonthMapper),
+        (StartOfQuarterMapper, CoreStartOfQuarterMapper),
+        (StartOfYearMapper, CoreStartOfYearMapper),
     ],
 )
 def test_decode_partition_mapper(sdk_cls, core_cls):
@@ -853,10 +1092,10 @@ def test_decode_partition_mapper_not_exists():
 
 
 def test_encode_product_mapper():
-    from airflow.sdk import IdentityMapper, ProductMapper, ToHourlyMapper
+    from airflow.sdk import IdentityMapper, ProductMapper, StartOfHourMapper
     from airflow.serialization.encoders import encode_partition_mapper
 
-    partition_mapper = ProductMapper(IdentityMapper(), ToHourlyMapper())
+    partition_mapper = ProductMapper(IdentityMapper(), StartOfHourMapper())
     assert encode_partition_mapper(partition_mapper) == {
         Encoding.TYPE: "airflow.partition_mappers.product.ProductMapper",
         Encoding.VAR: {
@@ -867,8 +1106,9 @@ def test_encode_product_mapper():
                     Encoding.VAR: {},
                 },
                 {
-                    Encoding.TYPE: "airflow.partition_mappers.temporal.ToHourlyMapper",
+                    Encoding.TYPE: "airflow.partition_mappers.temporal.StartOfHourMapper",
                     Encoding.VAR: {
+                        "timezone": "UTC",
                         "input_format": "%Y-%m-%dT%H:%M:%S",
                         "output_format": "%Y-%m-%dT%H",
                     },
@@ -880,11 +1120,11 @@ def test_encode_product_mapper():
 
 def test_decode_product_mapper():
     from airflow.partition_mappers.product import ProductMapper as CoreProductMapper
-    from airflow.sdk import ProductMapper, ToDailyMapper, ToHourlyMapper
+    from airflow.sdk import ProductMapper, StartOfDayMapper, StartOfHourMapper
     from airflow.serialization.decoders import decode_partition_mapper
     from airflow.serialization.encoders import encode_partition_mapper
 
-    partition_mapper = ProductMapper(ToHourlyMapper(), ToDailyMapper())
+    partition_mapper = ProductMapper(StartOfHourMapper(), StartOfDayMapper())
     encoded_pm = encode_partition_mapper(partition_mapper)
 
     core_pm = decode_partition_mapper(encoded_pm)
@@ -895,25 +1135,95 @@ def test_decode_product_mapper():
     assert core_pm.to_downstream("2024-06-15T10:30:00|2024-06-15T10:30:00") == "2024-06-15T10|2024-06-15"
 
 
-def test_encode_chain_mapper():
-    from airflow.sdk import ChainMapper, ToDailyMapper, ToHourlyMapper
+def test_encode_fan_out_mapper():
+    from airflow.sdk import FanOutMapper, StartOfDayMapper, StartOfWeekMapper, WeekWindow
     from airflow.serialization.encoders import encode_partition_mapper
 
-    partition_mapper = ChainMapper(ToHourlyMapper(), ToDailyMapper(input_format="%Y-%m-%dT%H"))
+    partition_mapper = FanOutMapper(
+        upstream_mapper=StartOfWeekMapper(),
+        window=WeekWindow(),
+        downstream_mapper=StartOfDayMapper(),
+    )
+    assert encode_partition_mapper(partition_mapper) == {
+        Encoding.TYPE: "airflow.partition_mappers.temporal.FanOutMapper",
+        Encoding.VAR: {
+            "upstream_mapper": {
+                Encoding.TYPE: "airflow.partition_mappers.temporal.StartOfWeekMapper",
+                Encoding.VAR: {
+                    "input_format": "%Y-%m-%dT%H:%M:%S",
+                    "output_format": "%Y-%m-%d (W%V)",
+                    "timezone": "UTC",
+                },
+            },
+            "window": {
+                Encoding.TYPE: "airflow.partition_mappers.window.WeekWindow",
+                Encoding.VAR: {"direction": "forward"},
+            },
+            "downstream_mapper": {
+                Encoding.TYPE: "airflow.partition_mappers.temporal.StartOfDayMapper",
+                Encoding.VAR: {
+                    "input_format": "%Y-%m-%dT%H:%M:%S",
+                    "output_format": "%Y-%m-%d",
+                    "timezone": "UTC",
+                },
+            },
+        },
+    }
+
+
+def test_decode_fan_out_mapper():
+    from airflow.partition_mappers.temporal import (
+        FanOutMapper as CoreFanOutMapper,
+        StartOfDayMapper as CoreStartOfDayMapper,
+        StartOfWeekMapper as CoreStartOfWeekMapper,
+    )
+    from airflow.partition_mappers.window import WeekWindow as CoreWeekWindow
+    from airflow.sdk import FanOutMapper, StartOfWeekMapper, WeekWindow
+    from airflow.serialization.decoders import decode_partition_mapper
+    from airflow.serialization.encoders import encode_partition_mapper
+
+    partition_mapper = FanOutMapper(upstream_mapper=StartOfWeekMapper(), window=WeekWindow())
+    encoded_pm = encode_partition_mapper(partition_mapper)
+
+    core_pm = decode_partition_mapper(encoded_pm)
+
+    assert isinstance(core_pm, CoreFanOutMapper)
+    assert isinstance(core_pm.upstream_mapper, CoreStartOfWeekMapper)
+    assert isinstance(core_pm.window, CoreWeekWindow)
+    # downstream_mapper is auto-resolved to StartOfDayMapper for WeekWindow.
+    assert isinstance(core_pm.downstream_mapper, CoreStartOfDayMapper)
+    assert list(core_pm.to_downstream("2024-01-15T00:00:00")) == [
+        "2024-01-15",
+        "2024-01-16",
+        "2024-01-17",
+        "2024-01-18",
+        "2024-01-19",
+        "2024-01-20",
+        "2024-01-21",
+    ]
+
+
+def test_encode_chain_mapper():
+    from airflow.sdk import ChainMapper, StartOfDayMapper, StartOfHourMapper
+    from airflow.serialization.encoders import encode_partition_mapper
+
+    partition_mapper = ChainMapper(StartOfHourMapper(), StartOfDayMapper(input_format="%Y-%m-%dT%H"))
     assert encode_partition_mapper(partition_mapper) == {
         Encoding.TYPE: "airflow.partition_mappers.chain.ChainMapper",
         Encoding.VAR: {
             "mappers": [
                 {
-                    Encoding.TYPE: "airflow.partition_mappers.temporal.ToHourlyMapper",
+                    Encoding.TYPE: "airflow.partition_mappers.temporal.StartOfHourMapper",
                     Encoding.VAR: {
+                        "timezone": "UTC",
                         "input_format": "%Y-%m-%dT%H:%M:%S",
                         "output_format": "%Y-%m-%dT%H",
                     },
                 },
                 {
-                    Encoding.TYPE: "airflow.partition_mappers.temporal.ToDailyMapper",
+                    Encoding.TYPE: "airflow.partition_mappers.temporal.StartOfDayMapper",
                     Encoding.VAR: {
+                        "timezone": "UTC",
                         "input_format": "%Y-%m-%dT%H",
                         "output_format": "%Y-%m-%d",
                     },
@@ -925,11 +1235,11 @@ def test_encode_chain_mapper():
 
 def test_decode_chain_mapper():
     from airflow.partition_mappers.chain import ChainMapper as CoreChainMapper
-    from airflow.sdk import ChainMapper, ToDailyMapper, ToHourlyMapper
+    from airflow.sdk import ChainMapper, StartOfDayMapper, StartOfHourMapper
     from airflow.serialization.decoders import decode_partition_mapper
     from airflow.serialization.encoders import encode_partition_mapper
 
-    partition_mapper = ChainMapper(ToHourlyMapper(), ToDailyMapper(input_format="%Y-%m-%dT%H"))
+    partition_mapper = ChainMapper(StartOfHourMapper(), StartOfDayMapper(input_format="%Y-%m-%dT%H"))
     encoded_pm = encode_partition_mapper(partition_mapper)
 
     core_pm = decode_partition_mapper(encoded_pm)
@@ -1023,6 +1333,146 @@ class TestSerializedBaseOperator:
         assert result.timestamp() == timestamp
 
 
+class TestRetryPolicySerialization:
+    """Test that retry_policy is serialized as a boolean flag (has_retry_policy)."""
+
+    def test_has_retry_policy_flag_set_when_policy_present(self):
+        """When retry_policy is set, has_retry_policy=True in serialized form."""
+        from airflow.sdk import DAG, BaseOperator
+        from airflow.serialization.serialized_objects import DagSerialization
+
+        policy = ExceptionRetryPolicy(
+            rules=[RetryRule(exception=ValueError, action=RetryAction.FAIL, reason="bad data")],
+        )
+
+        with DAG(dag_id="test_retry_policy_ser", start_date=DEFAULT_DATE) as dag:
+            BaseOperator(task_id="op_with_policy", retries=3, retry_policy=policy)
+
+        serialized = DagSerialization.serialize_dag(dag)
+        deserialized = DagSerialization.deserialize_dag(serialized)
+
+        task = deserialized.task_dict["op_with_policy"]
+        assert task.has_retry_policy is True
+
+    def test_has_retry_policy_flag_false_when_no_policy(self):
+        """Without retry_policy, has_retry_policy defaults to False."""
+        from airflow.sdk import DAG, BaseOperator
+        from airflow.serialization.serialized_objects import DagSerialization
+
+        with DAG(dag_id="test_no_retry_policy_ser", start_date=DEFAULT_DATE) as dag:
+            BaseOperator(task_id="op_no_policy", retries=3)
+
+        serialized = DagSerialization.serialize_dag(dag)
+        deserialized = DagSerialization.deserialize_dag(serialized)
+
+        task = deserialized.task_dict["op_no_policy"]
+        assert task.has_retry_policy is False
+
+    def test_mapped_task_retry_policy_serializes_as_flag(self):
+        """A mapped task's retry_policy must serialize as has_retry_policy, not the object."""
+        from airflow.sdk import DAG  # module-level DAG is airflow.models.dag.DAG
+
+        policy = ExceptionRetryPolicy(
+            rules=[RetryRule(exception=ValueError, action=RetryAction.FAIL, reason="bad data")],
+        )
+
+        with DAG(dag_id="test_mapped_retry_policy_ser", start_date=DEFAULT_DATE) as dag:
+
+            @task(retries=3, retry_policy=policy)
+            def mapped(x):
+                return x
+
+            mapped.expand(x=[1, 2, 3])
+
+        serialized = DagSerialization.serialize_dag(dag)
+        # The RetryPolicy object must never be embedded -- str(obj) leaks a memory address.
+        assert "ExceptionRetryPolicy object at 0x" not in json.dumps(serialized)
+
+        deserialized = DagSerialization.deserialize_dag(serialized)
+        assert deserialized.task_dict["mapped"].has_retry_policy is True
+
+    def test_mapped_task_retry_policy_serialization_is_deterministic(self):
+        """Serializing the same mapped-task-with-policy DAG twice yields identical output.
+
+        Regression test: the RetryPolicy object was serialized via str(obj), embedding a
+        per-process memory address, so every re-parse produced a different serialized DAG
+        (and a spurious new DagVersion).
+        """
+        from airflow.sdk import DAG  # module-level DAG is airflow.models.dag.DAG
+
+        def build():
+            policy = ExceptionRetryPolicy(
+                rules=[RetryRule(exception=ValueError, action=RetryAction.FAIL)],
+            )
+            with DAG(dag_id="test_mapped_retry_policy_determinism", start_date=DEFAULT_DATE) as dag:
+
+                @task(retries=3, retry_policy=policy)
+                def mapped(x):
+                    return x
+
+                mapped.expand(x=[1, 2, 3])
+            return dag
+
+        assert DagSerialization.serialize_dag(build()) == DagSerialization.serialize_dag(build())
+
+    def test_dag_default_args_retry_policy_serializes_as_flag(self):
+        """A retry_policy in DAG default_args must not leak the object into serialized default_args.
+
+        Regression test: serialize_dag serializes the raw default_args dict, so a RetryPolicy
+        there hit the str(obj) fallback (memory address -> new DagVersion every parse) even
+        though each task's has_retry_policy was set correctly.
+        """
+        from airflow.sdk import DAG  # module-level DAG is airflow.models.dag.DAG
+
+        def build():
+            policy = ExceptionRetryPolicy(
+                rules=[RetryRule(exception=ValueError, action=RetryAction.FAIL)],
+            )
+            with DAG(
+                dag_id="test_default_args_retry_policy",
+                start_date=DEFAULT_DATE,
+                default_args={"retry_policy": policy},
+            ) as dag:
+
+                @task
+                def plain():
+                    return 1
+
+                plain()
+            return dag
+
+        serialized = DagSerialization.serialize_dag(build())
+        # The RetryPolicy object must never be embedded in serialized default_args...
+        assert "ExceptionRetryPolicy object at 0x" not in json.dumps(serialized)
+        # ...and the has_retry_policy flag must be written in its place.
+        default_args_dict = serialized["default_args"][Encoding.VAR]
+        assert default_args_dict.get("has_retry_policy") is True
+        assert "retry_policy" not in default_args_dict
+        # Deterministic across independent parses (no embedded memory address).
+        assert DagSerialization.serialize_dag(build()) == DagSerialization.serialize_dag(build())
+
+    def test_mapped_task_no_retry_policy_flag_false(self):
+        """A mapped task without a retry_policy must not spuriously set has_retry_policy.
+
+        Mapped resolves the flag via _get_partial_kwargs_or_operator_default (falling back to
+        SerializedBaseOperator.has_retry_policy=False), a different path than the non-mapped
+        dataclass default — so it needs its own negative test.
+        """
+        from airflow.sdk import DAG  # module-level DAG is airflow.models.dag.DAG
+
+        with DAG(dag_id="test_mapped_no_retry_policy", start_date=DEFAULT_DATE) as dag:
+
+            @task(retries=3)
+            def mapped(x):
+                return x
+
+            mapped.expand(x=[1, 2, 3])
+
+        serialized = DagSerialization.serialize_dag(dag)
+        deserialized = DagSerialization.deserialize_dag(serialized)
+        assert deserialized.task_dict["mapped"].has_retry_policy is False
+
+
 class TestKubernetesImportAvoidance:
     """Test that serialization doesn't import kubernetes unnecessarily."""
 
@@ -1049,3 +1499,379 @@ class TestKubernetesImportAvoidance:
         result = _has_kubernetes()
 
         assert result is True
+
+    def test_serialize_v1pod_attempts_import_before_serializing(self, monkeypatch):
+        """Regression test: V1Pod serialization must call _has_kubernetes(attempt_import=True)."""
+        k8s = pytest.importorskip("kubernetes.client.models")
+        from kubernetes.client.api_client import ApiClient
+
+        calls = []
+
+        def fake_has_kubernetes(*, attempt_import=False):
+            calls.append(attempt_import)
+            return True
+
+        monkeypatch.setattr(serialized_objects, "_has_kubernetes", fake_has_kubernetes)
+        monkeypatch.setattr(serialized_objects, "k8s", k8s, raising=False)
+        monkeypatch.setattr(serialized_objects, "ApiClient", ApiClient, raising=False)
+
+        pod = k8s.V1Pod(metadata=k8s.V1ObjectMeta(name="test-pod"))
+        result = BaseSerialization.serialize(pod)
+
+        assert isinstance(result, dict), "V1Pod should serialize to a dict, not a string"
+        assert result.get(Encoding.TYPE) == DAT.POD, "V1Pod should have type DAT.POD"
+        assert True in calls
+
+    def test_v1pod_serde_without_cncf_kubernetes_provider(self, monkeypatch):
+        """V1Pod ser/deser must work when the cncf.kubernetes provider is not installed.
+
+        Regression test for the K8s executor ``pod_override`` getting stringified during DAG
+        serialization on deployments that install ``kubernetes`` but not
+        ``apache-airflow-providers-cncf-kubernetes``.
+        """
+        k8s = pytest.importorskip("kubernetes.client.models")
+
+        # Simulate the cncf.kubernetes provider being unimportable. Setting a module to ``None``
+        # in ``sys.modules`` makes importing it raise ``ModuleNotFoundError``. We must block the
+        # exact module the old code imported (``...pod_generator``) and not just the parent
+        # package: if the submodule is already cached in ``sys.modules`` from an earlier test,
+        # ``from ...pod_generator import PodGenerator`` resolves the cached leaf without ever
+        # touching the parent, so blocking only the parent would not exercise the regression.
+        monkeypatch.setitem(sys.modules, "airflow.providers.cncf.kubernetes", None)
+        monkeypatch.setitem(sys.modules, "airflow.providers.cncf.kubernetes.pod_generator", None)
+        _has_kubernetes.cache_clear()
+
+        pod = k8s.V1Pod(metadata=k8s.V1ObjectMeta(name="test-pod"))
+        encoded = BaseSerialization.serialize(pod)
+
+        assert isinstance(encoded, dict), "V1Pod should serialize to a dict, not a string"
+        assert encoded[Encoding.TYPE] == DAT.POD
+
+        decoded = BaseSerialization.deserialize(encoded)
+        assert isinstance(decoded, k8s.V1Pod)
+        assert decoded.metadata.name == "test-pod"
+
+        _has_kubernetes.cache_clear()
+
+    def test_deserialized_v1pod_does_not_capture_unpicklable_config(self, monkeypatch):
+        """A deserialized V1Pod must not capture the in-cluster Configuration.
+
+        In-cluster, the kubernetes client installs a process-global default ``Configuration`` whose
+        ``refresh_api_key_hook`` is an unpicklable local closure. Under kubernetes-client v36,
+        ``ApiClient.__deserialize_model`` copies that config onto the pod and every nested model, so a
+        naively deserialized ``pod_override`` cannot be pickled onto the KubernetesExecutor queue and
+        crashes the scheduler. Deserializing through a fresh ``Configuration`` keeps the pod picklable.
+        """
+        k8s = pytest.importorskip("kubernetes.client.models")
+
+        def _make_unpicklable_hook():
+            def _refresh_api_key(config):
+                return None
+
+            return _refresh_api_key
+
+        dirty = Configuration()
+        dirty.refresh_api_key_hook = _make_unpicklable_hook()
+        monkeypatch.setattr(Configuration, "_default", dirty, raising=False)
+
+        pod = k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(name="test-pod"),
+            spec=k8s.V1PodSpec(containers=[k8s.V1Container(name="base", image="airflow:3")]),
+        )
+        decoded = BaseSerialization.deserialize(BaseSerialization.serialize(pod))
+
+        assert isinstance(decoded, k8s.V1Pod)
+        # The top-level pod and every nested model must carry a clean, picklable Configuration.
+        pickle.dumps(decoded)
+        assert decoded.local_vars_configuration.refresh_api_key_hook is None
+        assert decoded.spec.containers[0].local_vars_configuration.refresh_api_key_hook is None
+
+
+@pytest.mark.db_test
+def test_serialized_dag_getitem_returns_task(dag_maker):
+    from airflow.serialization.definitions.dag import SerializedDAG
+
+    with dag_maker() as dag:
+        BashOperator(task_id="my_task", bash_command="echo 1")
+
+    ser_dict = DagSerialization.to_dict(dag)
+    ser_dag = DagSerialization.from_dict(ser_dict)
+    assert isinstance(ser_dag, SerializedDAG)
+    assert ser_dag["my_task"].task_id == "my_task"
+
+
+@pytest.mark.db_test
+def test_serialized_dag_getitem_missing_raises_node_not_found(dag_maker):
+    from airflow.exceptions import NodeNotFound
+
+    with dag_maker() as dag:
+        BashOperator(task_id="my_task", bash_command="echo 1")
+
+    ser_dict = DagSerialization.to_dict(dag)
+    ser_dag = DagSerialization.from_dict(ser_dict)
+    with pytest.raises(NodeNotFound):
+        ser_dag["nonexistent"]
+
+
+@pytest.mark.db_test
+def test_serialized_dag_getitem_missing_is_key_error(dag_maker):
+    with dag_maker() as dag:
+        BashOperator(task_id="my_task", bash_command="echo 1")
+
+    ser_dict = DagSerialization.to_dict(dag)
+    ser_dag = DagSerialization.from_dict(ser_dict)
+    with pytest.raises(KeyError):
+        ser_dag["nonexistent"]
+
+
+@pytest.mark.db_test
+def test_serialized_dag_getitem_returns_task_group(dag_maker):
+    from airflow.serialization.definitions.dag import SerializedDAG
+
+    with dag_maker() as dag:
+        with TaskGroup(group_id="section") as tg:
+            BashOperator(task_id="t", bash_command="echo 1")
+
+    ser_dict = DagSerialization.to_dict(dag)
+    ser_dag = DagSerialization.from_dict(ser_dict)
+    assert isinstance(ser_dag, SerializedDAG)
+    assert ser_dag["section"].group_id == tg.group_id
+
+
+class _DeadlineGadget:
+    """Stands in for any allow-listed class a Dag author could name in a deadline field.
+
+    Deliberately constructible by serde -- it carries the ``serialize`` /
+    ``deserialize`` pair serde requires. A gadget serde cannot build would make the
+    test pass for the wrong reason: deserialization would fail on its own and the
+    "was it constructed" assertion would never be exercised.
+    """
+
+    instantiated = False
+
+    def __init__(self, **kwargs):
+        type(self).instantiated = True
+        self.kwargs = kwargs
+
+    def serialize(self):
+        return {}
+
+    @staticmethod
+    def deserialize(data, version):
+        return _DeadlineGadget(**(data or {}))
+
+
+def _encode_as(classname: str) -> dict:
+    """Build a serde payload naming ``classname``."""
+    from airflow.sdk.serde import CLASSNAME, DATA, VERSION
+
+    return {CLASSNAME: classname, VERSION: 1, DATA: {}}
+
+
+@pytest.mark.parametrize("field", [DeadlineAlertFields.CALLBACK, DeadlineAlertFields.INTERVAL])
+def test_deadline_fields_refuse_unexpected_classes_without_constructing_them(field):
+    """A Dag author must not be able to name an arbitrary class in a deadline field.
+
+    These decoders run in the scheduler and API server whenever a serialized Dag is
+    loaded, and the Security Model says a Dag author reaches those processes only
+    through registered plugins. The assertion that matters is that the class is never
+    *constructed*: `deserialize()` instantiates before returning, so a check on the
+    returned object would already be too late for a class with side effects in
+    `__init__`.
+    """
+    from unittest import mock
+
+    from airflow.sdk import serde
+
+    gadget_name = f"{_DeadlineGadget.__module__}.{_DeadlineGadget.__qualname__}"
+    _DeadlineGadget.instantiated = False
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    serialized[Encoding.VAR][field] = _encode_as(gadget_name)
+
+    # Make the gadget acceptable to serde itself, so the refusal comes from the
+    # deadline gate rather than from the general deserialization allow list.
+    with mock.patch.object(serde, "_extra_allowed", serde._extra_allowed | {gadget_name}):
+        with pytest.raises(ValueError, match="Refusing to deserialize"):
+            BaseSerialization.deserialize(serialized)
+
+    assert _DeadlineGadget.instantiated is False, "the class was constructed before being rejected"
+
+
+@pytest.mark.parametrize("encoding", ["current", "legacy"])
+def test_deadline_callback_kwargs_are_kept_encoded(encoding):
+    """Callback kwargs are not decoded with the alert: classes named there are not constructed.
+
+    The kwargs are decoded where the callback runs, so the decoded alert holds them exactly as
+    they were stored, and encoding the alert again writes them back unchanged.
+    """
+    from unittest import mock
+
+    from airflow.sdk import serde
+    from airflow.sdk._shared.serialization import OLD_DATA, OLD_TYPE
+
+    gadget_name = f"{_DeadlineGadget.__module__}.{_DeadlineGadget.__qualname__}"
+    _DeadlineGadget.instantiated = False
+    nested = _encode_as(gadget_name) if encoding == "current" else {OLD_TYPE: gadget_name, OLD_DATA: {}}
+    encoded_kwargs = {"nested": nested, "items": [nested], "plain": "value"}
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    callback_payload = serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK]
+    callback_payload[serde.DATA]["kwargs"] = encoded_kwargs
+
+    with mock.patch.object(serde, "_extra_allowed", serde._extra_allowed | {gadget_name}):
+        decoded = BaseSerialization.deserialize(serialized)
+        reencoded = BaseSerialization.serialize(decoded)
+
+    assert _DeadlineGadget.instantiated is False
+    assert isinstance(decoded.callback, AsyncCallback)
+    assert decoded.callback.kwargs == encoded_kwargs
+    assert reencoded[Encoding.VAR][DeadlineAlertFields.CALLBACK] == callback_payload
+
+
+def test_deadline_callback_kwargs_legacy_container_is_unwrapped():
+    from airflow.sdk import serde
+    from airflow.sdk._shared.serialization import OLD_DATA, OLD_DICT, OLD_TYPE
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    callback_payload = serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK]
+    callback_payload[serde.DATA]["kwargs"] = {OLD_TYPE: OLD_DICT, OLD_DATA: TEST_CALLBACK_KWARGS}
+
+    decoded = BaseSerialization.deserialize(serialized)
+
+    assert decoded.callback.kwargs == TEST_CALLBACK_KWARGS
+
+
+@pytest.mark.parametrize("kwargs", [["not", "a", "mapping"], _encode_as("builtins.dict")])
+def test_deadline_callback_kwargs_must_be_a_mapping(kwargs):
+    from airflow.sdk import serde
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK][serde.DATA]["kwargs"] = kwargs
+
+    with pytest.raises(ValueError, match="kwargs is not a mapping"):
+        BaseSerialization.deserialize(serialized)
+
+
+def test_deadline_alert_with_live_callback_kwargs_round_trips():
+    """An alert written by the Dag processor keeps its kwargs encoded through decode and re-encode."""
+    from airflow.sdk import serde
+
+    original = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(
+            TEST_CALLBACK_PATH, kwargs={"interval": timedelta(minutes=5), "pair": (1, 2), "plain": {"a": 1}}
+        ),
+    )
+    serialized = BaseSerialization.serialize(original)
+
+    decoded = BaseSerialization.deserialize(serialized)
+
+    assert (
+        decoded.callback.kwargs
+        == serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK][serde.DATA]["kwargs"]
+    )
+    assert BaseSerialization.serialize(decoded) == serialized
+
+
+@pytest.mark.parametrize("field", [DeadlineAlertFields.CALLBACK, DeadlineAlertFields.INTERVAL])
+def test_deadline_fields_refuse_legacy_encoded_classes(field):
+    """The legacy ``{"__type", "__var"}`` spelling must not slip past the check.
+
+    serde rewrites that shape into ``__classname__`` *inside* deserialize, so a payload
+    inspected beforehand carries no ``__classname__`` at all and an unnormalised check
+    sees nothing to reject.
+    """
+    from unittest import mock
+
+    from airflow.sdk import serde
+    from airflow.sdk._shared.serialization import OLD_DATA, OLD_TYPE
+
+    gadget_name = f"{_DeadlineGadget.__module__}.{_DeadlineGadget.__qualname__}"
+    _DeadlineGadget.instantiated = False
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=AsyncCallback(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    serialized[Encoding.VAR][field] = {OLD_TYPE: gadget_name, OLD_DATA: {}}
+
+    with mock.patch.object(serde, "_extra_allowed", serde._extra_allowed | {gadget_name}):
+        with pytest.raises(ValueError, match="Refusing to deserialize"):
+            BaseSerialization.deserialize(serialized)
+
+    assert _DeadlineGadget.instantiated is False
+
+
+@pytest.mark.parametrize("callback_cls", [AsyncCallback, SyncCallback])
+def test_deadline_callback_accepts_pre_3_2_module_path(callback_cls):
+    """Callbacks serialized before 3.2 name the module they were defined in back then.
+
+    3.2 moved them out of ``airflow.sdk.definitions.deadline`` into
+    ``...definitions.callback``, so an alert stored by an earlier version carries the old
+    path. Rejecting it would make those rows undecodable on upgrade.
+    """
+    from airflow.sdk import serde
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=callback_cls(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    payload = serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK]
+    payload[serde.CLASSNAME] = f"airflow.sdk.definitions.deadline.{callback_cls.__qualname__}"
+
+    decoded = BaseSerialization.deserialize(serialized)
+
+    assert isinstance(decoded.callback, callback_cls)
+    assert decoded.callback.path == TEST_CALLBACK_PATH
+    assert decoded.callback.kwargs == TEST_CALLBACK_KWARGS
+
+
+@pytest.mark.parametrize(
+    ("callback_cls", "foreign_field"),
+    [(AsyncCallback, "executor"), (SyncCallback, "queue")],
+    ids=["async-rejects-executor", "sync-rejects-queue"],
+)
+def test_deadline_callback_rejects_field_belonging_to_the_other_subclass(callback_cls, foreign_field):
+    """``queue`` and ``executor`` belong to one subclass each, not to both.
+
+    Accepting either for both classes would hand the constructor an argument it does not
+    take, turning a malformed payload into a TypeError from deep inside the rebuild.
+    """
+    from airflow.sdk import serde
+
+    valid = DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_QUEUED_AT,
+        interval=timedelta(hours=1),
+        callback=callback_cls(TEST_CALLBACK_PATH, kwargs=TEST_CALLBACK_KWARGS),
+    )
+    serialized = BaseSerialization.serialize(valid)
+    serialized[Encoding.VAR][DeadlineAlertFields.CALLBACK][serde.DATA][foreign_field] = "something"
+
+    with pytest.raises(ValueError, match=f"Unexpected deadline callback fields: {foreign_field}"):
+        BaseSerialization.deserialize(serialized)

@@ -17,6 +17,234 @@
  under the License.
  -->
 
+# v3.4.0
+
+## New Features:
+
+- Let plugins add their own actions to Dag, run and task instance rows (#75427)
+- Add an API endpoint comparing two stored Dag versions (#73322)
+- Allow filtering the Dag runs list by Dag tags (#70861)
+- Add a draining state for graceful Dag pausing (#72407)
+- Add bulk pause, drain and unpause actions to the Dags list (#73055)
+- Add a Dag bundle detail endpoint listing the files in a bundle (#73009)
+- Add an `is_scheduled` filter to the REST API (#72029)
+- Add an API endpoint for backfill Dag run entries (#67381)
+- Add a bundle-version parameter to the Dag run trigger endpoint (#61550)
+- Add an exact-match `uri` filter to `GET /assets` (#69489)
+- Add `partition_key` and `partition_key_regexp_pattern` filters for asset events (#64610)
+- Add extra-field filtering for asset events (#64611)
+- Add filters and pagination to the jobs list (#68616)
+- Add an Asset Tab plugin (#69986)
+- Add React plugin support to Dag and task overviews (#69992)
+- Add `owner_display_name` substring and prefix filters to the Dag list (#70583)
+- Add a team column and filter to the Dag run and task instance lists (#70241)
+- Add a team column and filter to the jobs list (#73295)
+- Add a team column and filter to the XComs list (#72158)
+- Add a team column and filter to the audit log (#71916)
+- Add a team filter to the Human-in-the-loop task instances listing (#73726)
+- Add Task Loops: expose loop iterations and outcomes via `loop_id`/`iteration` filters and a `LoopIterationResponse` (#74354)
+- Read current task executions by exact loop region (`region_id`/`region_index`) and try (#74350)
+- Clear selected task-loop work and regenerate only what was replaced (#74349)
+- Describe a task at a specific Dag version via the task endpoint (#74365)
+- Filter task instances by `loop_id` and a single loop pass (#74931)
+
+## Improvements:
+
+- Expose the retry deadline on task instances and reset run fields when a retry starts (#76028)
+- Surface the retry-policy decision on task instances (#73030)
+- Attribute log, asset-event and asset-state writes to the task attempt (#74347)
+- Expose an `in_loop` flag on task instances (#74352)
+- Give every mapped expansion a loop region, including a `409` on region conflicts (#74346)
+- Let loop gates record human-readable decisions (#74932)
+- Number task loop iterations from one instead of zero (#75260)
+- Deprecate cyclic TaskGroup dependencies, adding a `task group cycle` Dag warning (#73746)
+- Scope plugin views on any entity field, not a fixed criteria set (#74278)
+- Allow scoping plugin tabs to specific Dags and tasks (#69148)
+- Add a `team_name` attribute to plugins for multi-team (#69502)
+- Allow a Job to be associated with several teams (#73561)
+- Expand the health endpoint reporting (#70416)
+- Add `source_reference` and `language` to the warning, import-error and Dag source models (#72474)
+- Add a `duplicate dag id` Dag warning type (#68791)
+- Show Dag bundle versions and refresh times (#72909)
+- Show the owning team in asset dependencies (#71446)
+- Show the owning team on Dag, Dag run and task instance detail responses (#70312)
+- Add `owner_display_name` to the audit log (#68833)
+- Return a `file_token` on Dag import errors for requesting a reparse (#72896)
+- Allow explicit runs to drain a paused Dag (#73763)
+- Type `asset_expression` in the REST API so consumers need not cast through unknown (#67725)
+- Document HTTP statuses that route helpers raise (#74027)
+- Keep OpenAPI error responses in sync with the statuses routes raise (#71647)
+- Document favorite Dag's 409 and return a readable conflict message (#73411)
+- Make `latest_dag_version` a required field on the Dag details response (#74247)
+
+## Bug Fixes:
+
+- Clear retry-policy state when a task instance is cleared (#75646)
+- Reject non-positive `max_active_runs` when creating a backfill (#75320)
+- Reject blank pool names and variable keys in the REST API (#75258)
+- Fix HTTP 500 when ordering the Dag list by state or start date (#75148)
+- Refuse a Human-in-the-loop response for a request the task has since replaced (#74982)
+- Filter the jobs `is_alive` check in SQL so pagination stays correct (#73684)
+- Discard a task instance's stored task-state values when it is cleared (#72100)
+- Clear all task instances in a task group, not just the first page (#73547)
+- Require a request body on the asset materialize endpoint (#73328)
+- Hide unreadable assets in the asset expression served by `next_run_assets` (#72864)
+- Stop reporting components as degraded after an instance restart (#73222)
+- Return asset events for Dag runs without a start date (#71379)
+- Fix the Dag detail HTTP 500 for Dags without a `fileloc` (#69110)
+
+# v3.3.2
+
+## Improvements:
+
+- Document HTTP statuses that API routes raise but never declared (#71622)
+
+## Bug Fixes:
+
+- Revoke every credential presented to the logout endpoint, not just the session cookie (#72933)
+- Restore counts on the Dag Run and Task Instance lists (#72739)
+- Return HTTP 404 from task state store endpoints for unknown task instances (#71860)
+- Mark only a run's most recent asset event as triggering it (#71547)
+
+# v3.3.1
+
+## Bug Fixes:
+
+- Allow filtering Dag runs by partition date in the API (#70304)
+- Simplify the API docs on pattern search (#70509)
+- Document the 409 response from the XCom create endpoint (#71128)
+- API: Return 503 when SQLite locks during backfill creation (#69659)
+- Reject invalid partition keys in the create asset events API (#69581)
+
+# v3.3.0
+
+## New Features:
+
+- AIP-103: Add Core API endpoints for task state and asset state (#67041)
+- AIP-103: Add patch task state core API and support for ``expires_at`` in set API (#67319)
+- Add ``awaiting_input`` task state for Human-in-the-loop (#68028)
+- Return dag-specified results in the dag run wait API (#64577)
+- Add ``POST /dags/{dag_id}/clearDagRuns`` bulk endpoint (#67709)
+- Add bulk delete Dag Runs (#67095)
+- Add bulk update to mark Dag runs as success/failed (#67948)
+- Clear, mark success/failed and delete multiple task instances (#64141)
+- Add partition clear support to the REST API matching the CLI (#68702)
+- Propagate ``partition_date`` to consumers of partitioned assets (#67285)
+- Add consumer-team asset filtering API endpoint support (#68034)
+- Add Dag runs filters for Consuming Asset (#63624)
+- Add async connection testing via workers for security isolation (#62343)
+- Add ``nav_top_level`` option for plugin nav items (#67084)
+- Implement patching of task group instances in the API (#62812)
+- Add cursor-based pagination for the ``get_dag_runs`` endpoint (#65604)
+- Add cursor-based pagination for the ``get_task_instances`` endpoint (#64845)
+- Support ordering ``XCom`` entries in the REST API (#65418)
+- Enable queueing up new tasks (#63484)
+- Add the "is backfillable" property for Dags (#64644)
+- Add ``DagRunType`` for operator (#63733)
+- Pass ``try_number`` to the extra links API (#65661)
+- Add ``rerun_with_latest_version`` config hierarchy for clear/rerun behavior (#63884)
+
+## Improvements:
+
+- Record writer info for every asset-store write for better cross-linkage (#67902)
+- Apply note when clearing a Dag Run / task instances (#67639)
+- Update search parameters to better leverage DB indexes (#64963)
+- Filter task instances by rendered map index (#66008)
+- Handle undecryptable Variable values gracefully in the Stable REST API (#65452)
+- Surface import errors on deactivated Dags (#65687)
+- Align Dag capitalization from "DAG" to "Dag" in the API (#66211, #66099, #66112)
+
+## Bug Fixes:
+
+- Stop exposing trigger kwargs in the REST API response (#67868)
+- Fix Dag run partition-key filter breaking on composite keys with ``|`` (#68459)
+- Fix sort order for mapped task instances (#67551)
+- Fix using the Dag form when materializing an asset (#64211)
+- Fix ``GET /auth/login`` missing 400 in the OpenAPI spec (#67571)
+- Fix ``GET /pools`` list endpoint incorrectly documenting 404 in the OpenAPI spec (#67570)
+- Fix backfill params not overriding existing Dag run conf (#64939)
+- Fix ``PATCH /dags`` pagination bug and document wildcard ``dag_id_pattern`` (#63665)
+
+# v3.2.2
+
+## Improvements:
+
+- UI: Filter task instances by rendered map index (#66008) (#67163)
+- UI: Enable queue up new tasks (#63484) (#66869)
+- Pass ``try_number`` to extra links API (#65661) (#66171)
+- Update search parameters to better leverage DB indexes (#64963) (#65964)
+- Add cursor-based pagination for ``get_dag_runs`` endpoint (#65604) (#65746)
+- Support ordering ``XCom`` entries in the REST API and UI (#65418) (#65600)
+- UI: Add Dag runs filters for Consuming Asset (#63624) (#65306)
+- Align Dag capitalization from "DAG" to "Dag" in ``core_api`` (#66211) (#66304)
+
+## Bug Fixes:
+
+- Fix backfill params not overriding existing Dag run conf (#64939) (#65599)
+- Fix ``PATCH /dags`` pagination bug and document wildcard ``dag_id_pattern`` (#65309)
+
+# v3.2.1
+
+## Bug Fixes:
+
+ - Fix: use Dag form when materializing asset ([#64211](https://github.com/apache/airflow/pull/64211))
+
+# v3.2.0
+
+## New Features:
+
+- Add Asset Partitioning support: backfill for partitioned DAGs ([#61464](https://github.com/apache/airflow/pull/61464))
+- Add `partition_key` to `DagRunAssetReference` ([#61725](https://github.com/apache/airflow/pull/61725))
+- Add partition key column and filter to DAG Runs list ([#61939](https://github.com/apache/airflow/pull/61939))
+- Add `DagRunType` for asset materializations ([#62276](https://github.com/apache/airflow/pull/62276))
+- Add `allowed_run_types` to allowlist specific DAG run types ([#61833](https://github.com/apache/airflow/pull/61833))
+- Add DAG runs filters by `bundleVersion` ([#62810](https://github.com/apache/airflow/pull/62810))
+- Expose `timetable_partitioned` in UI API ([#62777](https://github.com/apache/airflow/pull/62777))
+- Add base React plugin destination ([#62530](https://github.com/apache/airflow/pull/62530))
+- Add `team_name` to Pool APIs ([#60952](https://github.com/apache/airflow/pull/60952))
+- Add `team_name` to connection public APIs ([#59336](https://github.com/apache/airflow/pull/59336))
+- Add `team_id` to variable APIs ([#57102](https://github.com/apache/airflow/pull/57102))
+- Add team selector to list variables and list connections pages ([#60995](https://github.com/apache/airflow/pull/60995))
+- Support OR operator in search parameters ([#60008](https://github.com/apache/airflow/pull/60008))
+- Add wildcard support for `dag_id` and `dag_run_id` in bulk task instance endpoint ([#57441](https://github.com/apache/airflow/pull/57441))
+- Add `operator_name_pattern`, `pool_pattern`, `queue_pattern` as search filters for task instances ([#57571](https://github.com/apache/airflow/pull/57571))
+- Add filters to Task Instances tab ([#56920](https://github.com/apache/airflow/pull/56920))
+- Add API support for filtering DAGs by timetable type ([#58852](https://github.com/apache/airflow/pull/58852))
+- Enable triggerer queues ([#59239](https://github.com/apache/airflow/pull/59239))
+- Add ability to add, edit, and delete XComs directly from UI ([#58921](https://github.com/apache/airflow/pull/58921))
+- Add HITL detail history ([#55952](https://github.com/apache/airflow/pull/55952), [#56760](https://github.com/apache/airflow/pull/56760))
+- Add update_mask support for bulk PATCH APIs ([#54597](https://github.com/apache/airflow/pull/54597))
+- Introduce named asset watchers ([#55643](https://github.com/apache/airflow/pull/55643))
+- Add DAG ID pattern search functionality to DAG Runs and Task Instances ([#55691](https://github.com/apache/airflow/pull/55691))
+- Add UI to allow creation of DAG Runs with partition key ([#58004](https://github.com/apache/airflow/pull/58004))
+- Support retry multiplier parameter ([#56866](https://github.com/apache/airflow/pull/56866))
+- Display active DAG runs count in header with auto-refresh ([#58332](https://github.com/apache/airflow/pull/58332))
+- Add checkbox before clear task confirmation to prevent rerun of tasks in Running state ([#56351](https://github.com/apache/airflow/pull/56351))
+
+## Improvements:
+
+- Upgrade FastAPI and conform OpenAPI schema changes ([#61476](https://github.com/apache/airflow/pull/61476))
+- Use SQLAlchemy native `Uuid`/`JSON` types instead of `sqlalchemy-utils` ([#61532](https://github.com/apache/airflow/pull/61532))
+- Remove team ID and use team name as primary key ([#59109](https://github.com/apache/airflow/pull/59109))
+- Update `BulkDeleteAction` to use generic type ([#59207](https://github.com/apache/airflow/pull/59207))
+- Add link to API docs ([#53346](https://github.com/apache/airflow/pull/53346))
+
+## Bug Fixes:
+
+- Fix null `dag_run_conf` in `BackfillResponse` serialization ([#63259](https://github.com/apache/airflow/pull/63259))
+- Fix missing `dag_id` filter on DAG Run query ([#62750](https://github.com/apache/airflow/pull/62750))
+- Fix `HITLResponse` data model name ([#57795](https://github.com/apache/airflow/pull/57795))
+- Remove unused parameter in logout ([#58045](https://github.com/apache/airflow/pull/58045))
+
+# v3.1.8
+
+## Bug Fixes:
+
+ - Fix: 404 queued asset events from API server logs ([#62934](https://github.com/apache/airflow/pull/62934))
+ - Fix executor slots showing negative infinity ([#61140](https://github.com/apache/airflow/pull/61140))
+ - Fix Pool API slots validation ([#61071](https://github.com/apache/airflow/pull/61071))
+ - Add ``run_after`` alias to ``XComResponse`` for backward compatibility ([#61443](https://github.com/apache/airflow/pull/61443))
+
 # v3.1.6
 
 ## Bug Fixes:

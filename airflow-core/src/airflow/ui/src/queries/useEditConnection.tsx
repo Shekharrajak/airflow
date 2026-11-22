@@ -16,12 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { useConnectionServiceGetConnectionsKey, useConnectionServicePatchConnection } from "openapi/queries";
-import { toaster } from "src/components/ui";
+
+import { toaster } from "src/system-components";
+
 import type { ConnectionBody } from "src/pages/Connections/Connections";
 
 export const useEditConnection = (
@@ -89,6 +92,11 @@ export const useEditConnection = (
     if (requestBody.schema !== initialConnection.schema) {
       updateMask.push("schema");
     }
+    if (requestBody.team_name !== initialConnection.team_name) {
+      updateMask.push("team_name");
+    }
+
+    const teamName = requestBody.team_name === "" ? undefined : requestBody.team_name;
 
     mutate({
       connectionId: initialConnection.connection_id,
@@ -97,8 +105,8 @@ export const useEditConnection = (
         conn_type: requestBody.conn_type,
         connection_id: initialConnection.connection_id,
         extra: requestBody.extra === "{}" ? undefined : requestBody.extra,
-        // eslint-disable-next-line unicorn/no-null
         port: requestBody.port === "" ? null : Number(requestBody.port),
+        team_name: teamName,
       },
       updateMask,
     });

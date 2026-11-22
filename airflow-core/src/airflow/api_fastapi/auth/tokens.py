@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import attrs
-import httpx
+import httpx2
 import jwt
 import structlog
 from asgiref.sync import async_to_sync
@@ -107,7 +107,7 @@ class JWKS:
     fetched_at: float = 0
     last_fetch_attempt_at: float = 0
 
-    client: httpx.AsyncClient = attrs.field(factory=httpx.AsyncClient)
+    client: httpx2.AsyncClient = attrs.field(factory=httpx2.AsyncClient)
 
     _jwks: jwt.PyJWKSet | None = None
     refresh_jwks: bool = True
@@ -279,7 +279,8 @@ class JWTValidator:
     )
     # By default, we just validate these
     required_claims: frozenset[str] = frozenset({"exp", "iat", "nbf"})
-    audience: str | Sequence[str]
+    # ``None`` is passed straight to ``jwt.decode`` and accepts only tokens without an ``aud`` claim.
+    audience: str | Sequence[str] | None
     algorithm: list[str] = attrs.field(
         factory=_conf_list_factory("api_auth", "jwt_algorithm", fallback="GUESS"), converter=_to_list
     )
@@ -319,7 +320,10 @@ class JWTValidator:
         self, unvalidated: str, required_claims: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """Decode the JWT token, returning the validated claims or raising an exception."""
-        key = await self._get_validation_key(unvalidated)
+        try:
+            key = await self._get_validation_key(unvalidated)
+        except KeyError:
+            raise jwt.InvalidTokenError("Kid did not match any validation keys")
         algorithms = self.algorithm
         validation_key: str | jwt.PyJWK | Any = key
         if algorithms == ["GUESS"] and isinstance(key, jwt.PyJWK):
@@ -349,13 +353,27 @@ class JWTValidator:
         return claims
 
     def revoke_token(self, token: str) -> None:
-        """Validate the token, extract jti and exp, and revoke it in the database."""
+        """
+        Validate the token, extract jti and exp, and revoke it in the database.
+
+        A token that does not validate is not revoked: it is already unusable, so this is logged as a
+        warning. A valid token whose revocation cannot be recorded is still usable until it expires,
+        so that failure is logged as an error rather than being reported the same way.
+        """
         try:
             claims = self.validated_claims(token)
-            if (jti := claims.get("jti")) and (exp := claims.get("exp")):
-                RevokedToken.revoke(jti, datetime.fromtimestamp(exp, tz=timezone.utc))
-        except (jwt.InvalidTokenError, Exception):
-            log.warning("Failed to revoke token", exc_info=True)
+        except Exception:
+            log.warning("Not revoking a token that does not validate", exc_info=True)
+            return
+        if not ((jti := claims.get("jti")) and (exp := claims.get("exp"))):
+            log.warning("Not revoking a token that carries no jti or exp claim")
+            return
+        try:
+            RevokedToken.revoke(jti, datetime.fromtimestamp(exp, tz=timezone.utc))
+        except Exception:
+            log.exception(
+                "Failed to record the revocation of token %s; it remains valid until it expires", jti
+            )
 
     def status(self):
         if self.jwks:
@@ -447,15 +465,21 @@ class JWTGenerator:
             assert self._secret_key
         return self._secret_key
 
-    def generate(self, extras: dict[str, Any] | None = None, headers: dict[str, Any] | None = None) -> str:
+    def generate(
+        self,
+        extras: dict[str, Any] | None = None,
+        headers: dict[str, Any] | None = None,
+        valid_for: float | None = None,
+    ) -> str:
         """Generate a signed JWT for the subject."""
         now = int(datetime.now(tz=timezone.utc).timestamp())
+        effective_valid_for = valid_for if valid_for is not None else self.valid_for
         claims = {
             "jti": uuid.uuid4().hex,
             "iss": self.issuer,
             "aud": self.audience,
             "nbf": now,
-            "exp": int(now + self.valid_for),
+            "exp": int(now + effective_valid_for),
             "iat": now,
         }
 

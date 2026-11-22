@@ -1,4 +1,3 @@
-
  .. Licensed to the Apache Software Foundation (ASF) under one
     or more contributor license agreements.  See the NOTICE file
     distributed with this work for additional information
@@ -36,7 +35,7 @@ Required Software Packages
 Use system-level package managers like yum, apt-get for Linux, or
 Homebrew for macOS to install required software packages:
 
-* Python (One of: 3.10, 3.11, 3.12, 3.13, 3.14)
+* Python (One of: 3.11, 3.12, 3.13, 3.14)
 * MySQL 5.7+
 * libxml
 * helm (only for helm chart tests)
@@ -102,11 +101,11 @@ Installing Python versions
 
    This step can be skipped - ``uv`` will automatically install the Python version you need when you create a virtualenv.
 
-You can install Python versions using ``uv python install`` command. For example, to install Python 3.10.7, you can run:
+You can install Python versions using ``uv python install`` command. For example, to install Python 3.11.16, you can run:
 
 .. code:: bash
 
-    uv python install 3.10.7
+    uv python install 3.11.16
 
 This is optional step - ``uv`` will automatically install the Python version you need when you create a virtualenv.
 
@@ -126,7 +125,7 @@ with a specific Python version by running:
 
 .. code:: bash
 
-    uv venv --python 3.10.7
+    uv venv --python 3.11.16
 
 You can also create a venv with a different venv directory name by running:
 
@@ -267,57 +266,56 @@ for the provider is as simple as running:
 
     uv run pytest
 
-Installing "golden" version of dependencies
--------------------------------------------
+Locked versions of dependencies
+-------------------------------
 
-Whatever virtualenv solution you use, when you want to make sure you are using the same
-version of dependencies as in main, you can install recommended version of the dependencies by using pip:
-constraint-python<PYTHON_MAJOR_MINOR_VERSION>.txt files as ``constraint`` file. This might be useful
-to avoid "works-for-me" syndrome, where you use different version of dependencies than the ones
-that are used in main, CI tests and by other contributors.
+The ``uv.lock`` file is committed to the Airflow repository and is used by ``uv sync`` to ensure
+consistent dependency versions across all developers. When you run ``uv sync``, it uses the lock file
+to install exact dependency versions, so you don't need to pass constraint files manually.
 
-There are different constraint files for different python versions. For example this command will install
-all basic devel requirements and requirements of google provider as last successfully tested for Python 3.10:
+The ``uv sync`` command prefers the locked versions of dependencies from ``uv.lock``. It will only
+attempt to resolve new dependencies when ``pyproject.toml`` files change (e.g. when a new dependency
+is added or version bounds are modified). This means that day-to-day ``uv sync`` is fast and
+deterministic — it simply installs what the lock file specifies without re-resolving the dependency
+tree.
 
-.. code:: bash
-
-    uv pip install -e ".[devel,google]" \
-      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-main/constraints-source-providers-3.10.txt"
-
-
-In the future we will utilise ``uv.lock`` to manage dependencies and constraints, but for the moment we do not
-commit ``uv.lock`` file to Airflow repository because we need to figure out automation of updating the ``uv.lock``
-very frequently (few times a day sometimes). With Airflow's 700+ dependencies it's all but guaranteed that we
-will have 3-4 changes a day and currently automated constraints generation mechanism in ``canary`` build keeps
-constraints updated, but for ASF policy reasons we cannot update ``uv.lock`` in the same way - but work is in
-progress to fix it.
-
-Make sure to use latest main for such installation, those constraints are "development constraints" and they
-are refreshed several times a day to make sure they are up to date with the latest changes in the main branch.
-
-Note that this might not always work as expected, because the constraints are not always updated
-immediately after the dependencies are updated, sometimes there is a very recent change (few hours, rarely more
-than a day) which still runs in ``canary`` build and constraints will not be updated until the canary build
-succeeds. Usually what works in this case is running your install command without constraints.
-
-You can upgrade just airflow, without paying attention to provider's dependencies by using
-the 'constraints-no-providers' constraint files. This allows you to keep installed provider dependencies
-and install to latest supported ones by pure Airflow core.
+If you want to make sure that ``uv sync`` does not update your lock file at all (for example in CI
+or when running tests), you can pass the ``--frozen`` flag:
 
 .. code:: bash
 
-    uv pip install -e ".[devel]" \
-      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-main/constraints-no-providers-3.10.txt"
+    uv sync --frozen
 
-These are examples of the development options available with the local virtualenv in your IDE:
+This never resolves or writes to the lock file, even when it is out of date with respect to
+``pyproject.toml``. Use ``--locked`` (or ``uv lock --check``) to fail on a stale lock file instead.
 
-* local debugging;
-* Airflow source view;
-* auto-completion;
-* documentation support;
-* unit tests.
+A change to a ``pyproject.toml`` (including a workspace member's version) must be committed together
+with the refreshed ``uv.lock``: run ``uv lock``. The ``update-uv-lock`` prek hook, which also runs in CI,
+fails otherwise. All other prek hooks run ``uv`` frozen and never change ``uv.lock``.
 
-This document describes minimum requirements and instructions for using a standalone version of the local virtualenv.
+Cooldown via ``exclude-newer``
+..............................
+
+The ``[tool.uv]`` section in the top-level ``pyproject.toml`` sets ``exclude-newer = "4 days"``.
+This acts as a cooldown period — when ``uv`` resolves new dependencies, it ignores package versions
+released in the last 4 days. This protects against broken or yanked releases that might otherwise
+immediately break the dependency resolution for all developers. When ``uv`` writes the lock file, it
+records the resolved ``exclude-newer`` timestamp so that subsequent ``uv sync`` calls use the same
+cutoff, ensuring consistency across machines.
+
+Constraints generated from the lock file
+.........................................
+
+Airflow also publishes traditional ``pip``-style constraint files (see
+`Airflow dependencies and extras <13_airflow_dependencies_and_extras.rst>`_ for details). When
+installing Airflow from sources, these constraint files are generated directly from ``uv.lock`` using
+``uv export --frozen``, which converts the lock file into a flat list of pinned versions suitable for
+``pip install --constraint``. This ensures that both the ``uv sync`` workflow and the ``pip`` constraint
+workflow install the same dependency versions.
+
+The lock file is updated regularly — whenever dependencies are changed via any ``pyproject.toml`` and
+when ``breeze ci upgrade`` is run. Make sure to use the latest main branch to get the most
+up-to-date ``uv.lock``.
 
 Running Tests
 -------------

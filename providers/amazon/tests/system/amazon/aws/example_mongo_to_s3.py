@@ -25,7 +25,7 @@ try:
 except ImportError:
     # Compatibility for Airflow < 3.1
     from airflow.utils.trigger_rule import TriggerRule  # type: ignore[no-redef,attr-defined]
-from airflow.utils.timezone import datetime
+from airflow.providers.common.compat.sdk import timezone
 
 from system.amazon.aws.utils import SystemTestContextBuilder
 
@@ -42,7 +42,7 @@ sys_test_context_task = (
 with DAG(
     DAG_ID,
     schedule="@once",
-    start_date=datetime(2021, 1, 1),
+    start_date=timezone.datetime(2021, 1, 1),
     catchup=False,
 ) as dag:
     test_context = sys_test_context_task()
@@ -94,5 +94,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

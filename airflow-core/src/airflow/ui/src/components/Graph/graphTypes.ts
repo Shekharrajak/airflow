@@ -19,11 +19,17 @@
 import { AliasNode } from "./AliasNode";
 import { AssetConditionNode } from "./AssetConditionNode";
 import { AssetNode } from "./AssetNode";
+import { AssetWatcherNode } from "./AssetWatcherNode";
 import { DagNode } from "./DagNode";
 import { DefaultNode } from "./DefaultNode";
 import Edge from "./Edge";
 import { JoinNode } from "./JoinNode";
 import { TaskNode } from "./TaskNode";
+
+export const opacityStyle = (isFiltered: boolean | undefined) => ({
+  opacity: isFiltered ? 0.2 : 1,
+  transition: "opacity 0.2s",
+});
 
 export const nodeTypes = {
   asset: AssetNode,
@@ -31,9 +37,12 @@ export const nodeTypes = {
   "asset-condition": AssetConditionNode,
   "asset-name-ref": DefaultNode,
   "asset-uri-ref": DefaultNode,
+  "asset-watcher": AssetWatcherNode,
   dag: DagNode,
   join: JoinNode,
+  sensor: DefaultNode,
   task: TaskNode,
+  trigger: DefaultNode,
 };
 
 export const edgeTypes = { custom: Edge };

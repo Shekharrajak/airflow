@@ -22,13 +22,25 @@ import time
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .. import Self
 
 DeltaType = int | float | datetime.timedelta
 
 
+class BackendTimerProtocol(Protocol):
+    """Minimal interface of a backend timer (e.g. pystatsd / dogstatsd) wrapped by :class:`Timer`."""
+
+    def start(self) -> object: ...
+
+    def stop(self) -> object: ...
+
+
 class TimerProtocol(Protocol):
     """Type protocol for StatsLogger.timer."""
+
+    duration: float | None
 
     def __enter__(self) -> Self: ...
 
@@ -54,7 +66,7 @@ class Timer(TimerProtocol):
 
     .. code-block:: python
 
-        with Stats.timer() as t:
+        with stats.timer() as t:
             # Something to time
             frob_the_foos()
 
@@ -64,7 +76,7 @@ class Timer(TimerProtocol):
 
     .. code-block:: python
 
-        timer = Stats.timer().start()
+        timer = stats.timer().start()
 
         # Something to time
         frob_the_foos()
@@ -77,7 +89,7 @@ class Timer(TimerProtocol):
 
     .. code-block:: python
 
-        with Stats.timer("foos.frob"):
+        with stats.timer("foos.frob"):
             # Something to time
             frob_the_foos()
 
@@ -85,7 +97,7 @@ class Timer(TimerProtocol):
 
     .. code-block:: python
 
-        with Stats.timer("foos.frob") as t:
+        with stats.timer("foos.frob") as t:
             # Something to time
             frob_the_foos()
 
@@ -95,10 +107,10 @@ class Timer(TimerProtocol):
     # pystatsd and dogstatsd both have a timer class, but present different API
     # so we can't use this as a mixin on those, instead this class contains the "real" timer
 
-    _start_time: float | None
-    duration: float | None
+    _start_time: float | None = None
+    duration: float | None = None
 
-    def __init__(self, real_timer: Timer | None = None) -> None:
+    def __init__(self, real_timer: BackendTimerProtocol | None = None) -> None:
         self.real_timer = real_timer
 
     def __enter__(self) -> Self:
@@ -120,3 +132,16 @@ class Timer(TimerProtocol):
             self.duration = 1000.0 * (time.perf_counter() - self._start_time)  # Convert to milliseconds.
         if send and self.real_timer:
             self.real_timer.stop()
+
+
+class DurationEmittingTimer(Timer):
+    """Timer that passes its measured duration, in milliseconds, to ``emit`` when stopped."""
+
+    def __init__(self, emit: Callable[[float], object]) -> None:
+        super().__init__()
+        self._emit = emit
+
+    def stop(self, send: bool = True) -> None:
+        super().stop(send)
+        if send and self.duration is not None:
+            self._emit(self.duration)

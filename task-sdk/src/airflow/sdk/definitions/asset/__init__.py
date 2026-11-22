@@ -32,10 +32,10 @@ from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Collection
+    from typing import Self
     from urllib.parse import SplitResult
 
     from pydantic.types import JsonValue
-    from typing_extensions import Self
 
     from airflow.sdk.api.datamodels._generated import AssetProfile
     from airflow.sdk.io.path import ObjectStoragePath
@@ -48,6 +48,7 @@ else:
 
 __all__ = [
     "Asset",
+    "AssetAccessControl",
     "Dataset",
     "Model",
     "AssetAlias",
@@ -60,6 +61,7 @@ __all__ = [
 ]
 
 from airflow.sdk.configuration import conf
+from airflow.sdk.definitions.asset.access_control import AssetAccessControl
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +231,11 @@ class BaseAsset:
     :meta private:
     """
 
+    @property
+    def requires_batching(self) -> bool:
+        """Whether this condition needs multiple asset events to be satisfied."""
+        return False
+
     def __or__(self, other: BaseAsset) -> BaseAsset:
         if not isinstance(other, BaseAsset):
             return NotImplemented
@@ -278,6 +285,9 @@ class Asset(os.PathLike, BaseAsset):
     watchers: list[AssetWatcher] = attrs.field(
         factory=list,
     )
+    access_control: AssetAccessControl = attrs.field(
+        factory=AssetAccessControl,
+    )
 
     asset_type: ClassVar[str] = "asset"
     __version__: ClassVar[int] = 1
@@ -291,6 +301,7 @@ class Asset(os.PathLike, BaseAsset):
         group: str = ...,
         extra: dict[str, JsonValue] | None = None,
         watchers: list[AssetWatcher] = ...,
+        access_control: AssetAccessControl = ...,
     ) -> None:
         """Canonical; both name and uri are provided."""
 
@@ -302,6 +313,7 @@ class Asset(os.PathLike, BaseAsset):
         group: str = ...,
         extra: dict[str, JsonValue] | None = None,
         watchers: list[AssetWatcher] = ...,
+        access_control: AssetAccessControl = ...,
     ) -> None:
         """It's possible to only provide the name, either by keyword or as the only positional argument."""
 
@@ -313,6 +325,7 @@ class Asset(os.PathLike, BaseAsset):
         group: str = ...,
         extra: dict[str, JsonValue] | None = None,
         watchers: list[AssetWatcher] = ...,
+        access_control: AssetAccessControl = ...,
     ) -> None:
         """It's possible to only provide the URI as a keyword argument."""
 
@@ -324,6 +337,7 @@ class Asset(os.PathLike, BaseAsset):
         group: str | None = None,
         extra: dict[str, JsonValue] | None = None,
         watchers: list[AssetWatcher] | None = None,
+        access_control: AssetAccessControl | None = None,
     ) -> None:
         if name is None and uri is None:
             raise TypeError("Asset() requires either 'name' or 'uri'")
@@ -345,6 +359,8 @@ class Asset(os.PathLike, BaseAsset):
             kwargs["extra"] = extra
         if watchers is not None:
             kwargs["watchers"] = watchers
+        if access_control is not None:
+            kwargs["access_control"] = access_control
 
         self.__attrs_init__(name=name, uri=uri, **kwargs)
 
@@ -476,6 +492,10 @@ class AssetBooleanCondition(BaseAsset):
     def __hash__(self) -> int:
         return hash(tuple(self.objects))
 
+    @property
+    def requires_batching(self) -> bool:
+        return any(obj.requires_batching for obj in self.objects)
+
 
 class AssetAny(AssetBooleanCondition):
     """Use to combine assets schedule references in an "or" relationship."""
@@ -494,6 +514,10 @@ class AssetAll(AssetBooleanCondition):
     """Use to combine assets schedule references in an "and" relationship."""
 
     agg_func = all  # type: ignore[assignment]
+
+    @property
+    def requires_batching(self) -> bool:
+        return len(self.objects) > 1 or super().requires_batching
 
     def __and__(self, other: BaseAsset) -> BaseAsset:
         if not isinstance(other, BaseAsset):

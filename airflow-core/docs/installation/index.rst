@@ -49,6 +49,49 @@ via extras and providers.
 When you install Airflow, you need to :doc:`setup the database <setting-up-the-database>` which must
 also be kept updated when Airflow is upgraded.
 
+Local start for development and testing
+'''''''''''''''''''''''''''''''''''''''
+
+To run Airflow on your machine for development and testing, follow the :doc:`/start`. It installs Airflow
+into a virtual environment and starts every component with ``airflow standalone``, which is not meant for
+production.
+
+.. _starting-components-separately:
+
+Starting components separately
+""""""""""""""""""""""""""""""
+
+The ``airflow standalone`` command starts every component for you. To run them yourself, create the database
+tables once:
+
+.. code-block:: bash
+
+    airflow db migrate
+
+Then start each component in its own terminal, with the same virtual environment activated and the same
+``AIRFLOW_HOME`` if you set one. Each command keeps running until you stop it:
+
+.. code-block:: bash
+
+    airflow api-server --port 8080
+    airflow scheduler
+    airflow dag-processor
+    airflow triggerer
+
+With the default ``SimpleAuthManager``, the API server prints a generated password for the ``admin`` user on
+its first start and saves it in ``simple_auth_manager_passwords.json.generated`` under ``AIRFLOW_HOME``
+(``~/airflow`` unless you set it). If you use the :doc:`apache-airflow-providers-fab:auth-manager/index`
+instead, create an admin user with ``airflow users create``, which prompts for a password:
+
+.. code-block:: bash
+
+    airflow users create \
+        --username admin \
+        --firstname Peter \
+        --lastname Parker \
+        --role Admin \
+        --email spiderman@superhero.org
+
 Using released sources
 ''''''''''''''''''''''
 
@@ -373,7 +416,7 @@ control theory - where there are two types of systems:
    the system and adjust the knobs continuously to make sure the system is running smoothly.
 
 Airflow (and generally any modern systems running usually on cloud services, with multiple layers responsible
-for resources as well multiple parameters to control their behaviour) is a complex system and it fall
+for resources as well multiple parameters to control their behaviour) is a complex system and it falls
 much more in the second category. If you decide to run Airflow in production on your own, you should be
 prepared for the monitor/observe/adjust feedback loop to make sure the system is running smoothly.
 

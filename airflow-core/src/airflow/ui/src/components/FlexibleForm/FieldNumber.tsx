@@ -16,10 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { NumberInputField, NumberInputRoot } from "src/system-components";
+
 import { paramPlaceholder, useParamStore } from "src/queries/useParamStore";
 
 import type { FlexibleFormElementProps } from ".";
-import { NumberInputField, NumberInputRoot } from "../ui/NumberInput";
 
 export const FieldNumber = ({ name, namespace = "default", onUpdate }: FlexibleFormElementProps) => {
   const { disabled, paramsDict, setParamsDict } = useParamStore(namespace);
@@ -29,7 +30,6 @@ export const FieldNumber = ({ name, namespace = "default", onUpdate }: FlexibleF
       // If input is cleared, set the value to null or undefined
       if (paramsDict[name]) {
         // "undefined" values are removed from params, so we set it to null to avoid falling back to DAG defaults.
-        // eslint-disable-next-line unicorn/no-null
         paramsDict[name].value = null;
       }
     } else {

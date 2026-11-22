@@ -21,13 +21,19 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from airflow.models.dynamic_region import DynamicRegion
 from airflow.models.xcom import XCOM_RETURN_KEY
 from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import task_group
+from airflow.sdk.definitions._internal.loop import create_loop
 from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 from airflow.ti_deps.dep_context import DepContext
 from airflow.ti_deps.deps.base_ti_dep import TIDepStatus
 from airflow.ti_deps.deps.mapped_task_upstream_dep import MappedTaskUpstreamDep
 from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.mapping import push_mapped_length
 
 pytestmark = [pytest.mark.db_test, pytest.mark.need_serialized_dag]
 
@@ -42,6 +48,33 @@ REMOVED = TaskInstanceState.REMOVED
 SKIPPED = TaskInstanceState.SKIPPED
 SUCCESS = TaskInstanceState.SUCCESS
 UPSTREAM_FAILED = TaskInstanceState.UPSTREAM_FAILED
+
+
+def test_mapping_dependency_checks_unmapped_loop_producer_at_positive_pass(dag_maker, session):
+    @task_group
+    def body():
+        source = PythonOperator(task_id="source", python_callable=list)
+        PythonOperator.partial(task_id="consumer", python_callable=list).expand(op_kwargs=source.output)
+
+    with dag_maker(serialized=True):
+        loop = create_loop(body, max_iterations=3)
+    dr = dag_maker.create_dagrun()
+    region = DynamicRegion.get_or_create(
+        dag_id=dr.dag_id, run_id=dr.run_id, node_id=loop.group_id, session=session
+    )
+    session.add(region)
+    session.flush()
+    source = next(ti for ti in dr.task_instances if ti.task_id == "body.source")
+    consumer = next(ti for ti in dr.task_instances if ti.task_id == "body.consumer")
+    source.region_id, source.region_index, source.state = region.id, 1, FAILED
+    consumer.region_id, consumer.region_index = region.id, 1
+    consumer.task = dag_maker.serialized_dag.get_task(consumer.task_id)
+    session.flush()
+
+    statuses = list(MappedTaskUpstreamDep()._get_dep_statuses(consumer, DepContext(), session=session))
+
+    assert any(not status.passed for status in statuses)
+    assert consumer.state == UPSTREAM_FAILED
 
 
 @pytest.mark.parametrize(
@@ -149,7 +182,7 @@ def test_mapped_task_upstream_dep(
         ]
     )
     assert get_dep_statuses(dr, mapped_task, session) == expected_statuses
-    ti = dr.get_task_instance(session=session, task_id=mapped_task)
+    ti = dr.get_task_instance(session=session, task_id=mapped_task, region_id=tis[mapped_task].region_id)
     assert ti is not None
     assert ti.state == expected_state
 
@@ -221,27 +254,36 @@ def test_step_by_step(
     assert sorted(schedulable_tis) == ["t1", "t2_a", "t3", "t4"]
     assert not finished_tis_states
 
-    # Run first schedulable task
-    schedulable_tis["t1"].run()
+    # Simulate running the first schedulable task: t1 returns [0]
+    schedulable_tis["t1"].state = SUCCESS
+    push_mapped_length(schedulable_tis["t1"], [0], session=session)
+    session.flush()
     schedulable_tis, finished_tis_states = _one_scheduling_decision_iteration(dr, session)
     assert sorted(schedulable_tis) == ["t2_a", "t3", "t4"]
     assert finished_tis_states == {"t1": SUCCESS}
 
-    # Run remaining schedulable tasks
+    # Simulate running remaining schedulable tasks
     if failure_mode == UPSTREAM_FAILED:
-        with pytest.raises(AirflowFailException):
-            schedulable_tis["t2_a"].run()
+        schedulable_tis["t2_a"].state = FAILED
+        session.flush()
         _one_scheduling_decision_iteration(dr, session)
     else:
-        schedulable_tis["t2_a"].run()
+        schedulable_tis["t2_a"].state = SUCCESS
+        session.flush()
         schedulable_tis, _ = _one_scheduling_decision_iteration(dr, session)
         if not failure_mode:
-            schedulable_tis["t2_b"].run()
+            schedulable_tis["t2_b"].state = SUCCESS
+            push_mapped_length(schedulable_tis["t2_b"], [1, 2], session=session)
         else:
-            with pytest.raises(AirflowFailException):
-                schedulable_tis["t2_b"].run()
-    schedulable_tis["t3"].run()
-    schedulable_tis["t4"].run()
+            schedulable_tis["t2_b"].state = FAILED
+        session.flush()
+    if skip_upstream:
+        schedulable_tis["t3"].state = SKIPPED
+    else:
+        schedulable_tis["t3"].state = SUCCESS
+        push_mapped_length(schedulable_tis["t3"], [3, 4], session=session)
+    schedulable_tis["t4"].state = SUCCESS
+    session.flush()
     _one_scheduling_decision_iteration(dr, session)
 
     # Test the mapped task upstream dependency checks
@@ -259,17 +301,21 @@ def test_step_by_step(
     assert finished_tis_states == expected_finished_tis_states
 
     if expect_passed:
-        # Run the m1 tasks
+        # Simulate running the m1 tasks; m2 mapping counts xcoms with map_index >= 0
         for i in range(4):
-            schedulable_tis[f"{mapped_task_1}_{i}"].run()
+            ti = schedulable_tis[f"{mapped_task_1}_{i}"]
+            ti.state = SUCCESS
+            ti.xcom_push(XCOM_RETURN_KEY, i, session=session)
             expected_finished_tis_states[f"{mapped_task_1}_{i}"] = SUCCESS
+        session.flush()
         schedulable_tis, finished_tis_states = _one_scheduling_decision_iteration(dr, session)
         assert sorted(schedulable_tis) == [f"{mapped_task_2}_{i}" for i in range(4)]
         assert finished_tis_states == expected_finished_tis_states
-        # Run the m2 tasks
+        # Simulate running the m2 tasks
         for i in range(4):
-            schedulable_tis[f"{mapped_task_2}_{i}"].run()
+            schedulable_tis[f"{mapped_task_2}_{i}"].state = SUCCESS
             expected_finished_tis_states[f"{mapped_task_2}_{i}"] = SUCCESS
+        session.flush()
         schedulable_tis, finished_tis_states = _one_scheduling_decision_iteration(dr, session)
         assert finished_tis_states == expected_finished_tis_states
         assert not schedulable_tis

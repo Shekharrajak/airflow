@@ -17,28 +17,25 @@
  * under the License.
  */
 import { expect, type Locator, type Page } from "@playwright/test";
+
 import { BasePage } from "tests/e2e/pages/BasePage";
 
 export class DagCodePage extends BasePage {
   public readonly editorContainer: Locator;
   public readonly editorScrollable: Locator;
-  public readonly lineNumbers: Locator;
-  public readonly syntaxTokens: Locator;
   public readonly viewLines: Locator;
 
   public constructor(page: Page) {
     super(page);
     this.editorContainer = page.locator('[role="code"]');
-    this.lineNumbers = page.locator(".monaco-editor .line-numbers");
     this.editorScrollable = page.locator(".monaco-scrollable-element");
-    this.syntaxTokens = page.locator(".monaco-editor .view-line span span");
     this.viewLines = page.locator(".monaco-editor .view-line");
   }
 
   public async navigateToCodeTab(dagId: string): Promise<void> {
     await expect(async () => {
       await this.navigateTo(`/dags/${dagId}/code`);
-      await expect(this.editorContainer).toBeVisible({ timeout: 5000 });
+      await expect(this.editorContainer).toBeVisible();
     }).toPass({ intervals: [2000], timeout: 60_000 });
     await this.waitForCodeReady();
   }
@@ -50,19 +47,7 @@ export class DagCodePage extends BasePage {
 
     await expect(scrollable).toBeVisible({ timeout: 30_000 });
 
-    await expect
-      .poll(async () => scrollable.evaluate((el) => el.scrollHeight > el.clientHeight), {
-        timeout: 10_000,
-      })
-      .toBe(true);
-  }
-
-  public async verifyLineNumbersDisplayed(): Promise<void> {
-    await this.waitForCodeReady();
-
-    await expect(this.lineNumbers.first()).toBeVisible({ timeout: 30_000 });
-    await expect(this.lineNumbers).not.toHaveCount(0);
-    await expect(this.lineNumbers.first()).toHaveText("1");
+    await expect.poll(async () => scrollable.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
   }
 
   public async verifySourceCodeDisplayed(): Promise<void> {
@@ -70,14 +55,6 @@ export class DagCodePage extends BasePage {
 
     await expect(this.viewLines.first()).toBeVisible({ timeout: 30_000 });
     await expect(this.viewLines).not.toHaveCount(0);
-  }
-
-  public async verifySyntaxHighlighting(): Promise<void> {
-    await this.waitForCodeReady();
-
-    await expect(this.syntaxTokens.first()).toBeVisible({ timeout: 30_000 });
-    await expect(this.syntaxTokens).not.toHaveCount(0);
-    await expect(this.syntaxTokens.first()).toHaveAttribute("class", /mtk\d+/);
   }
 
   private async waitForCodeReady(): Promise<void> {

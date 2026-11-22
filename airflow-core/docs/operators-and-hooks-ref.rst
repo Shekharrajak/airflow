@@ -1,4 +1,3 @@
-
  .. Licensed to the Apache Software Foundation (ASF) under one
     or more contributor license agreements.  See the NOTICE file
     distributed with this work for additional information
@@ -65,7 +64,7 @@ For details see: :doc:`apache-airflow-providers:operators-and-hooks-ref/index`.
    * - :mod:`airflow.providers.standard.operators.empty`
      -
 
-   * - :mod:`airflow.providers.common.sql.operators.generic_transfer.GenericTransfer`
+   * - :class:`airflow.providers.common.sql.operators.generic_transfer.GenericTransfer`
      - :doc:`How to use <apache-airflow-providers-common-sql:operators>`
 
    * - :mod:`airflow.providers.standard.operators.latest_only`

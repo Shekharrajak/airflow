@@ -43,6 +43,10 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir apache-airflow[amazon,postgres]
 # /tmp is the only writable directory in Lambda, so we need to set the AIRFLOW_HOME there.
 ENV AIRFLOW_HOME=/tmp/airflow
+# Lambda does not set HOME and many third party libraries write caches or downloaded components under
+# the user's home directory, so give it one of its own under /tmp. It cannot be created here: each
+# execution environment gets a fresh /tmp, so app.py creates it when the function starts.
+ENV HOME=/tmp/home
 # Dags are read-only, so they can be stored in opt (or another path provided).
 ARG container_dag_path=/opt/airflow/dags
 ENV AIRFLOW__CORE__DAGS_FOLDER=$container_dag_path
@@ -80,18 +84,18 @@ ENV REQUIREMENTS_PATH=$requirements_path
 #ENV AWS_DEFAULT_REGION=$aws_default_region
 #ENV AWS_SESSION_TOKEN=$aws_session_token
 
-## Loading DAGs
-# This Dockerfile supports 2 ways to load DAGs onto the container.
+## Loading Dags
+# This Dockerfile supports 2 ways to load Dags onto the container.
 # One is to download them from S3 at runtime during the Lambda app invocation. The other
 # is to copy the dags into the image at build time, this will make task execution
 # much faster, since the images will already be present but the image will need to be rebuilt
-# every time the DAGs are updated.
-# If you would like to use an alternative method of loading DAGs, feel free to make the
+# every time the Dags are updated.
+# If you would like to use an alternative method of loading Dags, feel free to make the
 # necessary changes to this file.
 
 ARG host_dag_path=./dags
 ENV HOST_DAG_PATH=$host_dag_path
-# Uncomment the line below to copy the DAGs from the host to the container.
+# Uncomment the line below to copy the Dags from the host to the container.
 # COPY $HOST_DAG_PATH $AIRFLOW__CORE__DAGS_FOLDER
 
 # Use these arguments to load DAGs at runtime. If you are using the provided Lambda function (app.py),

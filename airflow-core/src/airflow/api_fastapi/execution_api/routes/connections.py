@@ -23,27 +23,38 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 
 from airflow.api_fastapi.execution_api.datamodels.connection import ConnectionResponse
-from airflow.api_fastapi.execution_api.security import CurrentTIToken, get_team_name_dep
+from airflow.api_fastapi.execution_api.security import (
+    CurrentExecutionToken,
+    ExecutionAPIRoute,
+    ExecutionOrProcessorSecretsToken,
+    get_team_name_dep,
+)
 from airflow.exceptions import AirflowNotFoundException
 from airflow.models.connection import Connection
 
 
 async def has_connection_access(
     connection_id: Annotated[str, Path(min_length=1)],
-    token=CurrentTIToken,
+    token=CurrentExecutionToken,
 ) -> bool:
     """Check if the task has access to the connection."""
-    # TODO: Placeholder for actual implementation
-
     log.debug(
         "Checking access for task instance with key '%s' to connection '%s'",
         token.id,
         connection_id,
     )
+
+    # The current version of Airflow does not support true
+    # multi-tenancy yet (this is well-documented at
+    # https://airflow.apache.org/docs/apache-airflow/stable/security/security_model.html#future-multi-tenancy-isolation),
+    # so for now we always return 'True' here.
+    # When we introduce true multi-tenancy in the future
+    # this would be the place to do add a check.
     return True
 
 
 router = APIRouter(
+    route_class=ExecutionAPIRoute,
     responses={status.HTTP_404_NOT_FOUND: {"description": "Connection not found"}},
     dependencies=[Depends(has_connection_access)],
 )
@@ -52,10 +63,12 @@ log = logging.getLogger(__name__)
 
 
 @router.get(
-    "/{connection_id}",
+    "/{connection_id:path}",
+    dependencies=[ExecutionOrProcessorSecretsToken],
     responses={
         status.HTTP_401_UNAUTHORIZED: {"description": "Unauthorized"},
-        status.HTTP_403_FORBIDDEN: {"description": "Task does not have access to the connection"},
+        status.HTTP_400_BAD_REQUEST: {"description": "A Dag processor token did not name its Dag bundle"},
+        status.HTTP_403_FORBIDDEN: {"description": "The caller does not have access to the connection"},
     },
 )
 def get_connection(

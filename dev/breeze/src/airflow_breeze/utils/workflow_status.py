@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "rich>=13.6.0",
 # ]
@@ -33,6 +33,13 @@ from rich.console import Console
 console = Console(width=400, color_system="standard")
 
 
+def format_failed_jobs_lookup_error(run_id: int) -> str:
+    return (
+        "ERROR: failed to fetch failed jobs for workflow run "
+        f"{run_id}; inspect it directly with: gh run view {run_id} --json jobs --repo apache/airflow"
+    )
+
+
 def workflow_status(
     branch: str,
     workflow_id: str,
@@ -46,6 +53,10 @@ def workflow_status(
         workflow_id,
         "--branch",
         branch,
+        # A run still in progress has no conclusion yet, which would read as "no failures" and
+        # announce a recovery that has not happened.
+        "--status",
+        "completed",
         "--limit",
         "1",  # Limit to the most recent run
         "--repo",
@@ -93,7 +104,7 @@ def get_failed_jobs(run_id: int) -> list[str]:
     )
     if result.returncode != 0:
         console.print(f"[red]Error fetching failed jobs: {result.stderr}[/red]")
-        return []
+        return [format_failed_jobs_lookup_error(run_id)]
 
     return [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
 

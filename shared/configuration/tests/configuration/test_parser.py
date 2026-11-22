@@ -34,6 +34,7 @@ import pytest
 from airflow_shared.configuration.exceptions import AirflowConfigException
 from airflow_shared.configuration.parser import (
     AirflowConfigParser as _SharedAirflowConfigParser,
+    base_section_name,
     configure_parser_from_configuration_description,
 )
 
@@ -43,10 +44,6 @@ class _NoOpProvidersManager:
 
     @property
     def provider_configs(self):
-        return []
-
-    @property
-    def already_initialized_provider_configs(self):
         return []
 
 
@@ -92,38 +89,12 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
             *args,
             **kwargs,
         )
-        self.configuration_description = configuration_description
+        self._configuration_description = configuration_description
         self._default_values = _default_values
         self._suppress_future_warnings = False
 
         if default_config is not None:
             self._update_defaults_from_string(default_config)
-
-    def _update_defaults_from_string(self, config_string: str):
-        """Update defaults from string for testing."""
-        parser = ConfigParser()
-        parser.read_string(config_string)
-        for section in parser.sections():
-            if section not in self._default_values.sections():
-                self._default_values.add_section(section)
-            for key, value in parser.items(section):
-                self._default_values.set(section, key, value)
-
-    def _ensure_providers_config_loaded(self) -> None:
-        """Load provider configuration for tests when requested."""
-        if not self._providers_configuration_loaded:
-            self.load_providers_configuration()
-
-    def _ensure_providers_config_unloaded(self) -> bool:
-        """Unload provider configuration for tests when requested."""
-        if self._providers_configuration_loaded:
-            self.restore_core_default_configuration()
-            return True
-        return False
-
-    def _reload_provider_configs(self) -> None:
-        """Reload provider configuration for tests after temporary unloads."""
-        self.load_providers_configuration()
 
 
 class TestAirflowConfigParser:
@@ -836,16 +807,6 @@ existing_list = one,two,three
         with pytest.raises(ValueError, match=r"The value test/missing_key should be set!"):
             test_conf.get_mandatory_list_value("test", "missing_key", fallback=None)
 
-    def test_as_dict_only_materializes_provider_sources_after_loading_providers(self):
-        test_conf = AirflowConfigParser()
-
-        test_conf.as_dict(display_source=True)
-        assert "_provider_metadata_config_fallback_default_values" not in test_conf.__dict__
-
-        test_conf.load_providers_configuration()
-        test_conf.as_dict(display_source=True)
-        assert "_provider_metadata_config_fallback_default_values" in test_conf.__dict__
-
     def test_write_materializes_provider_sources_in_requested_context(self):
         test_conf = AirflowConfigParser()
 
@@ -855,7 +816,12 @@ existing_list = one,two,three
         test_conf.write(StringIO(), include_sources=True, include_providers=True)
         assert "_provider_metadata_config_fallback_default_values" in test_conf.__dict__
 
-    def test_get_uses_provider_metadata_fallback_before_loading_providers(self):
+        # we will not clear the cached _provider_metadata_config_fallback_default_values after the first call
+        test_conf.write(StringIO(), include_sources=True, include_providers=False)
+        assert "_provider_metadata_config_fallback_default_values" in test_conf.__dict__
+
+    def test_get_resolves_provider_metadata_fallback(self):
+        """conf.get returns values from provider metadata for provider-only sections."""
         provider_configs = [
             (
                 "apache-airflow-providers-test",
@@ -876,20 +842,55 @@ existing_list = one,two,three
             def provider_configs(self):
                 return provider_configs
 
+        test_conf = AirflowConfigParser(
+            provider_manager_type=ProvidersManagerWithConfig,
+            create_default_config_parser_callable=_create_default_config_parser,
+        )
+
+        assert test_conf._use_providers_configuration is True
+        assert test_conf.get("test_provider", "test_option") == "provider-default"
+        # Provider metadata is merged into configuration_description
+        assert test_conf.configuration_description.get("test_provider") is not None
+        # Base configuration is not mutated
+        assert "test_provider" not in test_conf._configuration_description
+
+    def test_has_option_uses_provider_metadata_fallback(self):
+        """has_option must reach provider-metadata fallback for provider-only sections.
+
+        Regression test: has_option passes ``fallback=None`` to get(), which leaked
+        into _get_option_from_defaults via **kwargs.  The ``"fallback" in kwargs``
+        guard caused _get_option_from_defaults to return None (the fallback) instead
+        of VALUE_NOT_FOUND_SENTINEL, short-circuiting the lookup before the provider
+        metadata fallback was consulted.
+        """
+        provider_configs = [
+            (
+                "apache-airflow-providers-test",
+                {
+                    "test_provider": {
+                        "options": {
+                            "test_option": {
+                                "default": "provider-default",
+                            }
+                        }
+                    }
+                },
+            )
+        ]
+
+        class ProvidersManagerWithConfig:
             @property
-            def already_initialized_provider_configs(self):
-                return []
+            def provider_configs(self):
+                return provider_configs
 
         test_conf = AirflowConfigParser(
             provider_manager_type=ProvidersManagerWithConfig,
             create_default_config_parser_callable=_create_default_config_parser,
         )
 
-        assert test_conf._providers_configuration_loaded is False
-        assert test_conf.configuration_description.get("test_provider") is None
-        assert test_conf.get("test_provider", "test_option") == "provider-default"
-        assert test_conf._providers_configuration_loaded is False
-        assert test_conf.configuration_description.get("test_provider") is None
+        assert test_conf.has_option("test_provider", "test_option") is True
+        assert test_conf.has_option("test_provider", "nonexistent_option") is False
+        assert test_conf.has_option("nonexistent_section", "nonexistent_option") is False
 
     def test_set_case_insensitive(self):
         # both get and set should be case insensitive
@@ -1123,3 +1124,210 @@ existing_list = one,two,three
             {"AIRFLOW__MY_TEAM___MY_SECTION__MY_KEY": "team_value"},
         ):
             assert test_conf.get("my_section", "my_key", team_name="my_team") == "team_value"
+
+    @pytest.mark.parametrize(
+        ("section", "expected"),
+        [
+            pytest.param("celery", "celery", id="base_section"),
+            pytest.param("team_a=celery", "celery", id="team_scoped_section"),
+            pytest.param("team-a=celery", "celery", id="team_name_with_dash"),
+            pytest.param("a=team=celery", "celery", id="separator_inside_team_name"),
+        ],
+    )
+    def test_base_section_name(self, section, expected):
+        """The base section name is recovered from a team scoped section name."""
+        assert base_section_name(section) == expected
+
+    def test_is_sensitive_option_resolves_team_scoped_names(self):
+        """A team scoped spelling of a registered sensitive option is recognised as sensitive."""
+        test_conf = AirflowConfigParser()
+        test_conf.sensitive_config_values.add(("test", "sensitive_key"))
+
+        assert test_conf.is_sensitive_option("test", "sensitive_key")
+        assert test_conf.is_sensitive_option("team_a=test", "sensitive_key")
+        assert test_conf.is_sensitive_option("team-a=test", "sensitive_key")
+        assert test_conf.is_sensitive_option("a=team=test", "sensitive_key")
+        # The section and key an AIRFLOW__<TEAM>___<SECTION>__<KEY> variable name splits into.
+        assert test_conf.is_sensitive_option("team_a", "_test__sensitive_key")
+
+        # An option that is not registered as sensitive stays readable under any spelling.
+        assert not test_conf.is_sensitive_option("test", "key1")
+        assert not test_conf.is_sensitive_option("team_a=test", "key1")
+        assert not test_conf.is_sensitive_option("team_a", "_test__key1")
+        # A team name matching a registered option does not make the section sensitive either.
+        assert not test_conf.is_sensitive_option("sensitive_key=test", "key1")
+
+    def test_team_scoped_sensitive_value_is_hidden_in_as_dict(self):
+        """A sensitive option set in a [team=section] section is hidden like the base option is."""
+        test_conf = AirflowConfigParser()
+        test_conf.read_string(
+            textwrap.dedent(
+                """\
+                [test]
+                sensitive_key = global_value
+
+                [team_a=test]
+                sensitive_key = team_a_value
+                key1 = team_a_key1_value
+            """
+            )
+        )
+        test_conf.sensitive_config_values.add(("test", "sensitive_key"))
+
+        as_dict = test_conf.as_dict(display_sensitive=False)
+
+        assert as_dict["team_a=test"]["sensitive_key"] == "< hidden >"
+        # The base option keeps being hidden, and an option that is not registered as sensitive
+        # keeps being readable.
+        assert as_dict["test"]["sensitive_key"] == "< hidden >"
+        assert as_dict["team_a=test"]["key1"] == "team_a_key1_value"
+
+        # display_source keeps reporting where the value came from
+        as_dict_with_source = test_conf.as_dict(display_sensitive=False, display_source=True)
+        assert as_dict_with_source["team_a=test"]["sensitive_key"] == ("< hidden >", "airflow.cfg")
+
+        # display_sensitive=True still returns the real values
+        as_dict_sensitive = test_conf.as_dict(display_sensitive=True)
+        assert as_dict_sensitive["team_a=test"]["sensitive_key"] == "team_a_value"
+        assert as_dict_sensitive["test"]["sensitive_key"] == "global_value"
+
+    def test_team_scoped_sensitive_cmd_and_secret_fallbacks_are_hidden_in_as_dict(self):
+        """The _cmd / _secret fallbacks of a team scoped option are not resolved, so they are hidden."""
+        test_conf = AirflowConfigParser()
+        test_conf.read_string(
+            textwrap.dedent(
+                """\
+                [team_a=test]
+                sensitive_key_cmd = echo -n team_a_value
+                sensitive_key_secret = team_a/secret/path
+            """
+            )
+        )
+        test_conf.sensitive_config_values.add(("test", "sensitive_key"))
+
+        as_dict = test_conf.as_dict(display_sensitive=False)
+
+        assert as_dict["team_a=test"]["sensitive_key_cmd"] == "< hidden >"
+        assert as_dict["team_a=test"]["sensitive_key_secret"] == "< hidden >"
+
+    def test_team_scoped_sensitive_env_var_is_hidden_in_as_dict(self):
+        """A sensitive option set by a team scoped env var is hidden like the base option is."""
+        test_conf = AirflowConfigParser()
+        test_conf.sensitive_config_values.add(("test", "sensitive_key"))
+
+        with patch.dict(
+            os.environ,
+            {
+                "AIRFLOW__TEAM_A___TEST__SENSITIVE_KEY": "team_a_value",
+                "AIRFLOW__TEAM_A___TEST__SENSITIVE_KEY_CMD": "echo -n team_a_cmd_value",
+                "AIRFLOW__TEAM_A___TEST__KEY1": "team_a_key1_value",
+            },
+        ):
+            hidden_values = self._collected_values(test_conf.as_dict(display_sensitive=False))
+            sensitive_values = self._collected_values(test_conf.as_dict(display_sensitive=True))
+
+        assert "team_a_value" not in hidden_values
+        assert "echo -n team_a_cmd_value" not in hidden_values
+        assert "< hidden >" in hidden_values
+        assert "team_a_key1_value" in hidden_values
+        # display_sensitive=True still returns the real value.
+        assert "team_a_value" in sensitive_values
+
+    def test_team_scoped_sensitive_value_is_hidden_by_write(self):
+        """A sensitive option set in a [team=section] section is hidden when writing the config out."""
+        test_conf = AirflowConfigParser()
+        test_conf.read_string(
+            textwrap.dedent(
+                """\
+                [team_a=test]
+                sensitive_key = team_a_value
+                key1 = team_a_key1_value
+            """
+            )
+        )
+        test_conf.sensitive_config_values.add(("test", "sensitive_key"))
+
+        file = StringIO()
+        test_conf.write(
+            file,
+            include_descriptions=False,
+            include_examples=False,
+            include_sources=False,
+            show_values=True,
+            hide_sensitive=True,
+        )
+        written = file.getvalue()
+
+        assert "team_a_value" not in written
+        assert "sensitive_key = < hidden >" in written
+        assert "key1 = team_a_key1_value" in written
+
+    @staticmethod
+    def _collected_values(as_dict):
+        """Flatten the values of an ``as_dict`` result, whatever section they were reported under."""
+        return {value for options in as_dict.values() for value in options.values()}
+
+    @pytest.mark.parametrize(
+        "populate_caches",
+        [
+            pytest.param(set(), id="neither_cached"),
+            pytest.param({"configuration_description"}, id="only_configuration_description"),
+            pytest.param({"sensitive_config_values"}, id="only_sensitive_config_values"),
+            pytest.param({"configuration_description", "sensitive_config_values"}, id="both_cached"),
+        ],
+    )
+    def test_invalidate_provider_flag_caches(self, populate_caches):
+        """Test that _invalidate_provider_flag_caches clears cached properties without error."""
+        test_conf = AirflowConfigParser()
+        if "configuration_description" in populate_caches:
+            _ = test_conf.configuration_description
+        if "sensitive_config_values" in populate_caches:
+            _ = test_conf.sensitive_config_values
+
+        test_conf._invalidate_provider_flag_caches()
+
+        assert "configuration_description" not in test_conf.__dict__
+        assert "sensitive_config_values" not in test_conf.__dict__
+
+    def test_invalidate_provider_flag_caches_allows_recomputation(self):
+        """Test that cached properties are recomputed after invalidation."""
+        test_conf = AirflowConfigParser()
+        desc_before = test_conf.configuration_description
+        sensitive_before = test_conf.sensitive_config_values
+
+        test_conf._invalidate_provider_flag_caches()
+
+        # Access again — should recompute, not error
+        desc_after = test_conf.configuration_description
+        sensitive_after = test_conf.sensitive_config_values
+        assert desc_after == desc_before
+        assert sensitive_after == sensitive_before
+
+    def test_load_providers_configuration_emits_deprecation_warning(self):
+        """Test that load_providers_configuration emits a DeprecationWarning."""
+        test_conf = AirflowConfigParser()
+        with pytest.warns(DeprecationWarning, match="load_providers_configuration.*deprecated"):
+            test_conf.load_providers_configuration()
+        assert test_conf._use_providers_configuration is True
+
+    def test_restore_core_default_configuration_emits_deprecation_warning(self):
+        """Test that restore_core_default_configuration emits a DeprecationWarning."""
+        test_conf = AirflowConfigParser()
+        with pytest.warns(DeprecationWarning, match="restore_core_default_configuration.*deprecated"):
+            test_conf.restore_core_default_configuration()
+        assert test_conf._use_providers_configuration is False
+
+    def test_deprecated_load_restore_round_trip(self):
+        """Test that the deprecated methods toggle _use_providers_configuration correctly."""
+        test_conf = AirflowConfigParser()
+        assert test_conf._use_providers_configuration is True
+
+        with pytest.warns(DeprecationWarning, match="restore_core_default_configuration"):
+            test_conf.restore_core_default_configuration()
+        assert test_conf._use_providers_configuration is False
+        assert "configuration_description" not in test_conf.__dict__
+
+        with pytest.warns(DeprecationWarning, match="load_providers_configuration"):
+            test_conf.load_providers_configuration()
+        assert test_conf._use_providers_configuration is True
+        assert "configuration_description" not in test_conf.__dict__

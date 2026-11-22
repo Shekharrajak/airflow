@@ -1,23 +1,41 @@
-// generated with @7nohe/openapi-react-query-codegen@2.0.0
-import { type Options } from "@hey-api/client-axios";
-import { type QueryClient } from "@tanstack/react-query";
+// generated with @7nohe/openapi-react-query-codegen@3.0.2
+import { type EnsureQueryDataOptions, type QueryClient } from "@tanstack/react-query";
 
-import { createTokenAllAdmins, loginAllAdmins } from "../requests/services.gen";
+import { createTokenAllAdmins, loginAllAdmins, type Options } from "../requests/sdk.gen";
+import type { CreateTokenAllAdminsData, LoginAllAdminsData } from "../requests/types.gen";
 import * as Common from "./common";
 
+/**
+ * Create Token All Admins
+ *
+ * Create a token with no credentials only if ``simple_auth_manager_all_admins`` is True.
+ */
 export const ensureUseCreateTokenAllAdminsData = (
   queryClient: QueryClient,
-  clientOptions: Options<unknown, true> = {},
+  clientOptions: Options<CreateTokenAllAdminsData, true> = {},
+  options?: Omit<EnsureQueryDataOptions<Common.CreateTokenAllAdminsDefaultResponse>, "queryKey" | "queryFn">,
 ) =>
   queryClient.ensureQueryData({
     queryKey: Common.UseCreateTokenAllAdminsKeyFn(clientOptions),
-    queryFn: () => createTokenAllAdmins({ ...clientOptions }).then((response) => response.data),
+    queryFn: ({ signal }) =>
+      createTokenAllAdmins({ ...clientOptions, signal, throwOnError: true }).then(
+        (response) => response.data,
+      ),
+    ...options,
   });
+/**
+ * Login All Admins
+ *
+ * Login the user with no credentials.
+ */
 export const ensureUseLoginAllAdminsData = (
   queryClient: QueryClient,
-  clientOptions: Options<unknown, true> = {},
+  clientOptions: Options<LoginAllAdminsData, true> = {},
+  options?: Omit<EnsureQueryDataOptions<Common.LoginAllAdminsDefaultResponse>, "queryKey" | "queryFn">,
 ) =>
   queryClient.ensureQueryData({
     queryKey: Common.UseLoginAllAdminsKeyFn(clientOptions),
-    queryFn: () => loginAllAdmins({ ...clientOptions }).then((response) => response.data),
+    queryFn: ({ signal }) =>
+      loginAllAdmins({ ...clientOptions, signal, throwOnError: true }).then((response) => response.data),
+    ...options,
   });

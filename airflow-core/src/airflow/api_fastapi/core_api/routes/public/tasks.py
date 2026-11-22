@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-from operator import attrgetter
 from typing import cast
 
 from fastapi import Depends, HTTPException, status
@@ -30,8 +29,32 @@ from airflow.api_fastapi.core_api.datamodels.tasks import TaskCollectionResponse
 from airflow.api_fastapi.core_api.openapi.exceptions import create_openapi_http_exception_doc
 from airflow.api_fastapi.core_api.security import requires_access_dag
 from airflow.exceptions import TaskNotFound
+from airflow.models.dag_version import DagVersion
 
 tasks_router = AirflowRouter(tags=["Task"], prefix="/dags/{dag_id}/tasks")
+
+_SORTABLE_TASK_FIELDS = {
+    "task_id",
+    "task_display_name",
+    "owner",
+    "start_date",
+    "end_date",
+    "trigger_rule",
+    "depends_on_past",
+    "wait_for_downstream",
+    "retries",
+    "queue",
+    "pool",
+    "pool_slots",
+    "execution_timeout",
+    "retry_delay",
+    "retry_exponential_backoff",
+    "priority_weight",
+    "weight_rule",
+    "ui_color",
+    "ui_fgcolor",
+    "operator_name",
+}
 
 
 @tasks_router.get(
@@ -50,12 +73,20 @@ def get_tasks(
     session: SessionDep,
     order_by: str = "task_id",
 ) -> TaskCollectionResponse:
-    """Get tasks for DAG."""
+    """Get tasks for Dag."""
     dag = get_latest_version_of_dag(dag_bag, dag_id, session)
-    try:
-        tasks = sorted(dag.tasks, key=attrgetter(order_by.lstrip("-")), reverse=(order_by[0:1] == "-"))
-    except AttributeError as err:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(err))
+    lstripped_order_by = order_by.lstrip("-")
+    if lstripped_order_by not in _SORTABLE_TASK_FIELDS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Ordering with '{lstripped_order_by}' is disallowed or "
+            f"the attribute does not exist on the model",
+        )
+    tasks = sorted(
+        dag.tasks,
+        key=lambda task: (getattr(task, lstripped_order_by) is None, getattr(task, lstripped_order_by)),
+        reverse=(order_by[0:1] == "-"),
+    )
     return TaskCollectionResponse(
         tasks=cast("list[TaskResponse]", tasks),
         total_entries=len(tasks),
@@ -72,9 +103,31 @@ def get_tasks(
     ),
     dependencies=[Depends(requires_access_dag(method="GET", access_entity=DagAccessEntity.TASK))],
 )
-def get_task(dag_id: str, task_id, session: SessionDep, dag_bag: DagBagDep) -> TaskResponse:
-    """Get simplified representation of a task."""
-    dag = get_latest_version_of_dag(dag_bag, dag_id, session)
+def get_task(
+    dag_id: str,
+    task_id,
+    session: SessionDep,
+    dag_bag: DagBagDep,
+    version_number: int | None = None,
+) -> TaskResponse:
+    """
+    Get simplified representation of a task.
+
+    Pass ``version_number`` (e.g. a task instance's ``dag_version.version_number``) to get the task
+    as defined in that Dag version. Without it the latest version is used. Returns 404 if that
+    version of the Dag does not exist.
+    """
+    if version_number is None:
+        dag = get_latest_version_of_dag(dag_bag, dag_id, session)
+    else:
+        dag_version = DagVersion.get_version(dag_id, version_number, session=session)
+        versioned_dag = None if dag_version is None else dag_bag.get_dag(dag_version.id, session=session)
+        if versioned_dag is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"The Dag {dag_id}, version_number {version_number} was not found",
+            )
+        dag = versioned_dag
     try:
         task = dag.get_task(task_id=task_id)
     except TaskNotFound:

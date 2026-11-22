@@ -30,7 +30,9 @@ from airflow.sdk import yaml
 from airflow.sdk._shared.configuration.parser import (
     AirflowConfigParser as _SharedAirflowConfigParser,
     configure_parser_from_configuration_description,
+    expand_env_var,
 )
+from airflow.sdk._shared.module_loading import import_string
 from airflow.sdk.execution_time.secrets import _SERVER_DEFAULT_SECRETS_SEARCH_PATH
 
 log = logging.getLogger(__name__)
@@ -99,7 +101,7 @@ def get_sdk_expansion_variables() -> dict[str, Any]:
     SDK only needs AIRFLOW_HOME for expansion. Core specific variables
     (FERNET_KEY, JWT_SECRET_KEY, etc.) are not needed in the SDK.
     """
-    airflow_home = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+    airflow_home = expand_env_var(os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow")))
     return {
         "AIRFLOW_HOME": airflow_home,
     }
@@ -107,8 +109,11 @@ def get_sdk_expansion_variables() -> dict[str, Any]:
 
 def get_airflow_config() -> str:
     """Get path to airflow.cfg file."""
-    airflow_home = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
-    return os.path.join(airflow_home, "airflow.cfg")
+    airflow_config_var = os.environ.get("AIRFLOW_CONFIG")
+    if airflow_config_var is None:
+        airflow_home: str = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        return os.path.join(expand_env_var(airflow_home), "airflow.cfg")
+    return expand_env_var(airflow_config_var)
 
 
 class AirflowSDKConfigParser(_SharedAirflowConfigParser):
@@ -130,11 +135,11 @@ class AirflowSDKConfigParser(_SharedAirflowConfigParser):
         from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
 
         # Read Core's config.yml (Phase 1: shared config.yml)
-        configuration_description = retrieve_configuration_description()
+        _configuration_description = retrieve_configuration_description()
         # Create default values parser
-        _default_values = create_default_config_parser(configuration_description)
+        _default_values = create_default_config_parser(_configuration_description)
         super().__init__(
-            configuration_description,
+            _configuration_description,
             _default_values,
             ProvidersManagerTaskRuntime,
             create_default_config_parser,
@@ -142,7 +147,7 @@ class AirflowSDKConfigParser(_SharedAirflowConfigParser):
             *args,
             **kwargs,
         )
-        self.configuration_description = configuration_description
+        self._configuration_description = _configuration_description
         self._default_values = _default_values
         self._suppress_future_warnings = False
 
@@ -156,6 +161,47 @@ class AirflowSDKConfigParser(_SharedAirflowConfigParser):
 
         if default_config is not None:
             self._update_defaults_from_string(default_config)
+
+    def mask_secrets(self) -> None:
+        """Mask sensitive config values in the secrets masker."""
+        from airflow.sdk._shared.configuration.exceptions import AirflowConfigException
+        from airflow.sdk._shared.configuration.parser import _build_kwarg_env_prefix, _collect_kwarg_env_vars
+        from airflow.sdk._shared.secrets_masker import mask_secret
+
+        core_mask_secret: Any | None = None
+        try:
+            import importlib
+
+            core_mask_secret = importlib.import_module("airflow._shared.secrets_masker").mask_secret
+        except ImportError:
+            pass
+
+        for section, key in self.sensitive_config_values:
+            try:
+                with self.suppress_future_warnings():
+                    value = self.get(section, key, suppress_warnings=True)
+            except AirflowConfigException:
+                log.debug(
+                    "Could not retrieve value from section %s, for key %s. Skipping redaction of this conf.",
+                    section,
+                    key,
+                )
+                continue
+            mask_secret(value)
+            if core_mask_secret:
+                core_mask_secret(value)
+
+        # Mask per-key backend kwarg env vars (AIRFLOW__SECRETS__BACKEND_KWARG__* etc.).
+        # These are not in sensitive_config_values but may contain sensitive values.
+        for _section, _kwargs_key in [
+            ("secrets", "backend_kwargs"),
+            ("workers", "secrets_backend_kwargs"),
+        ]:
+            _prefix = _build_kwarg_env_prefix(_section, _kwargs_key)
+            for _value in _collect_kwarg_env_vars(_prefix).values():
+                mask_secret(_value)
+                if core_mask_secret:
+                    core_mask_secret(_value)
 
     def _get_custom_secret_backend(self, worker_mode: bool | None = None) -> Any | None:
         return super()._get_custom_secret_backend(
@@ -232,8 +278,6 @@ def initialize_secrets_backends(
 
     Uses SDK's conf instead of Core's conf.
     """
-    from airflow.sdk._shared.module_loading import import_string
-
     backend_list = []
     worker_mode = False
     # Determine worker mode - if default_backends is not the server default, it's worker mode
@@ -260,22 +304,32 @@ def initialize_secrets_backends(
     return backend_list
 
 
+_secrets_backend_cache: dict[tuple[str, ...], list] = {}
+
+
+def clear_secrets_backends_cache() -> None:
+    """Drop the memoised backends so the next load rebuilds them from the current config."""
+    _secrets_backend_cache.clear()
+
+
 def ensure_secrets_loaded(
     default_backends: list[str] = _SERVER_DEFAULT_SECRETS_SEARCH_PATH,
 ) -> list:
     """
-    Ensure that all secrets backends are loaded.
+    Return the secrets backends for the given search path, building them once per process.
 
-    If the secrets_backend_list contains only 2 default backends, reload it.
+    A backend holds an authenticated client, so rebuilding one per lookup makes every secret
+    fetch authenticate again against the remote store. Nothing is memoised until a custom
+    backend is configured, so one appearing after the first lookup is still picked up.
     """
-    # Check if the secrets_backend_list contains only 2 default backends.
-
-    # Check if we are loading the backends for worker too by checking if the default_backends is equal
-    # to _SERVER_DEFAULT_SECRETS_SEARCH_PATH.
-    secrets_backend_list = initialize_secrets_backends()
-    if len(secrets_backend_list) == 2 or default_backends != _SERVER_DEFAULT_SECRETS_SEARCH_PATH:
-        return initialize_secrets_backends(default_backends=default_backends)
-    return secrets_backend_list
+    key = tuple(default_backends)
+    if key not in _secrets_backend_cache:
+        backends = initialize_secrets_backends(default_backends=default_backends)
+        # Equal lengths mean nothing was prepended, so no custom backend is configured yet.
+        if len(backends) == len(default_backends):
+            return backends
+        _secrets_backend_cache[key] = backends
+    return _secrets_backend_cache[key]
 
 
 def initialize_config() -> AirflowSDKConfigParser:

@@ -22,6 +22,7 @@ RELEASE_AIRFLOW_COMMANDS: dict[str, str | list[str]] = {
         "create-minor-branch",
         "prepare-airflow-distributions",
         "prepare-tarball",
+        "start-beta-process",
         "start-rc-process",
         "start-release",
         "release-prod-images",
@@ -42,6 +43,7 @@ RELEASE_PROVIDERS_COMMANDS: dict[str, str | list[str]] = {
     "name": "Providers release commands",
     "commands": [
         "prepare-provider-documentation",
+        "classify-provider-changes",
         "update-providers-next-version",
         "prepare-provider-distributions",
         "install-provider-distributions",
@@ -64,6 +66,15 @@ RELEASE_AIRFLOW_CTL_COMMANDS: dict[str, str | list[str]] = {
     "name": "airflowctl release commands",
     "commands": [
         "prepare-airflow-ctl-distributions",
+        "generate-issue-content-airflow-ctl",
+        "generate-airflowctl-changelog",
+    ],
+}
+
+RELEASE_MYPY_COMMANDS: dict[str, str | list[str]] = {
+    "name": "Apache Airflow Mypy release commands",
+    "commands": [
+        "prepare-mypy-distributions",
     ],
 }
 
@@ -76,8 +87,12 @@ RELEASE_OTHER_COMMANDS: dict[str, str | list[str]] = {
         "generate-constraints",
         "update-constraints",
         "publish-docs-to-s3",
+        "publish-schemas-to-s3",
         "verify-rc-by-pmc",
         "check-release-files",
+        "mirror-base-images",
+        "build-os-deps-images",
+        "publish-os-deps-images",
     ],
 }
 
@@ -89,6 +104,35 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--distribution-format",
                 "--version-suffix",
                 "--use-local-hatch",
+            ],
+        }
+    ],
+    "breeze release-management mirror-base-images": [
+        {
+            "name": "Mirror flags",
+            "options": [
+                "--python",
+            ],
+        }
+    ],
+    "breeze release-management build-os-deps-images": [
+        {
+            "name": "Build flags",
+            "options": [
+                "--python",
+                "--image-type",
+                "--base-image-digests",
+                "--platform",
+            ],
+        }
+    ],
+    "breeze release-management publish-os-deps-images": [
+        {
+            "name": "Publish flags",
+            "options": [
+                "--python",
+                "--image-type",
+                "--base-image-digests",
             ],
         }
     ],
@@ -109,6 +153,16 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
         }
     ],
     "breeze release-management prepare-airflow-ctl-distributions": [
+        {
+            "name": "Package flags",
+            "options": [
+                "--distribution-format",
+                "--version-suffix",
+                "--use-local-hatch",
+            ],
+        }
+    ],
+    "breeze release-management prepare-mypy-distributions": [
         {
             "name": "Package flags",
             "options": [
@@ -232,6 +286,7 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--distribution-format",
                 "--distributions-list-file",
                 "--skip-deleting-generated-files",
+                "--skip-git-fetch",
                 "--skip-tag-check",
                 "--version-suffix",
                 "--distributions-list",
@@ -247,12 +302,31 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             ],
         },
     ],
+    "breeze release-management classify-provider-changes": [
+        {
+            "name": "Classification options",
+            "options": [
+                "--base-branch",
+                "--skip-git-fetch",
+                "--github-repository",
+                "--output-file",
+            ],
+        },
+        {
+            "name": "Select non-regular providers",
+            "options": [
+                "--include-not-ready-providers",
+                "--include-removed-providers",
+            ],
+        },
+    ],
     "breeze release-management prepare-provider-documentation": [
         {
             "name": "Documentation generation mode",
             "options": [
                 "--release-date",
                 "--incremental-update",
+                "--mark-doc-only",
                 "--only-min-version-update",
                 "--reapply-templates-only",
                 "--non-interactive",
@@ -300,6 +374,8 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             "name": "Generate constraints flags",
             "options": [
                 "--airflow-constraints-mode",
+                "--allow-pre-releases",
+                "--fail-on-pending-provider-candidates",
                 "--github-repository",
                 "--python",
                 "--use-uv",
@@ -372,6 +448,31 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             ],
         }
     ],
+    "breeze release-management generate-issue-content-airflow-ctl": [
+        {
+            "name": "Generate issue flags",
+            "options": [
+                "--github-token",
+                "--previous-release",
+                "--current-release",
+                "--excluded-pr-list",
+                "--limit-pr-count",
+            ],
+        }
+    ],
+    "breeze release-management generate-airflowctl-changelog": [
+        {
+            "name": "Generate changelog flags",
+            "options": [
+                "--github-token",
+                "--previous-release",
+                "--current-release",
+                "--version",
+                "--excluded-pr-list",
+                "--output-file",
+            ],
+        }
+    ],
     "breeze release-management publish-docs": [
         {
             "name": "Publish Docs",
@@ -413,6 +514,7 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--excluded-pr-list",
                 "--github-token",
                 "--only-available-in-dist",
+                "--output-file",
             ],
         }
     ],
@@ -431,6 +533,16 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             "name": "Debug options",
             "options": ["--provider-id", "--provider-version"],
         },
+    ],
+    "breeze release-management start-beta-process": [
+        {
+            "name": "Start beta process flags",
+            "options": [
+                "--version",
+                "--task-sdk-version",
+                "--remote-name",
+            ],
+        }
     ],
     "breeze release-management start-rc-process": [
         {
@@ -496,6 +608,21 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--stable-versions",
                 "--publish-all-docs",
                 "--skip-write-to-stable-folder",
+                "--skip-packages-metadata",
+                "--packages-metadata-only",
+            ],
+        }
+    ],
+    "breeze release-management publish-schemas-to-s3": [
+        {
+            "name": "Publish schemas to S3",
+            "options": [
+                "--execution-api",
+                "--supervisor",
+                "--dag",
+                "--destination-location",
+                "--overwrite",
+                "--dry-run",
             ],
         }
     ],
@@ -505,6 +632,8 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             "options": [
                 "--python",
                 "--airflow-constraints-mode",
+                "--constraints-file",
+                "--save-constraints-to",
                 "--github-repository",
                 "--github-token",
             ],
@@ -515,6 +644,7 @@ RELEASE_MANAGEMENT_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--diff-mode",
                 "--package",
                 "--explain-why",
+                "--cooldown-days",
             ],
         },
         {

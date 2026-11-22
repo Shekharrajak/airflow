@@ -20,6 +20,13 @@ name: Non-core Distribution tests
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      merge-with:
+        description: >-
+          The base branch commit and merge base to merge the pushed commit with, space-separated;
+          empty outside fork CI runs.
+        required: false
+        default: ""
+        type: string
       # Static inputs defined to choose which distribution to test to run
       runners:
         description: "The array of labels (in json form) determining runners."
@@ -75,7 +82,9 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runners) }}
     strategy:
       fail-fast: false
-      max-parallel: 20
+      # 20 keeps runs on GitHub-hosted runners within the ASF limit of 20 concurrent jobs. The RunsOn
+      # runners are the project's own capacity, so a run there starts the whole matrix at once.
+      max-parallel: ${{ contains(inputs.runners, 'runs-on=') && 256 || 20 }}
       matrix:
         python-version: "${{fromJSON(inputs.python-versions)}}"
     env:
@@ -88,11 +97,16 @@ jobs:
     steps:
       - name: "Cleanup repo"
         shell: bash
-        run: docker run -v "${GITHUB_WORKSPACE}:/workspace" -u 0:0 bash -c "rm -rf /workspace/*"
+        run: sudo rm -rf ${GITHUB_WORKSPACE}/*
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: "Merge with the base branch"
+        if: inputs.merge-with != ''
+        uses: ./.github/actions/merge-with-base
+        with:
+          merge-with: ${{ inputs.merge-with }}
       - name: "Prepare breeze & CI image: ${{ matrix.python-version }}"
         uses: ./.github/actions/prepare_breeze_and_image
         with:

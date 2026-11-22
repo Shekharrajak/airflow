@@ -18,10 +18,9 @@
  */
 import { create } from "zustand";
 
-import type { ParamsSpec, ParamSpec } from "src/queries/useDagParams";
+import type { ParamsSpec, ParamSpec, ParamValue } from "src/queries/useDagParams";
 
 export const paramPlaceholder: ParamSpec = {
-  // eslint-disable-next-line unicorn/no-null
   description: null,
   schema: {
     const: undefined,
@@ -66,7 +65,7 @@ const createParamStore = () =>
           return {};
         }
 
-        const parsedConf = JSON.parse(confString) as Record<string, unknown>;
+        const parsedConf = JSON.parse(confString) as Record<string, ParamValue>;
         const baseDict =
           Object.keys(state.initialParamDict).length > 0 ? state.initialParamDict : state.paramsDict;
 
@@ -80,10 +79,9 @@ const createParamStore = () =>
             updatedParamsDictEntries.push([
               key,
               {
-                // eslint-disable-next-line unicorn/no-null
                 description: baseParam.description ?? null,
                 schema: baseParam.schema,
-                value: parsedConf[key],
+                value: parsedConf[key] ?? null,
               },
             ]);
           }
@@ -97,7 +95,6 @@ const createParamStore = () =>
             updatedParamsDictEntries.push([
               key,
               {
-                // eslint-disable-next-line unicorn/no-null
                 description: existingParam?.description ?? null,
                 schema: existingParam?.schema ?? paramPlaceholder.schema,
                 value,
@@ -123,11 +120,9 @@ const createParamStore = () =>
           2,
         );
 
-        if (state.conf === newConf && JSON.stringify(state.paramsDict) === JSON.stringify(newParamsDict)) {
-          return {};
-        }
-
-        return { conf: newConf, paramsDict: newParamsDict };
+        return state.conf === newConf && JSON.stringify(state.paramsDict) === JSON.stringify(newParamsDict)
+          ? {}
+          : { conf: newConf, paramsDict: newParamsDict };
       }),
   }));
 

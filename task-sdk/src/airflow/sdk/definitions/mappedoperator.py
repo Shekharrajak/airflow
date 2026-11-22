@@ -21,7 +21,7 @@ import contextlib
 import copy
 import warnings
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
 import attrs
 import methodtools
@@ -51,6 +51,7 @@ from airflow.sdk.definitions._internal.expandinput import (
     is_mappable,
 )
 from airflow.sdk.definitions._internal.types import NOTSET
+from airflow.sdk.definitions.external_clear import SupportsExternalClearTarget
 
 if TYPE_CHECKING:
     import datetime
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     )
     from airflow.sdk.definitions.operator_resources import Resources
     from airflow.sdk.definitions.param import ParamsDict
+    from airflow.sdk.definitions.retry_policy import RetryPolicy
     from airflow.sdk.types import WeightRuleParam
     from airflow.triggers.base import StartTriggerArgs
 
@@ -213,7 +215,6 @@ class OperatorPartial:
         return self._expand(ListOfDictsExpandInput(kwargs), strict=strict)
 
     def _expand(self, expand_input: ExpandInput, *, strict: bool) -> MappedOperator:
-        from airflow.providers.standard.operators.empty import EmptyOperator
         from airflow.sdk import BaseSensorOperator
         from airflow.sdk.bases.skipmixin import SkipMixin
 
@@ -226,6 +227,16 @@ class OperatorPartial:
         task_group = partial_kwargs.pop("task_group")
         start_date = partial_kwargs.pop("start_date", None)
         end_date = partial_kwargs.pop("end_date", None)
+        start_from_trigger = (
+            partial_kwargs["start_from_trigger"]
+            if "start_from_trigger" in partial_kwargs
+            else getattr(self.operator_class, "start_from_trigger", False)
+        )
+        start_trigger_args = (
+            partial_kwargs["start_trigger_args"]
+            if "start_trigger_args" in partial_kwargs
+            else getattr(self.operator_class, "start_trigger_args", None)
+        )
 
         try:
             operator_name = self.operator_class.custom_operator_name  # type: ignore
@@ -244,9 +255,15 @@ class OperatorPartial:
             template_fields_renderers=self.operator_class.template_fields_renderers,
             ui_color=self.operator_class.ui_color,
             ui_fgcolor=self.operator_class.ui_fgcolor,
-            is_empty=issubclass(self.operator_class, EmptyOperator),
+            # Only a class attribute set to True counts; a property cannot be evaluated without an instance.
+            # A mapped task's clear target is known only once it runs, so an operator that reports one runs.
+            is_empty=(
+                self.operator_class.inherits_from_empty_operator is True
+                and not issubclass(self.operator_class, SupportsExternalClearTarget)
+            ),
             is_sensor=issubclass(self.operator_class, BaseSensorOperator),
             can_skip_downstream=issubclass(self.operator_class, SkipMixin),
+            is_stub=self.operator_class.is_stub,
             task_module=self.operator_class.__module__,
             task_type=self.operator_class.__name__,
             operator_name=operator_name,
@@ -259,8 +276,8 @@ class OperatorPartial:
             # to BaseOperator.expand() contribute to operator arguments.
             expand_input_attr="expand_input",
             # TODO: Move these to task SDK's BaseOperator and remove getattr
-            start_trigger_args=getattr(self.operator_class, "start_trigger_args", None),
-            start_from_trigger=bool(getattr(self.operator_class, "start_from_trigger", False)),
+            start_trigger_args=start_trigger_args,
+            start_from_trigger=start_from_trigger,
         )
         return op
 
@@ -298,12 +315,14 @@ class MappedOperator(AbstractOperator):
     _is_empty: bool = attrs.field(alias="is_empty")
     _can_skip_downstream: bool = attrs.field(alias="can_skip_downstream")
     _is_sensor: bool = attrs.field(alias="is_sensor", default=False)
+    is_stub: bool = False
     _task_module: str
     task_type: str
     _operator_name: str
     start_trigger_args: StartTriggerArgs | None
     start_from_trigger: bool
     _needs_expansion: bool = True
+    returns_dag_result: bool = False
 
     dag: DAG | None
     task_group: TaskGroup | None
@@ -324,10 +343,6 @@ class MappedOperator(AbstractOperator):
 
     This should be a name to call ``getattr()`` on.
     """
-
-    HIDE_ATTRS_FROM_UI: ClassVar[frozenset[str]] = AbstractOperator.HIDE_ATTRS_FROM_UI | frozenset(
-        ("parse_time_mapped_ti_count", "operator_class", "start_trigger_args", "start_from_trigger")
-    )
 
     def __hash__(self):
         return id(self)
@@ -354,7 +369,7 @@ class MappedOperator(AbstractOperator):
     @classmethod
     def get_serialized_fields(cls):
         # Not using 'cls' here since we only want to serialize base fields.
-        return (frozenset(attrs.fields_dict(MappedOperator))) - {
+        return frozenset(attrs.fields_dict(MappedOperator)) - {
             "_is_empty",
             "_can_skip_downstream",
             "dag",
@@ -369,6 +384,7 @@ class MappedOperator(AbstractOperator):
             "_needs_expansion",
             "partial_kwargs",
             "operator_extra_links",
+            "is_stub",
         }
 
     @property
@@ -547,6 +563,14 @@ class MappedOperator(AbstractOperator):
         self.partial_kwargs["retry_exponential_backoff"] = value
 
     @property
+    def retry_policy(self) -> RetryPolicy | None:
+        return self.partial_kwargs.get("retry_policy")
+
+    @retry_policy.setter
+    def retry_policy(self, value: RetryPolicy | None) -> None:
+        self.partial_kwargs["retry_policy"] = value
+
+    @property
     def priority_weight(self) -> int:
         return self.partial_kwargs.get("priority_weight", DEFAULT_PRIORITY_WEIGHT)
 
@@ -641,6 +665,10 @@ class MappedOperator(AbstractOperator):
     @property
     def has_on_skipped_callback(self) -> bool:
         return bool(self.on_skipped_callback)
+
+    @property
+    def has_retry_policy(self) -> bool:
+        return bool(self.retry_policy)
 
     @property
     def run_as_user(self) -> str | None:
@@ -773,6 +801,7 @@ class MappedOperator(AbstractOperator):
         op.is_setup = is_setup
         op.is_teardown = is_teardown
         op.on_failure_fail_dagrun = on_failure_fail_dagrun
+        op.returns_dag_result = self.returns_dag_result
         op.downstream_task_ids = self.downstream_task_ids
         op.upstream_task_ids = self.upstream_task_ids
         return op

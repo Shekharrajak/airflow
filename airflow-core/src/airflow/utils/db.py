@@ -67,14 +67,8 @@ _USE_PSYCOPG3: bool
 try:
     from importlib.util import find_spec
 
-    import sqlalchemy
-    from packaging.version import Version
-
     is_psycopg3 = find_spec("psycopg") is not None
-    sqlalchemy_version = Version(sqlalchemy.__version__)
-    is_sqla2 = (sqlalchemy_version.major, sqlalchemy_version.minor, sqlalchemy_version.micro) >= (2, 0, 0)
-
-    _USE_PSYCOPG3 = is_psycopg3 and is_sqla2
+    _USE_PSYCOPG3 = is_psycopg3
 except (ImportError, ModuleNotFoundError):
     _USE_PSYCOPG3 = False
 
@@ -116,6 +110,9 @@ _REVISION_HEADS_MAP: dict[str, str] = {
     "3.1.0": "cc92b33c6709",
     "3.1.8": "509b94a1042d",
     "3.2.0": "1d6611b6ab7c",
+    "3.3.0": "d2f4e1b3c5a7",
+    "3.4.0": "b4f1a7d2c903",
+    "3.5.0": "c64b10719069",
 }
 
 # Prefix used to identify tables holding data moved during migration.
@@ -151,19 +148,28 @@ def timeout_with_traceback(seconds, message="Operation timed out"):
         raise TimeoutException(message)
 
     # Set the signal handler
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
+    timeout_supported = False
+    try:
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
+        timeout_supported = True
+    except (AttributeError, ValueError):
+        log.warning(
+            "timeout_with_traceback requires signal.SIGALRM and the main thread. "
+            "Proceeding without a timeout."
+        )
 
     try:
         yield
     finally:
-        # Cancel the alarm and restore the old handler
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        if timeout_supported:
+            # Cancel the alarm and restore the old handler
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
 
 @provide_session
-def merge_conn(conn: Connection, session: Session = NEW_SESSION):
+def merge_conn(conn: Connection, *, session: Session = NEW_SESSION):
     """Add new Connection."""
     if not session.scalar(select(1).where(conn.__class__.conn_id == conn.conn_id)):
         session.add(conn)
@@ -171,7 +177,7 @@ def merge_conn(conn: Connection, session: Session = NEW_SESSION):
 
 
 @provide_session
-def add_default_pool_if_not_exists(session: Session = NEW_SESSION):
+def add_default_pool_if_not_exists(*, session: Session = NEW_SESSION):
     """Add default pool if it does not exist."""
     from airflow.models.pool import Pool
 
@@ -187,12 +193,12 @@ def add_default_pool_if_not_exists(session: Session = NEW_SESSION):
 
 
 @provide_session
-def create_default_connections(session: Session = NEW_SESSION):
+def create_default_connections(*, session: Session = NEW_SESSION):
     """Create default Airflow connections."""
     conns = get_default_connections()
 
     for c in conns:
-        merge_conn(c, session)
+        merge_conn(c, session=session)
 
 
 def get_default_connections():
@@ -826,7 +832,7 @@ def _single_connection_pool() -> Generator[None, None, None]:
 
 
 @provide_session
-def initdb(session: Session = NEW_SESSION, use_migration_files: bool = False):
+def initdb(*, session: Session = NEW_SESSION, use_migration_files: bool = False):
     """
     Initialize Airflow database.
 
@@ -1008,7 +1014,7 @@ def synchronize_log_template(*, session: Session = NEW_SESSION) -> None:
     from airflow.models.tasklog import LogTemplate
 
     metadata = reflect_tables([LogTemplate], session)
-    log_template_table: Table | None = metadata.tables.get(LogTemplate.__tablename__)
+    log_template_table: Table | None = metadata.tables.get(LogTemplate.__table__.key)
 
     if log_template_table is None:
         log.info("Log template table does not exist (added in 2.3.0); skipping log template sync.")
@@ -1069,12 +1075,19 @@ def synchronize_log_template(*, session: Session = NEW_SESSION) -> None:
         session.add(LogTemplate(filename=filename, elasticsearch_id=elasticsearch_id))
 
 
-def reflect_tables(tables: list[MappedClassProtocol | str] | None, session):
+def reflect_tables(tables: Sequence[MappedClassProtocol | str] | None, session, schema: str | None = None):
     """
     When running checks prior to upgrades, we use reflection to determine current state of the database.
 
     This function gets the current state of each table in the set of models
     provided and returns a SqlAlchemy metadata object containing them.
+
+    A string entry in ``tables`` may be schema-qualified using dot notation (e.g.
+    ``"celery.celery_taskmeta"``) to reflect a table from a non-default schema; the returned
+    metadata's ``tables`` mapping is then keyed by that same ``schema.table`` string. When
+    ``tables`` is ``None``, ``schema`` selects which schema to reflect in full (default: the
+    connection's default schema); SQLAlchemy keys every reflected table by ``schema.table`` in
+    that case too, whenever a non-``None`` schema was given.
     """
     import sqlalchemy.schema
 
@@ -1082,21 +1095,61 @@ def reflect_tables(tables: list[MappedClassProtocol | str] | None, session):
     metadata = sqlalchemy.schema.MetaData()
 
     if tables is None:
-        metadata.reflect(bind=bind, resolve_fks=False)
+        metadata.reflect(bind=bind, schema=schema, resolve_fks=False)
     else:
         for tbl in tables:
             try:
-                table_name = tbl if isinstance(tbl, str) else tbl.__tablename__
-                metadata.reflect(bind=bind, only=[table_name], extend_existing=True, resolve_fks=False)
+                tbl_schema: str | None
+                if isinstance(tbl, str):
+                    tbl_schema, sep, name = tbl.partition(".")
+                    if not sep:
+                        tbl_schema, name = None, tbl
+                else:
+                    # Preserve the mapped class's own configured schema; see PR #70793.
+                    name = tbl.__tablename__
+                    tbl_schema = inspect(tbl, raiseerr=True).local_table.schema
+                metadata.reflect(
+                    bind=bind, schema=tbl_schema, only=[name], extend_existing=True, resolve_fks=False
+                )
             except exc.InvalidRequestError:
                 continue
     return metadata
 
 
+def check_team_names_can_be_lower_cased(*, session: Session) -> Iterable[str]:
+    """
+    Yield an error for each group of stored team names that cannot be folded to lower case.
+
+    Team names became lower case only, and a migration rewrites the stored ones. Names that
+    differ only in case collapse onto a single row, which would silently merge two teams -- one
+    would inherit the other's Dag bundles, Connections, Variables, Pools and Triggers. Nothing
+    here can choose which name survives, so migration stops and the operator renames one first.
+    """
+    from collections import defaultdict
+
+    from airflow.models.team import Team
+
+    if not inspect(session.get_bind()).has_table(Team.__tablename__):
+        return
+
+    by_lower: dict[str, list[str]] = defaultdict(list)
+    for name in Team.get_all_team_names(session=session):
+        by_lower[name.lower()].append(name)
+
+    for lowered, names in sorted(by_lower.items()):
+        if len(names) > 1:
+            yield (
+                f"Teams {', '.join(repr(name) for name in sorted(names))} differ only in case and "
+                f"would both become '{lowered}'. Rename all but one with `airflow teams create` / "
+                "`airflow teams delete`, moving its Dag bundles, Connections, Variables and Pools "
+                "across, before migrating."
+            )
+
+
 @provide_session
-def _check_migration_errors(session: Session = NEW_SESSION) -> Iterable[str]:
+def _check_migration_errors(*, session: Session = NEW_SESSION) -> Iterable[str]:
     """:session: session of the sqlalchemy."""
-    check_functions: Iterable[Callable[..., Iterable[str]]] = ()
+    check_functions: Iterable[Callable[..., Iterable[str]]] = (check_team_names_can_be_lower_cased,)
     for check_fn in check_functions:
         log.debug("running check function %s", check_fn.__name__)
         yield from check_fn(session=session)
@@ -1193,6 +1246,13 @@ def _run_upgradedb(
         current_revision = _get_current_revision(session=work_session)
         with _configured_alembic_environment() as env:
             source_heads = env.script.get_heads()
+
+        # End the read-only transaction from _get_current_revision before
+        # external DB manager migrations, which may run DDL that is blocked by
+        # open transactions (e.g. CREATE INDEX CONCURRENTLY). The advisory lock
+        # from create_global_lock() is unaffected: it is session-level and held
+        # on a separate connection.
+        work_session.rollback()
 
         if current_revision == source_heads[0] and not _SKIP_EXTERNAL_DB_MANAGERS_UPGRADE.get():
             external_db_manager = RunDBManager()
@@ -1317,7 +1377,7 @@ def _resetdb_default(session: Session) -> None:
 
 
 @provide_session
-def resetdb(session: Session = NEW_SESSION, skip_init: bool = False, use_migration_files: bool = False):
+def resetdb(*, session: Session = NEW_SESSION, skip_init: bool = False, use_migration_files: bool = False):
     """
     Clear out the database.
 
@@ -1456,7 +1516,7 @@ def _handle_fab_downgrade(*, session: Session) -> None:
         from airflow.providers.fab.auth_manager.models.db import FABDBManager
     except ImportError:
         raise RuntimeError(
-            "Import error occurred while importing FABDBManager. The apache-airflow-provider-fab package must be installed before we can "
+            "Import error occurred while importing FABDBManager. The apache-airflow-providers-fab package must be installed before we can "
             "downgrade to <3.0.0."
         )
 
@@ -1504,7 +1564,7 @@ def drop_airflow_moved_tables(connection):
 
 
 @provide_session
-def check(session: Session = NEW_SESSION):
+def check(*, session: Session = NEW_SESSION):
     """
     Check if the database works.
 
@@ -1567,7 +1627,12 @@ def _create_global_lock_mysql(lock: DBLocks, lock_timeout: int) -> Generator[Non
 def _create_global_lock_postgresql(
     session: Session, lock: DBLocks, lock_timeout: int
 ) -> Generator[None, None, None]:
-    """Create a global advisory lock for PostgreSQL using transactional advisory locks."""
+    """
+    Create a global advisory lock for PostgreSQL using session-level advisory locks.
+
+    The lock connection stays in an open transaction while the lock is held, which keeps it
+    on one server connection behind a transaction-pooling PgBouncer.
+    """
     bind = session.get_bind()
     if hasattr(bind, "connect"):
         conn = bind.connect()
@@ -1582,10 +1647,13 @@ def _create_global_lock_postgresql(
                 text("SELECT set_config('lock_timeout', :timeout, false)"),
                 {"timeout": str(lock_timeout)},
             )
-            conn.execute(text("SELECT pg_advisory_lock(:id)"), {"id": lock.value})
         else:
             conn.execute(text("SET LOCK_TIMEOUT to :timeout"), {"timeout": lock_timeout})
-            conn.execute(text("SELECT pg_advisory_lock(:id)"), {"id": lock.value})
+        # The last statement run on this connection before the yield must have no bound parameter:
+        # under psycopg3 a parameterized statement keeps its snapshot while the connection sits idle
+        # in transaction, and CREATE INDEX CONCURRENTLY run by a migration in this process would
+        # wait on it forever.
+        conn.execute(text(f"SELECT pg_advisory_lock({int(lock.value)})"))
 
         yield
     finally:
@@ -1619,7 +1687,7 @@ def create_global_lock(
     - GET_LOCK is session-level, not transaction-level
     - DDL operations cause implicit commits that would break transaction wrappers
 
-    For PostgreSQL, uses transactional advisory locks as before.
+    For PostgreSQL, uses a session-level advisory lock, held while the connection stays in a transaction.
     """
     dialect_name = get_dialect_name(session)
 
@@ -1699,6 +1767,9 @@ def _normalize_mysql_server_default(default: Any) -> str | None:
         return None
 
     normalized = str(default).strip().strip("'\"").lower()
+    # MySQL reflects expression defaults with escaped quotes and a charset introducer,
+    # e.g. unhex(_utf8mb4\'00ff\') for a model default of UNHEX('00ff').
+    normalized = re.sub(r"\b_[a-z0-9]+(?=')", "", normalized.replace("\\'", "'"))
     while normalized.startswith("(") and normalized.endswith(")"):
         normalized = normalized[1:-1].strip()
     normalized = normalized.replace(" ", "")

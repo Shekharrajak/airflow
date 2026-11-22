@@ -20,6 +20,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { useTableURLState } from "src/components/DataTable/useTableUrlState";
 import type { FilterValue, DateRangeValue } from "src/components/FilterBar";
+
 import { useFilterConfigs } from "src/constants/filterConfigs";
 import { SearchParamsKeys } from "src/constants/searchParams";
 
@@ -56,43 +57,75 @@ const handleDateRangeChange = (
 };
 
 export type FilterableSearchParamsKeys =
+  | SearchParamsKeys.ACTIVE
   | SearchParamsKeys.ASSET_EVENT_DATE_RANGE
   | SearchParamsKeys.BODY_SEARCH
   | SearchParamsKeys.BUNDLE_VERSION
+  | SearchParamsKeys.COMPLETED_AT_RANGE
   | SearchParamsKeys.CONF_CONTAINS
+  | SearchParamsKeys.CONSUMING_ASSET_PATTERN
   | SearchParamsKeys.CREATED_AT_RANGE
   | SearchParamsKeys.DAG_DISPLAY_NAME_PATTERN
   | SearchParamsKeys.DAG_ID
   | SearchParamsKeys.DAG_ID_PATTERN
   | SearchParamsKeys.DAG_VERSION
+  | SearchParamsKeys.DEADLINE_TIME_RANGE
   | SearchParamsKeys.DURATION_GTE
   | SearchParamsKeys.DURATION_LTE
   | SearchParamsKeys.END_DATE_RANGE
   | SearchParamsKeys.EVENT_DATE_RANGE
   | SearchParamsKeys.EVENT_TYPE
   | SearchParamsKeys.EXECUTOR_CLASS
+  | SearchParamsKeys.FAVORITE
+  | SearchParamsKeys.FROM_RANGE
+  | SearchParamsKeys.GROUP_PATTERN
+  | SearchParamsKeys.HAS_EVENTS
+  | SearchParamsKeys.HAS_IMPORT_ERRORS
   | SearchParamsKeys.HOSTNAME
   | SearchParamsKeys.JOB_STATE
   | SearchParamsKeys.JOB_TYPE
   | SearchParamsKeys.KEY_PATTERN
+  | SearchParamsKeys.LAST_ASSET_EVENT_TIMESTAMP_RANGE
   | SearchParamsKeys.LOGICAL_DATE_RANGE
+  | SearchParamsKeys.LOOP
   | SearchParamsKeys.MAP_INDEX
+  | SearchParamsKeys.MAX_ACTIVE_RUNS_GTE
+  | SearchParamsKeys.MAX_ACTIVE_RUNS_LTE
+  | SearchParamsKeys.MISSED
   | SearchParamsKeys.NAME_PATTERN
+  | SearchParamsKeys.NEEDS_REVIEW
   | SearchParamsKeys.OPERATOR_NAME_PATTERN
+  | SearchParamsKeys.OWNERS
+  | SearchParamsKeys.PARTITION_KEY
   | SearchParamsKeys.PARTITION_KEY_PATTERN
+  | SearchParamsKeys.PARTITION_STATUS
+  | SearchParamsKeys.PAUSED
   | SearchParamsKeys.POOL_NAME_PATTERN
   | SearchParamsKeys.QUEUE_NAME_PATTERN
+  | SearchParamsKeys.RENDERED_MAP_INDEX
+  | SearchParamsKeys.REPROCESS_BEHAVIOR
   | SearchParamsKeys.RESPONDED_BY_USER_NAME
   | SearchParamsKeys.RESPONSE_RECEIVED
   | SearchParamsKeys.RUN_AFTER_RANGE
   | SearchParamsKeys.RUN_ID
   | SearchParamsKeys.RUN_ID_PATTERN
+  | SearchParamsKeys.RUN_STATE
   | SearchParamsKeys.RUN_TYPE
+  | SearchParamsKeys.SOURCE_MAP_INDEX
+  | SearchParamsKeys.SOURCE_RUN_ID
   | SearchParamsKeys.START_DATE_RANGE
   | SearchParamsKeys.STATE
   | SearchParamsKeys.SUBJECT_SEARCH
+  | SearchParamsKeys.TAGS
   | SearchParamsKeys.TASK_ID
   | SearchParamsKeys.TASK_ID_PATTERN
+  | SearchParamsKeys.TASK_STATE
+  | SearchParamsKeys.TEAMS
+  | SearchParamsKeys.TIMETABLE_TYPE
+  | SearchParamsKeys.TO_RANGE
+  | SearchParamsKeys.TRIGGER_KIND
+  | SearchParamsKeys.TRIGGER_STATUS
+  | SearchParamsKeys.TRIGGERER_HOSTNAME
   | SearchParamsKeys.TRIGGERING_USER_NAME_PATTERN
   | SearchParamsKeys.TRY_NUMBER
   | SearchParamsKeys.USER;
@@ -108,7 +141,13 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
   const initialValues: Record<string, FilterValue> = {};
 
   filterConfigs.forEach((config) => {
-    if (config.type === "daterange") {
+    if (config.fromSearchParams) {
+      const value = config.fromSearchParams(searchParams);
+
+      if (value !== undefined) {
+        initialValues[config.key] = value;
+      }
+    } else if (config.type === "daterange") {
       // Handle daterange filters using startKey and endKey
       const startDate =
         config.startKey !== undefined && config.startKey !== ""
@@ -126,6 +165,12 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
           startDate: startDate ?? undefined,
         };
       }
+    } else if (config.type === "multiselect") {
+      const values = searchParams.getAll(config.key).filter((value) => value !== "");
+
+      if (values.length > 0) {
+        initialValues[config.key] = values;
+      }
     } else {
       // Handle other filter types
       const value = searchParams.get(config.key);
@@ -142,8 +187,12 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
     }
   });
 
-  const handleFiltersChange = (filters: Record<string, FilterValue>) => {
+  const handleFiltersChange = (
+    filters: Record<string, FilterValue>,
+    { clearKeys = [] }: { readonly clearKeys?: ReadonlyArray<string> } = {},
+  ) => {
     setTableURLState({
+      cursor: undefined,
       pagination: { ...pagination, pageIndex: 0 },
       sorting,
     });
@@ -156,8 +205,26 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
 
         newParams.delete(config.key);
 
-        if (config.type === "daterange") {
+        if (config.toSearchParams) {
+          Object.entries(config.toSearchParams(value)).forEach(([paramKey, paramValue]) => {
+            if (paramValue === undefined || paramValue === "") {
+              newParams.delete(paramKey);
+            } else {
+              newParams.set(paramKey, paramValue);
+            }
+          });
+        } else if (config.type === "daterange") {
           handleDateRangeChange(newParams, value as DateRangeValue | null, config);
+        } else if (config.type === "multiselect") {
+          const values = Array.isArray(value) ? value.filter((entry) => entry !== "") : [];
+
+          values.forEach((entry) => newParams.append(config.key, entry));
+
+          // The match mode belongs to this pill but is not a filter key of its own, so
+          // nothing else would ever clear it.
+          if (config.matchModeKey !== undefined && values.length === 0) {
+            newParams.delete(config.matchModeKey);
+          }
         } else if (value === null || value === undefined || value === "") {
           newParams.delete(config.key);
         } else {
@@ -165,7 +232,9 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
         }
       });
 
+      clearKeys.forEach((key) => newParams.delete(key));
       newParams.delete(SearchParamsKeys.OFFSET);
+      newParams.delete(SearchParamsKeys.CURSOR);
 
       return newParams;
     });

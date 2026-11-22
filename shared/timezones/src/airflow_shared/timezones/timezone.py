@@ -107,7 +107,9 @@ def make_aware(value: DateTime, timezone: dt.tzinfo | None = None) -> DateTime: 
 
 
 @overload
-def make_aware(value: dt.datetime, timezone: dt.tzinfo | None = None) -> dt.datetime: ...
+def make_aware(  # type: ignore[overload-cannot-match]
+    value: dt.datetime, timezone: dt.tzinfo | None = None
+) -> dt.datetime: ...
 
 
 def make_aware(value: dt.datetime | None, timezone: dt.tzinfo | None = None) -> dt.datetime | None:
@@ -200,7 +202,9 @@ def coerce_datetime(v: DateTime, tz: dt.tzinfo | None = None) -> DateTime: ...
 
 
 @overload
-def coerce_datetime(v: dt.datetime, tz: dt.tzinfo | None = None) -> DateTime: ...
+def coerce_datetime(  # type: ignore[overload-cannot-match]
+    v: dt.datetime, tz: dt.tzinfo | None = None
+) -> DateTime: ...
 
 
 def coerce_datetime(v: dt.datetime | None, tz: dt.tzinfo | None = None) -> DateTime | None:
@@ -230,6 +234,17 @@ def td_format(td_object: None | dt.timedelta | float | int) -> str | None:
     """
     if td_object is None:
         return None
+
+    prefix = ""
+    if isinstance(td_object, dt.timedelta):
+        if td_object < dt.timedelta(0):
+            prefix = "-"
+            td_object = -td_object
+    elif isinstance(td_object, (int, float)):
+        if td_object < 0:
+            prefix = "-"
+            td_object = -td_object
+
     if isinstance(td_object, dt.timedelta):
         delta = relativedelta() + td_object
     else:
@@ -254,7 +269,7 @@ def td_format(td_object: None | dt.timedelta | float | int) -> str | None:
     joined = ":".join(part for part in parts if part)
     if not joined:
         return "<1s"
-    return joined
+    return f"{prefix}{joined}"
 
 
 def parse_timezone(name: str | int) -> FixedTimezone | Timezone:

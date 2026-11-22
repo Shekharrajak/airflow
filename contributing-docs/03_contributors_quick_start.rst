@@ -113,21 +113,30 @@ Docker Community Edition
 
 Colima
 ------
-If you use Colima as your container runtimes engine, please follow the next steps:
+If you use Colima as your container runtime, prefer Docker contexts / ``DOCKER_HOST`` over
+symlinking sockets into ``/var/run`` (that can break Docker Desktop or other engines).
 
-1. `Install buildx manually <https://github.com/docker/buildx#manual-download>`_ and follow its instructions
+1. `Install buildx manually <https://github.com/docker/buildx#manual-download>`_ if your
+   Colima install does not already provide it, and follow its instructions.
 
-2. Link the Colima socket to the default socket path. Note that this may break other Docker servers
-
-.. code-block:: bash
-
-  sudo ln -sf $HOME/.colima/default/docker.sock /var/run/docker.sock
-
-3. Change docker context to use default
+2. Start Colima and select its Docker context (Colima creates a ``colima`` context for the
+   default profile):
 
 .. code-block:: bash
 
-  docker context use default
+  colima start
+  docker context use colima
+  docker info
+
+3. Optionally set ``DOCKER_HOST`` (or pass ``breeze --docker-host``) so tools pick Colima
+   even when another context is current:
+
+.. code-block:: bash
+
+  export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+
+If you previously symlinked Colima into ``/var/run/docker.sock``, remove that symlink when
+you switch back to Docker Desktop or another engine.
 
 Docker Compose
 --------------
@@ -228,6 +237,19 @@ Forking and cloning Project
    to clone the repo locally (you can also do it in your IDE - see the `Using your IDE`_
    chapter below)
 
+4. Add ``apache/airflow`` as the ``upstream`` remote, following the
+   `Git remote naming conventions <10_working_with_git.rst>`__:
+
+   .. code-block:: bash
+
+      git remote add upstream https://github.com/apache/airflow.git
+
+   If you use SSH with GitHub, add ``git@github.com:apache/airflow.git`` instead; ``breeze ci audit``
+   recognises both forms.
+
+   Once Breeze is installed, run ``breeze ci audit`` before your first push to check your remotes
+   and the CI in your fork; see `CI in your fork <18_contribution_workflow.rst#ci-in-your-fork>`__.
+
 .. note::
     For windows based machines, on cloning, the Git line endings may be different from unix based systems
     and might lead to unexpected behaviour on running breeze tooling. Manually setting a property will mitigate this issue.
@@ -261,8 +283,8 @@ To avoid burden on our CI infrastructure and to save time, prek hooks can be run
     We have recently started to recommend ``uv`` for our local development.
 
 .. note::
-    Remember to have global python set to Python >= 3.10 - Python 3.10 is end-of-life already and we've
-    started to use Python 3.10+ features in Airflow and accompanying scripts.
+    Remember to have global python set to Python >= 3.11 - Python 3.10 reaches end-of-life in October 2026 and we've
+    started to use Python 3.11+ features in Airflow and accompanying scripts.
 
 Installing prek is best done with ``uv`` (recommended) or ``pipx``.
 
@@ -410,33 +432,23 @@ syndrome - because not only others can reproduce easily what you do, but also th
 the same environment to run all tests - so you should be able to easily reproduce the same failures you
 see in CI in your local environment.
 
-1. Install ``uv`` or ``pipx``. We recommend to install ``uv`` as the general purpose python development
-   environment - you can install it via https://docs.astral.sh/uv/getting-started/installation/ or you can
-   install ``pipx`` (>=1.2.1) - follow the instructions in `Install pipx <https://pipx.pypa.io/stable/>`_
-   It is important to install version of pipx >= 1.2.1 to workaround ``packaging`` breaking change introduced
-   in September 2023
+1. Install ``uv``. You can install it via https://docs.astral.sh/uv/getting-started/installation/.
+   ``uv`` is the recommended general-purpose Python development environment for Airflow.
 
-2. Run ``uv tool install -e ./dev/breeze`` (or ``pipx install -e ./dev/breeze``) in your checked-out
-   repository. Make sure to follow any instructions printed during the installation - this is needed
-   to make sure that the ``breeze`` command is available in your PATH
+2. Run ``./scripts/tools/setup_breeze`` in your checked-out repository. This installs a small shim
+   at ``~/.local/bin/breeze`` that runs Breeze via ``uv run --locked`` from the current git
+   worktree's ``dev/breeze`` folder, so each worktree (including ephemeral ones used by coding
+   agents) gets its own Breeze, tied to that worktree's sources and to the dependency versions
+   pinned in ``dev/breeze/uv.lock``. See
+   `ADR 0017 <../dev/breeze/doc/adr/0017-use-uvx-to-run-breeze-from-local-sources.md>`_ for the
+   rationale.
 
-.. warning::
-
-  If you see below warning while running pipx - it means that you have hit the
-  `known issue <https://github.com/pypa/pipx/issues/1092>`_ with ``packaging`` version 23.2:
-
-  .. code-block:: bash
-
-    ⚠️ Ignoring --editable install option. pipx disallows it for anything but a local path,
-    to avoid having to create a new src/ directory.
-
-  The workaround is to downgrade packaging to 23.1 and re-running the ``pipx install`` command, for example
-  by running ``pip install "packaging<23.2"``.
-
-  .. code-block:: bash
-
-     pip install "packaging==23.1"
-     pipx install -e ./dev/breeze --force
+   The legacy global install path (``uv tool install -e ./dev/breeze`` or
+   ``pipx install -e ./dev/breeze``) still works for users who explicitly want a single shared
+   install, but it is no longer the recommended approach and conflicts with the shim (both target
+   ``~/.local/bin/breeze``). If you previously installed Breeze that way, uninstall it first
+   (``uv tool uninstall apache-airflow-breeze`` or ``pipx uninstall apache-airflow-breeze``) before
+   running ``setup_breeze``.
 
 3. Initialize breeze autocomplete
 
@@ -448,7 +460,7 @@ see in CI in your local environment.
 
 .. code-block:: bash
 
-  breeze --python 3.10 --backend postgres
+  breeze --python 3.11 --backend postgres
 
 .. note::
    If you encounter an error like "docker.credentials.errors.InitializationError:
@@ -478,10 +490,10 @@ see in CI in your local environment.
 
    .. code-block:: bash
 
-      breeze --python 3.10 --backend postgres
+      breeze --python 3.11 --backend postgres
 
 
-5. When you enter the Breeze environment you should see a prompt similar to ``[Breeze:3.10.19] root@e4756f6ac886:/opt/airflow#``. This
+5. When you enter the Breeze environment you should see a prompt similar to ``[Breeze:3.11.16] root@e4756f6ac886:/opt/airflow#``. This
    means that you are inside the Breeze container and ready to run most of the development tasks. You can leave
    the environment with ``exit`` and re-enter it with just ``breeze`` command
 
@@ -491,11 +503,11 @@ see in CI in your local environment.
 
 .. code-block:: bash
 
-  [Breeze:3.10.19] root@b76fcb399bb6:/opt/airflow# airflow db reset
+  [Breeze:3.11.16] root@b76fcb399bb6:/opt/airflow# airflow db reset
 
 .. code-block:: bash
 
-   [Breeze:3.10.19] root@b76fcb399bb6:/opt/airflow# airflow users create \
+   [Breeze:3.11.16] root@b76fcb399bb6:/opt/airflow# airflow users create \
                 --username admin \
                 --firstname FIRST_NAME \
                 --lastname LAST_NAME \
@@ -511,7 +523,7 @@ see in CI in your local environment.
 
 .. code-block:: bash
 
-  [Breeze:3.10.19] root@b76fcb399bb6:/opt/airflow# exit
+  [Breeze:3.11.16] root@b76fcb399bb6:/opt/airflow# exit
 
 8. You can stop the environment (which means deleting the databases and database servers running in the
    background) via ``breeze down`` command
@@ -525,7 +537,7 @@ Using Breeze
 ------------
 
 1. Starting the Breeze environment using ``breeze start-airflow`` starts the Breeze environment with last configuration run(
-   In this case Python version and backend are picked up from last execution ``breeze --python 3.10 --backend postgres``)
+   In this case Python version and backend are picked up from last execution ``breeze --python 3.11 --backend postgres``)
    It also automatically starts the API server (FastAPI api and UI), triggerer, dag processor and scheduler. It drops you in tmux with triggerer to the right, and
    Scheduler, API server (FastAPI api and UI), Dag processor from left to right at the bottom. Use ``[Ctrl + B] and Arrow keys`` to navigate.
 
@@ -536,9 +548,9 @@ Using Breeze
       Use CI image.
 
    Branch name:            main
-   Docker image:           ghcr.io/apache/airflow/main/ci/python3.10:latest
+   Docker image:           ghcr.io/apache/airflow/main/ci/python3.11:latest
    Airflow source version: 2.4.0.dev0
-   Python version:         3.10
+   Python version:         3.11
    Backend:                mysql 5.7
 
    * Port forwarding:
@@ -575,7 +587,7 @@ Using Breeze
 
   .. code-block:: bash
 
-    breeze --python 3.10 --backend postgres
+    breeze --python 3.11 --backend postgres
 
   2. Open tmux
 
@@ -640,24 +652,34 @@ Using Breeze
              alt="Connecting to postgresql">
       </div>
 
-4. Stopping breeze
+4. Stopping Breeze
 
-If ``breeze`` was started with ``breeze start-airflow``, this command will stop breeze and Airflow:
+If Breeze was started with ``breeze start-airflow``, first exit the terminal multiplexer so that the
+Breeze container stops and releases its forwarded ports:
+
+* With mprocs (the default), press ``q`` in the mprocs interface.
+* With tmux, run ``stop_airflow`` from the main shell pane:
 
 .. code-block:: bash
 
-  [Breeze:3.10.19] root@f3619b74c59a:/opt/airflow# stop_airflow
+  [Breeze:3.11.16] root@f3619b74c59a:/opt/airflow# stop_airflow
+
+After returning to the host shell, stop the remaining Docker Compose services:
+
+.. code-block:: bash
+
   breeze down
 
-If ``breeze`` was started with ``breeze --python 3.10 --backend postgres`` (or similar):
+If ``breeze`` was started with ``breeze --python 3.11 --backend postgres`` (or similar):
 
 .. code-block:: bash
 
-  [Breeze:3.10.19] root@f3619b74c59a:/opt/airflow# exit
+  [Breeze:3.11.16] root@f3619b74c59a:/opt/airflow# exit
   breeze down
 
 .. note::
-    ``stop_airflow`` is available only when ``breeze`` is started with ``breeze start-airflow``.
+    ``stop_airflow`` is available only when ``breeze start-airflow`` uses tmux. Use ``q`` to quit
+    the default mprocs interface.
 
 Using tmux Instead of mprocs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -680,10 +702,10 @@ You can also switch terminal multiplexer via breeze config:
 
 .. code-block:: bash
 
-  breeze setup config --terminal_multiplexer tmux
-  breeze setup config --terminal_multiplexer mprocs
+  breeze setup config --terminal-multiplexer tmux
+  breeze setup config --terminal-multiplexer mprocs
 
-** Benefits of using tmux:**
+**Benefits of using tmux:**
 
 * Familiar terminal multiplexer for many developers
 * More control over panes and windows
@@ -748,9 +770,9 @@ All Tests are inside ./tests directory.
 
 .. code-block:: bash
 
-   [Breeze:3.10.19] root@63528318c8b1:/opt/airflow# pytest tests/utils/test_dates.py
+   [Breeze:3.11.16] root@63528318c8b1:/opt/airflow# pytest tests/utils/test_dates.py
    ============================================================= test session starts ==============================================================
-   platform linux -- Python 3.10.20, pytest-8.3.3, pluggy-1.5.0 -- /usr/python/bin/python
+   platform linux -- Python 3.11.16, pytest-8.3.3, pluggy-1.5.0 -- /usr/python/bin/python
    cachedir: .pytest_cache
    rootdir: /opt/airflow
    configfile: pyproject.toml
@@ -770,20 +792,20 @@ All Tests are inside ./tests directory.
 
 .. code-block:: bash
 
-   breeze --backend postgres --postgres-version 15 --python 3.10 --db-reset testing tests --test-type All
+   breeze --backend postgres --postgres-version 15 --python 3.11 --db-reset testing tests --test-type All
 
 - Running specific type of test
 
   .. code-block:: bash
 
-    breeze --backend postgres --postgres-version 15 --python 3.10 --db-reset testing tests --test-type Core
+    breeze --backend postgres --postgres-version 15 --python 3.11 --db-reset testing tests --test-type Core
 
 
 - Running Integration test for specific test type
 
   .. code-block:: bash
 
-   breeze --backend postgres --postgres-version 15 --python 3.10 --db-reset testing tests --test-type All --integration mongo
+   breeze --backend postgres --postgres-version 15 --python 3.11 --db-reset testing tests --test-type All --integration mongo
 
 - For more information on Testing visit |09_testing.rst|
 
@@ -885,7 +907,7 @@ If you are familiar with Python development and use your favourite editors, Airf
 similarly to other projects of yours. However, if you need specific instructions for your IDE you
 will find more detailed instructions here:
 
-* `Pycharm/IntelliJ <quick-start-ide/contributors_quick_start_pycharm_intellij.rst>`_
+* `PyCharm/IntelliJ <quick-start-ide/contributors_quick_start_pycharm_intellij.rst>`_
 * `Visual Studio Code <quick-start-ide/contributors_quick_start_vscode.rst>`_
 
 

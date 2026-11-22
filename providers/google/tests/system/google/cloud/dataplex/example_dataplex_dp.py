@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Example Airflow DAG that shows how to use Dataplex Scan Data.
+Example Airflow DAG that shows how to use Knowledge Catalog Scan Data.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ SCHEMA = [
     {"name": "dt", "type": "STRING", "mode": "NULLABLE"},
 ]
 
-INSERT_DATE = datetime.now().strftime("%Y-%m-%d")
+INSERT_DATE = "{{ ds }}"
 INSERT_ROWS_QUERY = f"INSERT {DATASET}.{TABLE_1} VALUES (1, 'test test2', '{INSERT_DATE}');"
 LOCATION = "us"
 
@@ -134,7 +134,7 @@ with DAG(
     DAG_ID,
     start_date=datetime(2021, 1, 1),
     schedule="@once",
-    tags=["example", "dataplex", "data_profile"],
+    tags=["example", "knowledge-catalog", "data_profile"],
 ) as dag:
     create_dataset = BigQueryCreateEmptyDatasetOperator(task_id="create_dataset", dataset_id=DATASET)
     create_table_1 = BigQueryCreateTableOperator(
@@ -347,5 +347,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

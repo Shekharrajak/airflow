@@ -19,13 +19,46 @@
 from __future__ import annotations
 
 import os
-from abc import ABC
-from typing import TYPE_CHECKING
+from abc import ABC, abstractmethod
+from collections.abc import Hashable
+from enum import Enum
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from airflow.configuration import conf
+
 if TYPE_CHECKING:
     from airflow.api_fastapi.auth.tokens import JWTGenerator
+    from airflow.executors.workloads.types import WorkloadState
+
+
+class WorkloadType(str, Enum):
+    """Central registry of executor workload types."""
+
+    EXECUTE_TASK = "ExecuteTask"
+    EXECUTE_CALLBACK = "ExecuteCallback"
+    TEST_CONNECTION = "TestConnection"
+
+
+# Central executor priority registry: tuple is ordered from highest priority to lowest.
+#
+# Connection tests are short-lived and user-interactive, so they sort ahead of tasks:
+# otherwise a sustained task backlog would starve them until the reaper times them out.
+#
+# Adding a ``WorkloadType`` member: the aliases are enforced by
+# ``test_workload_families_track_every_workload_type``; the ``isinstance`` chains in
+# ``BaseExecutor.run_workload``, ``state_class_for_key`` and
+# ``SchedulerJobRunner.process_executor_events`` must be extended by hand.
+_workload_type_priority_order = (
+    WorkloadType.EXECUTE_CALLBACK,
+    WorkloadType.TEST_CONNECTION,
+    WorkloadType.EXECUTE_TASK,
+)
+
+WORKLOAD_TYPE_PRIORITY: dict[WorkloadType, int] = {
+    name: idx for idx, name in enumerate(_workload_type_priority_order)
+}
 
 
 class BaseWorkload:
@@ -62,6 +95,13 @@ class BundleInfo(BaseModel):
 
     name: str
     version: str | None = None
+    version_data: dict[str, Any] | None = None
+    """Optional structured metadata for this bundle version (e.g., an S3 object manifest).
+
+    This field is serialized on every workload payload — executor command-line argv for
+    K8s/ECS/Batch/Lambda, message body for Celery/SQS. Keep payloads small to avoid hitting
+    transport limits (ARG_MAX is ~128 KB on Linux; the etcd PodSpec ceiling is ~1.5 MB).
+    """
 
 
 class BaseWorkloadSchema(BaseModel):
@@ -72,9 +112,30 @@ class BaseWorkloadSchema(BaseModel):
     token: str = Field(repr=False)
     """The identity token for this workload"""
 
-    @staticmethod
-    def generate_token(sub_id: str, generator: JWTGenerator | None = None) -> str:
-        return generator.generate({"sub": sub_id}) if generator else ""
+    token_scope: ClassVar[str] = "workload"
+    """Scope claim stamped into tokens minted for this workload type."""
+
+    @classmethod
+    def generate_token(cls, sub_id: str, generator: JWTGenerator | None = None) -> str:
+        if not generator:
+            return ""
+        valid_for = conf.getfloat("scheduler", "task_queued_timeout")
+        return generator.generate(
+            extras={"sub": sub_id, "scope": cls.token_scope},
+            valid_for=valid_for,
+        )
+
+    @property
+    def sort_key(self) -> int:
+        """
+        Return the sort key for ordering workloads within the same priority.
+
+        The default of ``0`` gives FIFO behaviour (Python's stable sort preserves
+        insertion order among equal keys).  Override in subclasses that need
+        priority ordering within their priority group — for example, ``ExecuteTask`` returns
+        ``-self.ti.priority_weight`` so that higher-weight tasks are scheduled first.
+        """
+        return 0
 
 
 class BaseDagBundleWorkload(BaseWorkloadSchema, ABC):
@@ -83,3 +144,71 @@ class BaseDagBundleWorkload(BaseWorkloadSchema, ABC):
     dag_rel_path: os.PathLike[str]  # Filepath where the DAG can be found (likely prefixed with `DAG_FOLDER/`)
     bundle_info: BundleInfo
     log_path: str | None  # Rendered relative log filename template the task logs should be written to.
+
+    @property
+    @abstractmethod
+    def key(self) -> Hashable:
+        """
+        Return the unique key identifying this workload instance.
+
+        Used by executors for tracking queued/running workloads and reporting results.
+        Must be a hashable value suitable for use in sets and as dict keys.
+
+        Must be implemented by subclasses.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def display_name(self) -> str:
+        """
+        Return a human-readable name for this workload, suitable for logging and process titles.
+
+        Used by executors to set worker process titles and log messages.
+
+        Must be implemented by subclasses.
+
+        Example::
+
+            # For a task workload:
+            return str(self.ti.id)  # "4d828a62-a417-4936-a7a6-2b3fabacecab"
+
+            # For a callback workload:
+            return str(self.callback.id)  # "12345678-1234-5678-1234-567812345678"
+
+            # Results in process titles like:
+            # "airflow worker -- LocalExecutor: 4d828a62-a417-4936-a7a6-2b3fabacecab"
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def success_state(self) -> WorkloadState:
+        """
+        Return the state value representing successful completion of this workload type.
+
+        Must be implemented by subclasses.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def failure_state(self) -> WorkloadState:
+        """
+        Return the state value representing failed completion of this workload type.
+
+        Must be implemented by subclasses.
+        """
+        ...
+
+    @property
+    def running_state(self) -> WorkloadState | None:
+        """
+        Return the state value representing that this workload is actively running.
+
+        Called by the executor worker *before* execution begins. Subclasses may override
+        this to emit an intermediate state transition (e.g. callbacks need
+        QUEUED → RUNNING → SUCCESS/FAILED). Returns ``None`` by default, meaning
+        no intermediate state is emitted.
+        """
+        return None

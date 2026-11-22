@@ -210,6 +210,26 @@ lot less resources wasted on idle Operators or Sensors:
     :end-before: [END howto_operator_gke_start_pod_xcom_async]
 
 
+.. _howto/operator:GKEPodExecOperator:
+
+Execute a command in an existing Pod
+""""""""""""""""""""""""""""""""""""
+
+Use :class:`~airflow.providers.google.cloud.operators.kubernetes_engine.GKEPodExecOperator` to execute a
+command in a running container of an existing Pod using Google Cloud credentials. The operator discovers the
+GKE cluster endpoint, so a Kubernetes connection or ``kube_config`` file is not required.
+
+The Pod and container must already exist and be running. The operator streams the command output and waits for
+its exit code, but it does not create, restart, or delete the Pod. For more information about command execution,
+output, and XCom behavior, see :ref:`howto/operator:KubernetesPodExecOperator`.
+
+.. exampleinclude:: /../../google/tests/system/google/cloud/kubernetes_engine/example_kubernetes_engine.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_gke_pod_exec]
+    :end-before: [END howto_operator_gke_pod_exec]
+
+
 .. _howto/operator:GKEStartJobOperator:
 
 Run a Job on a GKE cluster
@@ -358,6 +378,31 @@ resume Job in the specified Google Kubernetes Engine cluster.
     :dedent: 4
     :start-after: [START howto_operator_gke_resume_job]
     :end-before: [END howto_operator_gke_resume_job]
+
+Sovereign Cloud from Google guidance
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+In the Sovereign Cloud from Google environments, the practical question for Kubernetes Engine
+is which operator parameters to set. For most of the operators, the answer is easy: ``use_dns_endpoint=True``.
+
+For example:
+
+.. code-block:: python
+
+    GKEStartPodOperator(
+        ...,
+        use_dns_endpoint=True,
+    )
+
+
+.. warning::
+  Please be cautious with the configuration parameters for the operators which requires to start a ``sidecar`` container
+  on the Sovereign Cloud from Google environments.
+
+  Currently, the operators which tries to push something to XCom (with ``do_xcom_push=True`` parameter)
+  do **not** work properly on the Sovereign Cloud from Google environments due to they require sidecar containers.
+
+For further information, take a look at the official documentation for
+the `Sovereign Cloud from Google <https://cloud.google.com/sovereign-cloud>`__
 
 Reference
 ^^^^^^^^^

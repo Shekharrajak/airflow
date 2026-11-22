@@ -49,7 +49,7 @@ To provide the database credentials to Airflow, you have 2 options - in your val
 Values file
 ^^^^^^^^^^^
 
-This is the simpler options, as the chart will create a Kubernetes Secret for you. However, keep in mind your credentials will be in your values file.
+This is the simpler option, as the chart will create a Kubernetes Secret for you. However, keep in mind your credentials will be in your values file.
 
 .. code-block:: yaml
    :caption: values.yaml
@@ -88,6 +88,39 @@ After secret creation, configure the chart to use the secret:
    data:
      metadataSecretName: mydatabase
 
+If your secret stores the connection string under a key other than ``connection`` (for
+example, `CloudNativePG <https://cloudnative-pg.io/>`_ generates credential secrets with
+the connection URI under the ``uri`` key), set ``metadataSecretKey`` accordingly:
+
+.. code-block:: yaml
+   :caption: values.yaml
+
+   data:
+     metadataSecretName: mydatabase-app
+     metadataSecretKey: uri
+
+Similarly, ``resultBackendSecretKey`` and ``brokerUrlSecretKey`` configure the key names
+used with ``resultBackendSecretName`` and ``brokerUrlSecretName``. All of these default to
+``connection`` and only apply when the corresponding secret name is provided.
+
+Keeping database credentials away from Celery workers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Task code runs on Celery workers, so anything in the worker's environment is readable by it. Celery
+workers need the metadata database only as the default Celery result backend, and they keep
+``AIRFLOW__DATABASE__SQL_ALCHEMY_CONN`` for that reason. To remove it, give Celery a separate result
+backend with ``data.resultBackendConnection``, ``data.resultBackendSecretName`` or
+``config.celery.result_backend``. A backend in the same database needs its own database user, limited to the
+Celery result tables, or the workers still hold the metadata database credentials. A backend set any other
+way, such as ``env`` or ``secret``, is not detected and the worker keeps the connection. A separate result
+backend needs ``apache-airflow-providers-celery`` 3.12.4 or newer. KEDA reads the
+connection from the worker's environment, so workers scaled by it always keep the credentials.
+
+Containers without the connection fall back to SQLite, and engine arguments that SQLite does not accept make
+Airflow fail at import. The chart clears ``sql_alchemy_engine_args`` there when it is set through
+``config.database``, so set it that way rather than through ``env``: Kerberos sidecars have no environment of
+their own to override it in.
+
 .. _production-guide:pgbouncer:
 
 Metadata DB Cleanup
@@ -113,8 +146,8 @@ If you are using PostgreSQL as your database, you will likely want to enable `Pg
 Due to distributed nature of Airflow, it can open a lot of database connections. Using a connection pooler can significantly
 reduce the number of open connections on the database.
 
-Database credentials stored Values file
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Database credentials stored in Values file
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: yaml
    :caption: values.yaml
@@ -123,8 +156,8 @@ Database credentials stored Values file
      enabled: true
 
 
-Database credentials stored Kubernetes Secret
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Database credentials stored in Kubernetes Secret
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The default connection string in this case will not work. You need to modify accordingly the Kubernetes secret:
 
@@ -218,10 +251,6 @@ API Secret Key
 You should set a static API secret key when deploying with Airflow chart as it will help ensure
 your Airflow components only restart when necessary.
 
-.. note::
-
-   This section also applies to the webserver for Airflow 2 (simply replace ``api`` with ``webserver``).
-
 .. warning::
 
    You should use a different secret key for every instance you run, as this key is used to sign
@@ -248,7 +277,6 @@ Follow below steps to create static API secret key:
       :caption: values.yaml
 
       apiSecretKeySecretName: my-api-secret
-      # Where the random key is under `webserver-secret-key` in the k8s Secret
 
    .. warning::
 
@@ -265,6 +293,88 @@ generated using the secret key has a short expiry time though. Make sure that ti
 that you run Airflow components on is synchronized (for example using ntpd). You might get
 "forbidden" errors when the logs are accessed otherwise.
 
+Fernet Key
+----------
+
+Airflow uses a Fernet key to encrypt sensitive data, such as connection passwords, stored in the metadata database.
+See :doc:`Fernet <apache-airflow:security/secrets/fernet>` for background on how this works. If you do not provide a
+key, the chart generates one and stores it in the ``<RELEASE_NAME>-fernet-key`` Kubernetes Secret the first time you
+run ``helm install``.
+
+.. warning::
+
+   The chart only creates that Secret on ``helm install`` -- it is not re-created or otherwise updated by
+   ``helm upgrade``. This applies both to the auto-generated key and to a key you pass through ``fernetKey`` in the values file. To rotate the Fernet key, you need to manage the Secret yourself, as described below.
+
+To provide your own key, either set ``fernetKey`` in the values file:
+
+.. code-block:: yaml
+   :caption: values.yaml
+
+   fernetKey: <fernet_key>
+
+.. warning::
+
+   Due to security concerns, it is advised to use a Kubernetes Secret instead of setting the Fernet key directly in
+   the values file. Never commit a ``values.yaml`` containing a plaintext Fernet key to version control.
+
+or create your own Kubernetes Secret containing a ``fernet-key`` key with a base64-encoded value, and point the chart at it with ``fernetKeySecretName``:
+
+.. code-block:: bash
+
+   kubectl create secret generic my-fernet-key --from-literal="fernet-key=<fernet_key>"
+
+.. code-block:: yaml
+   :caption: values.yaml
+
+   fernetKeySecretName: my-fernet-key
+
+.. note::
+
+   ``kubectl create secret`` only creates an object in the cluster -- it is not tracked anywhere else. Manage this
+   Secret through your Infrastructure-as-a-Code process (for example, a GitOps repository, a Sealed Secret, or
+   an External Secrets Operator resource) so it is not lost on a cluster migration or a full redeploy.
+
+Rotating the Fernet key
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Once connections, variables and triggers have been encrypted with a Fernet key, changing the key outright makes the
+existing encrypted values unreadable. To rotate the key without losing access to them, follow the same procedure as
+:doc:`Rotating encryption keys <apache-airflow:security/secrets/fernet>`, applied to the Kubernetes Secret that backs
+``AIRFLOW__CORE__FERNET_KEY``:
+
+#. Make sure you are using a self-managed Secret through ``fernetKeySecretName``
+#. Update the ``fernet-key`` value in that Secret to a comma-separated list ``new_fernet_key,old_fernet_key``, using
+   the same ``kubectl create secret`` command as above with ``--dry-run=client -o yaml`` piped into ``kubectl apply``
+   so it updates the existing Secret in place instead of failing because it already exists:
+
+   .. code-block:: bash
+
+      kubectl create secret generic my-fernet-key \
+        --from-literal="fernet-key=new_fernet_key,old_fernet_key" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+   Then restart the Airflow components (for example with ``kubectl rollout restart``) so they pick up the new value
+#. Run ``airflow rotate-fernet-key``, in one of the Airflow components pods, to re-encrypt existing connections, variables and triggers with the new key.
+#. Update the Secret, so it only contains ``new_fernet_key``, and restart the components once more:
+
+   .. code-block:: bash
+
+      kubectl create secret generic my-fernet-key \
+        --from-literal="fernet-key=new_fernet_key" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+JWT Secret
+----------
+
+You should set a static JWT Secret key when deploying with Airflow chart as it will increase environment
+stability. It can be achieved by using ``jwtSecretName`` field in the ``values.yaml`` file.
+
+.. note::
+
+   For increase security of production setup, consider creating custom JWT Secret rollover procedure which will
+   not cause failures in dag runs due to mismatch in tokens.
+
 Eviction configuration
 ----------------------
 When running Airflow along with the `Kubernetes Cluster Autoscaler <https://github.com/kubernetes/autoscaler>`_, it is important to configure whether pods can be safely evicted.
@@ -274,14 +384,19 @@ This setting can be configured in the Airflow chart at different levels:
    :caption: values.yaml
 
    workers:
-     safeToEvict: true
+     celery:
+       safeToEvict: true
+     kubernetes:
+       safeToEvict: true
    scheduler:
      safeToEvict: true
    apiServer:
      safeToEvict: true
 
-``workers.safeToEvict`` defaults to ``false``, and when using ``KubernetesExecutor``
-``workers.safeToEvict`` shouldn't be set to ``true`` as the workers may be removed before finishing.
+.. note::
+
+   ``workers.kubernetes.safeToEvict`` defaults to ``false`` as it shouldn't be set to ``true``,
+   because the tasks may be removed before finishing.
 
 Extending and customizing Airflow Image
 ---------------------------------------
@@ -304,7 +419,7 @@ Typical scenarios where you would like to use your custom image are adding:
 * custom tools needed in your deployment.
 
 See :ref:`Extending Airflow Image <quick-start:extending-airflow-image>` and/or
-`Building the image <https://airflow.apache.org/docs/docker-stack/build.html>`_ for more
+`Building your image <https://airflow.apache.org/docs/docker-stack/build.html>`_ for more
 details on how you can extend, customize and test the modifications of Airflow image.
 
 Managing Dag Files
@@ -378,6 +493,55 @@ Ingress
 You can create and configure ``Ingress`` objects. See the :ref:`Ingress chart parameters <parameters:ingress>`.
 For more information on ``Ingress``, see the
 `Kubernetes Ingress documentation <https://kubernetes.io/docs/concepts/services-networking/ingress/>`_.
+
+Gateway API (HTTPRoute)
+^^^^^^^^^^^^^^^^^^^^^^^
+
+As an alternative to ``Ingress``, the chart can create
+`Kubernetes Gateway API <https://gateway-api.sigs.k8s.io/>`_ ``HTTPRoute`` resources for the API server and Flower.
+This requires the Gateway API CRDs to be installed in the cluster and a ``Gateway`` to already exist —
+the chart only creates the ``HTTPRoute`` resources and attaches them to the Gateway via ``parentRefs``.
+
+.. code-block:: yaml
+   :caption: values.yaml
+
+   executor: CeleryExecutor
+
+   apiServer:
+     httpRoute:
+       enabled: true
+       parentRefs:
+         - name: main-gateway
+           namespace: gateway-system
+           sectionName: https
+       hostnames:
+         - airflow.example.com
+
+   flower:
+     enabled: true
+     httpRoute:
+       enabled: true
+       parentRefs:
+         - name: main-gateway
+           namespace: gateway-system
+           sectionName: https
+       hostnames:
+         - flower.example.com
+
+Flower HTTPRoute resources are only created when Flower itself is created, so ``flower.enabled`` must be
+``true`` and the executor must include ``CeleryExecutor``.
+
+For fine-grained routing, supply ``apiServer.httpRoute.rules`` or ``flower.httpRoute.rules`` directly —
+the entry mirrors the upstream ``HTTPRouteRule`` schema and overrides the default rule generated from
+the corresponding ``apiServer.httpRoute.path`` and ``apiServer.httpRoute.pathType``, or
+``flower.httpRoute.path`` and ``flower.httpRoute.pathType`` values.
+
+.. note::
+
+   ``HTTPRoute`` is an alternative to ``Ingress`` for the same component, so enable only one routing
+   mechanism for each component. Enabling both for the same component fails template rendering.
+   When an ``HTTPRoute`` is enabled, the chart also verifies (via Helm ``Capabilities``) that the Gateway
+   API CRDs are installed and fails with a clear message if they are not.
 
 LoadBalancer Service
 ^^^^^^^^^^^^^^^^^^^^
@@ -466,7 +630,7 @@ If you are using a Datadog agent in your environment, this will enable Airflow t
 Celery Backend
 --------------
 
-If you are using ``CeleryExecutor`` or ``CeleryKubernetesExecutor``, you can bring your own Celery backend.
+If you are using ``CeleryExecutor``, you can bring your own Celery backend.
 
 By default, the chart will deploy Redis. However, you can use any supported Celery backend instead:
 
@@ -487,7 +651,7 @@ Security Context
 Constraints
 ^^^^^^^^^^^
 
-A ``Security Context Constraint`` (SCC) is a OpenShift construct that works as a RBAC rule. However, it targets Pods instead of users.
+A ``Security Context Constraint`` (SCC) is an OpenShift construct that works as an RBAC rule. However, it targets Pods instead of users.
 When defining a SCC, one can control actions and resources a POD can perform or access during startup and runtime.
 
 The SCCs are split into different levels or categories with the ``restricted`` SCC being the default one assigned to Pods.
@@ -644,6 +808,28 @@ This will generate the following scheduler deployment:
            - name: scheduler
          ...
 
+Omitting default ``securityContext`` values
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+On OpenShift, the ``restricted`` SCC assigns ``runAsUser`` and ``fsGroup`` automatically and rejects Pods
+that request specific values without the ``anyuid`` SCC in place. Since an empty ``securityContexts.pod``
+falls back to :ref:`uid <parameters:Airflow>` / :ref:`gid <parameters:Airflow>` (as shown above), leaving
+it empty is not enough to avoid hard-coded values. Set ``securityContexts.disableDefaults`` to stop the
+chart from filling in these defaults wherever ``securityContexts.pod`` / ``securityContexts.containers``
+(or the equivalent per-component overrides) are left empty:
+
+.. code-block:: yaml
+   :caption: values.yaml
+
+   securityContexts:
+     disableDefaults: true
+
+This omits ``runAsUser`` / ``fsGroup`` (pod) and ``runAsUser`` (container) from the rendered
+``securityContext`` entirely wherever they are not explicitly set, allowing the SCC to supply its own
+values. Explicit values set in ``securityContexts.pod`` / ``securityContexts.containers`` (or a
+component's local override, e.g. ``scheduler.securityContexts.pod``) still take priority over
+``disableDefaults``.
+
 Built-in secrets and environment variables
 ------------------------------------------
 
@@ -694,8 +880,6 @@ Here is the full list of secrets that can be disabled and replaced by ``_CMD`` a
 +-------------------------------------------------------+------------------------------------------+--------------------------------------------------+
 | ``<RELEASE_NAME>-jwt-secret``                         | ``.Values.jwtSecretName``                | ``AIRFLOW__API_AUTH__JWT_SECRET``                |
 +-------------------------------------------------------+------------------------------------------+--------------------------------------------------+
-| ``<RELEASE_NAME>-webserver-secret-key``               | ``.Values.webserverSecretKeySecretName`` | ``AIRFLOW__WEBSERVER__SECRET_KEY``               |
-+-------------------------------------------------------+------------------------------------------+--------------------------------------------------+
 | ``<RELEASE_NAME>-airflow-result-backend``             | ``.Values.data.resultBackendSecretName`` | ``AIRFLOW__CELERY__RESULT_BACKEND``              |
 +-------------------------------------------------------+------------------------------------------+--------------------------------------------------+
 | ``<RELEASE_NAME>-airflow-broker-url``                 | ``.Values.data.brokerUrlSecretName``     | ``AIRFLOW__CELERY__BROKER_URL``                  |
@@ -737,7 +921,7 @@ You can read more about advanced ways of setting configuration variables in the
 Service Account Token Volume Configuration
 ------------------------------------------
 
-When using pod-launching executors (``CeleryExecutor``, ``CeleryKubernetesExecutor``, ``KubernetesExecutor``, ``LocalKubernetesExecutor``),
+When using pod-launching executors (``CeleryExecutor``, ``KubernetesExecutor``),
 you can configure how Kubernetes service account tokens are mounted into pods. This provides enhanced security control
 and compatibility with security policies like Kyverno.
 
@@ -779,12 +963,12 @@ This container-specific approach ensures that:
 Configuration Options
 ^^^^^^^^^^^^^^^^^^^^^
 
-The service account token volume configuration is available for the scheduler component and includes the following options:
+The service account token volume configuration is available for the scheduler and cleanup component and includes the following options:
 
 .. code-block:: yaml
    :caption: values.yaml
 
-   scheduler:
+   (scheduler|cleanup):
      serviceAccount:
        automountServiceAccountToken: false
        serviceAccountTokenVolume:
@@ -817,9 +1001,7 @@ Supported Executors
 The service account token volume configuration is only effective for pod-launching executors:
 
 * ``CeleryExecutor`` - when launching Celery worker pods
-* ``CeleryKubernetesExecutor`` - for both Celery workers and Kubernetes task pods
 * ``KubernetesExecutor`` - when launching task pods in Kubernetes
-* ``LocalKubernetesExecutor`` - for Kubernetes task pods in local mode
 
 For other executors (``LocalExecutor``, ``SequentialExecutor``), this configuration has no effect
 as they don't launch additional pods.

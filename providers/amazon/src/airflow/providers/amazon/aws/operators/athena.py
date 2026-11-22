@@ -47,13 +47,19 @@ class AthenaOperator(AwsBaseOperator[AthenaHook]):
         :ref:`howto/operator:AthenaOperator`
 
     :param query: Trino/Presto query to be run on Amazon Athena. (templated)
-    :param database: Database to select. (templated)
+    :param database: Default database for query execution. (templated)
+        This argument is optional when the query does not require a default database,
+        such as when all referenced table names are fully qualified.
+        If omitted or set to ``None``, any ``Database`` value set in
+        the ``query_execution_context`` will be used instead.
     :param catalog: Catalog to select. (templated)
     :param output_location: s3 path to write the query results into. (templated)
-        To run the query, you must specify the query results location using one of the ways:
-        either for individual queries using either this setting (client-side),
-        or in the workgroup, using WorkGroupConfiguration.
-        If none of them is set, Athena issues an error that no output location is provided
+        The query results location comes from one of three places: this setting
+        (client-side), the workgroup, using WorkGroupConfiguration, or Athena itself
+        for a workgroup with managed query results. Leave this setting unset for such
+        a workgroup, since Athena rejects a query that also sets an output location.
+        If none of the three applies, Athena issues an error that no output location
+        is provided.
     :param client_request_token: Unique token created by user to avoid multiple executions of same query
     :param workgroup: Athena workgroup in which query will be run. (templated)
     :param query_execution_context: Context in which query need to be run
@@ -88,7 +94,7 @@ class AthenaOperator(AwsBaseOperator[AthenaHook]):
         self,
         *,
         query: str,
-        database: str,
+        database: str | None = None,
         output_location: str | None = None,
         client_request_token: str | None = None,
         workgroup: str = "primary",
@@ -122,7 +128,8 @@ class AthenaOperator(AwsBaseOperator[AthenaHook]):
 
     def execute(self, context: Context) -> str | None:
         """Run Trino/Presto Query on Amazon Athena."""
-        self.query_execution_context["Database"] = self.database
+        if self.database:
+            self.query_execution_context["Database"] = self.database
         self.query_execution_context["Catalog"] = self.catalog
         if self.output_location:
             self.result_configuration["OutputLocation"] = self.output_location
@@ -251,11 +258,13 @@ class AthenaOperator(AwsBaseOperator[AthenaHook]):
                 ],
             )
 
+        fallback_database = self.database or self.query_execution_context.get("Database")
+
         inputs: list[Dataset] = list(
             filter(
                 None,
                 [
-                    self.get_openlineage_dataset(table.schema or self.database, table.name)
+                    self.get_openlineage_dataset(table.schema or fallback_database, table.name)
                     for table in parse_result.in_tables
                 ],
             )
@@ -265,7 +274,7 @@ class AthenaOperator(AwsBaseOperator[AthenaHook]):
             filter(
                 None,
                 [
-                    self.get_openlineage_dataset(table.schema or self.database, table.name)
+                    self.get_openlineage_dataset(table.schema or fallback_database, table.name)
                     for table in parse_result.out_tables
                 ],
             )

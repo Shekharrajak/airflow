@@ -19,16 +19,28 @@ from __future__ import annotations
 
 import datetime
 import multiprocessing
+from typing import NamedTuple
 
-from airflow.sdk import timezone
-from airflow.sdk.configuration import conf
+
+class _CacheKey(NamedTuple):
+    """
+    Identifies one cache entry.
+
+    Kept as a tuple of its parts rather than a concatenated string: joining an
+    optional team segment onto the key is not injective, so two different entries
+    could compose the same string and share a slot.
+    """
+
+    prefix: str
+    team_name: str | None
+    key: str
 
 
 class SecretCache:
     """A static class to manage the global secret cache."""
 
     __manager: multiprocessing.managers.SyncManager | None = None
-    _cache: dict[str, _CacheValue] | None = None
+    _cache: dict[_CacheKey, _CacheValue] | None = None
     _ttl: datetime.timedelta
 
     class NotPresentException(Exception):
@@ -36,15 +48,30 @@ class SecretCache:
 
     class _CacheValue:
         def __init__(self, value: str | None) -> None:
+            from airflow.sdk import timezone
+
             self.value = value
             self.date = timezone.utcnow()
 
         def is_expired(self, ttl: datetime.timedelta) -> bool:
+            from airflow.sdk import timezone
+
             return timezone.utcnow() - self.date > ttl
 
     _VARIABLE_PREFIX = "__v_"
     _CONNECTION_PREFIX = "__c_"
-    _TEAM_PATTERN = "_{}_"
+
+    @staticmethod
+    def _key(prefix: str, team_name: str | None, key: str) -> _CacheKey:
+        """
+        Build the cache key for an entry.
+
+        The parts are kept separate rather than concatenated into a string.
+        Concatenating them is not injective when the team name is optional: a caller
+        with no team can choose a key that reproduces another team's composed string
+        and read that team's entry.
+        """
+        return _CacheKey(prefix=prefix, team_name=team_name, key=key)
 
     @classmethod
     def init(cls):
@@ -55,6 +82,8 @@ class SecretCache:
         """
         if cls._cache is not None:
             return
+        from airflow.sdk.configuration import conf
+
         use_cache = conf.getboolean(section="secrets", key="use_cache", fallback=False)
         if not use_cache:
             return
@@ -68,7 +97,7 @@ class SecretCache:
 
     @classmethod
     def reset(cls):
-        """Use for test purposes only."""
+        """Detach this process from the shared cache, including entries inherited across a fork."""
         cls._cache = None
 
     @classmethod
@@ -106,9 +135,7 @@ class SecretCache:
             # using an exception for misses allow to meaningfully cache None values
             raise cls.NotPresentException
 
-        team = cls._TEAM_PATTERN.format(team_name) if team_name else ""
-
-        val = cls._cache.get(f"{prefix}{team}{key}")
+        val = cls._cache.get(cls._key(prefix, team_name, key))
         if val and not val.is_expired(cls._ttl):
             return val.value
         raise cls.NotPresentException
@@ -129,13 +156,11 @@ class SecretCache:
     @classmethod
     def _save(cls, key: str, value: str | None, prefix: str, team_name: str | None = None):
         if cls._cache is not None:
-            team = cls._TEAM_PATTERN.format(team_name) if team_name else ""
-            cls._cache[f"{prefix}{team}{key}"] = cls._CacheValue(value)
+            cls._cache[cls._key(prefix, team_name, key)] = cls._CacheValue(value)
 
     @classmethod
     def invalidate_variable(cls, key: str, team_name: str | None = None):
         """Invalidate (actually removes) the value stored in the cache for that Variable."""
         if cls._cache is not None:
-            team = cls._TEAM_PATTERN.format(team_name) if team_name else ""
             # second arg ensures no exception if key is absent
-            cls._cache.pop(f"{cls._VARIABLE_PREFIX}{team}{key}", None)
+            cls._cache.pop(cls._key(cls._VARIABLE_PREFIX, team_name, key), None)

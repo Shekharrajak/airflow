@@ -1,47 +1,75 @@
-// generated with @7nohe/openapi-react-query-codegen@2.0.0
-import { type Options } from "@hey-api/client-axios";
-import { useMutation, UseMutationOptions, useQuery, UseQueryOptions } from "@tanstack/react-query";
+// generated with @7nohe/openapi-react-query-codegen@3.0.2
+import { useMutation, useQuery, type UseMutationOptions, type UseQueryOptions } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 
-import { createToken, createTokenAllAdmins, createTokenCli, loginAllAdmins } from "../requests/services.gen";
 import {
+  createToken,
+  createTokenAllAdmins,
+  createTokenCli,
+  loginAllAdmins,
+  type Options,
+} from "../requests/sdk.gen";
+import type {
+  CreateTokenAllAdminsData,
   CreateTokenAllAdminsError,
   CreateTokenCliData,
   CreateTokenCliError,
   CreateTokenData,
   CreateTokenError,
+  LoginAllAdminsData,
+  LoginAllAdminsError,
 } from "../requests/types.gen";
 import * as Common from "./common";
 
+/**
+ * Create Token All Admins
+ *
+ * Create a token with no credentials only if ``simple_auth_manager_all_admins`` is True.
+ */
 export const useCreateTokenAllAdmins = <
   TData = Common.CreateTokenAllAdminsDefaultResponse,
   TError = AxiosError<CreateTokenAllAdminsError>,
   TQueryKey extends Array<unknown> = unknown[],
 >(
-  clientOptions: Options<unknown, true> = {},
+  clientOptions: Options<CreateTokenAllAdminsData, true> = {},
   queryKey?: TQueryKey,
   options?: Omit<UseQueryOptions<TData, TError>, "queryKey" | "queryFn">,
 ) =>
   useQuery<TData, TError>({
     queryKey: Common.UseCreateTokenAllAdminsKeyFn(clientOptions, queryKey),
-    queryFn: () =>
-      createTokenAllAdmins({ ...clientOptions }).then((response) => response.data as TData) as TData,
+    queryFn: ({ signal }) =>
+      createTokenAllAdmins({ ...clientOptions, signal, throwOnError: true }).then(
+        (response) => response.data as TData,
+      ) as TData,
     ...options,
   });
+/**
+ * Login All Admins
+ *
+ * Login the user with no credentials.
+ */
 export const useLoginAllAdmins = <
   TData = Common.LoginAllAdminsDefaultResponse,
   TError = AxiosError<LoginAllAdminsError>,
   TQueryKey extends Array<unknown> = unknown[],
 >(
-  clientOptions: Options<unknown, true> = {},
+  clientOptions: Options<LoginAllAdminsData, true> = {},
   queryKey?: TQueryKey,
   options?: Omit<UseQueryOptions<TData, TError>, "queryKey" | "queryFn">,
 ) =>
   useQuery<TData, TError>({
     queryKey: Common.UseLoginAllAdminsKeyFn(clientOptions, queryKey),
-    queryFn: () => loginAllAdmins({ ...clientOptions }).then((response) => response.data as TData) as TData,
+    queryFn: ({ signal }) =>
+      loginAllAdmins({ ...clientOptions, signal, throwOnError: true }).then(
+        (response) => response.data as TData,
+      ) as TData,
     ...options,
   });
+/**
+ * Create Token
+ *
+ * Authenticate the user.
+ */
 export const useCreateToken = <
   TData = Common.CreateTokenMutationResult,
   TError = AxiosError<CreateTokenError>,
@@ -56,9 +84,15 @@ export const useCreateToken = <
 ) =>
   useMutation<TData, TError, Options<CreateTokenData, true>, TContext>({
     mutationKey: Common.UseCreateTokenKeyFn(mutationKey),
-    mutationFn: (clientOptions) => createToken(clientOptions) as unknown as Promise<TData>,
+    mutationFn: (clientOptions) =>
+      createToken({ ...clientOptions, throwOnError: true }) as unknown as Promise<TData>,
     ...options,
   });
+/**
+ * Create Token Cli
+ *
+ * Authenticate the user for the CLI.
+ */
 export const useCreateTokenCli = <
   TData = Common.CreateTokenCliMutationResult,
   TError = AxiosError<CreateTokenCliError>,
@@ -73,6 +107,7 @@ export const useCreateTokenCli = <
 ) =>
   useMutation<TData, TError, Options<CreateTokenCliData, true>, TContext>({
     mutationKey: Common.UseCreateTokenCliKeyFn(mutationKey),
-    mutationFn: (clientOptions) => createTokenCli(clientOptions) as unknown as Promise<TData>,
+    mutationFn: (clientOptions) =>
+      createTokenCli({ ...clientOptions, throwOnError: true }) as unknown as Promise<TData>,
     ...options,
   });

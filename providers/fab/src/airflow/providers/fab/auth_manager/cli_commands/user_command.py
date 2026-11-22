@@ -22,8 +22,8 @@ import functools
 import getpass
 import json
 import os
-import random
 import re
+import secrets
 import string
 from typing import Any
 
@@ -113,7 +113,8 @@ def user_reset_password(args):
 
 def _create_password(args):
     if args.use_random_password:
-        password = "".join(random.choices(string.printable, k=16))
+        characters = string.ascii_letters + string.digits + string.punctuation
+        password = "".join(secrets.choice(characters) for _ in range(16))
     elif args.password:
         password = args.password
     else:
@@ -262,13 +263,14 @@ def _import_users(users_list: list[dict[str, Any]]):
                 users_updated.append(user["email"])
             else:
                 print(f"Creating new user with email '{user['email']}'")
-                appbuilder.sm.add_user(
+                if not appbuilder.sm.add_user(
                     username=user["username"],
                     first_name=user["firstname"],
                     last_name=user["lastname"],
                     email=user["email"],
                     role=roles,
-                )
+                ):
+                    raise SystemExit(f"Failed to create user with email {user['email']!r}")
 
                 users_created.append(user["email"])
 

@@ -16,9 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useMemo } from "react";
+
 import { Field, Stack, Spinner } from "@chakra-ui/react";
 import { Select } from "chakra-react-select";
-import { useMemo } from "react";
 import { type Control, Controller, type FieldValues, type Path } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
@@ -62,7 +63,6 @@ export const TeamSelector = <T extends FieldValues = FieldValues>({ control }: P
                 data-testid="team-selector"
                 isClearable
                 isDisabled={isLoading}
-                // eslint-disable-next-line unicorn/no-null
                 onChange={(val) => onChange(val?.value ?? null)}
                 options={options}
                 placeholder={translate("team.selector.placeHolder")}

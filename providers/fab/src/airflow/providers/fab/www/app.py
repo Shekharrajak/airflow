@@ -18,11 +18,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from functools import cache
 from os.path import isabs
 
 from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from sqlalchemy.engine.url import make_url
 
@@ -32,11 +30,15 @@ from airflow.exceptions import AirflowConfigException
 from airflow.logging_config import configure_logging
 from airflow.providers.common.compat.sdk import conf
 from airflow.providers.fab.version_compat import AIRFLOW_V_3_1_8_PLUS
+from airflow.providers.fab.www.db import AirflowSQLAlchemy
 from airflow.providers.fab.www.extensions.init_appbuilder import init_appbuilder
 from airflow.providers.fab.www.extensions.init_jinja_globals import init_jinja_globals
 from airflow.providers.fab.www.extensions.init_manifest_files import configure_manifest_files
 from airflow.providers.fab.www.extensions.init_security import init_api_auth
-from airflow.providers.fab.www.extensions.init_session import init_airflow_session_interface
+from airflow.providers.fab.www.extensions.init_session import (
+    init_airflow_session_interface,
+    init_session_max_lifetime,
+)
 from airflow.providers.fab.www.extensions.init_views import (
     init_error_handlers,
     init_plugins,
@@ -59,6 +61,14 @@ def create_app(enable_plugins: bool):
     from airflow.providers.fab.auth_manager.fab_auth_manager import FabAuthManager
 
     flask_app = Flask(__name__)
+
+    @flask_app.after_request
+    def remove_duplicate_date_header(response):
+        # Remove the application-level Date header so the ASGI/WSGI server
+        # can emit a single Date header for the final response.
+        response.headers.pop("Date", None)
+        return response
+
     flask_app.secret_key = conf.get("api", "SECRET_KEY")
     flask_app.config["SQLALCHEMY_DATABASE_URI"] = conf.get("database", "SQL_ALCHEMY_CONN")
     flask_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -76,6 +86,15 @@ def create_app(enable_plugins: bool):
     with flask_app.app_context():
         flask_app.config.from_pyfile(webserver_config, silent=True)
 
+    # Bridge ``[fab] auth_role_public`` Airflow config into the Flask app config so legacy FAB
+    # code paths that read ``AUTH_ROLE_PUBLIC`` from ``current_app.config`` (e.g.
+    # ``AnonymousUser.roles``, basic_auth, kerberos_auth, security manager) stay in sync with
+    # the FastAPI-based auth flow. The Airflow config takes precedence over
+    # ``webserver_config.py`` when both are set so there is a single source of truth.
+    auth_role_public_conf = conf.get("fab", "auth_role_public", fallback="") or ""
+    if auth_role_public_conf:
+        flask_app.config["AUTH_ROLE_PUBLIC"] = auth_role_public_conf
+
     url = make_url(flask_app.config["SQLALCHEMY_DATABASE_URI"])
     if url.drivername == "sqlite" and url.database and not isabs(url.database):
         raise AirflowConfigException(
@@ -88,7 +107,7 @@ def create_app(enable_plugins: bool):
 
     csrf.init_app(flask_app)
 
-    db = SQLAlchemy(flask_app)
+    db = AirflowSQLAlchemy(flask_app)
     if settings.Session is None:
         raise RuntimeError("Session not configured. Call configure_orm() first.")
     db.session = settings.Session
@@ -111,17 +130,7 @@ def create_app(enable_plugins: bool):
             init_plugins(flask_app)
         elif isinstance(get_auth_manager(), FabAuthManager):
             init_airflow_session_interface(flask_app, db)
+            init_session_max_lifetime(flask_app)
         init_jinja_globals(flask_app, enable_plugins=enable_plugins)
         init_wsgi_middleware(flask_app)
     return flask_app
-
-
-@cache
-def cached_app():
-    """Return cached instance of Airflow WWW app."""
-    return create_app()
-
-
-def purge_cached_app():
-    """Remove the cached version of the app in global state."""
-    cached_app.cache_clear()

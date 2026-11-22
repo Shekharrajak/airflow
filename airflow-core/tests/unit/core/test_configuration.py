@@ -45,7 +45,18 @@ from airflow.configuration import (
 from airflow.providers_manager import ProvidersManager
 from airflow.sdk.execution_time.secrets import DEFAULT_SECRETS_SEARCH_PATH_WORKERS
 
-from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.config import (
+    CFG_FALLBACK_CONFIG_OPTIONS,
+    PROVIDER_METADATA_CONFIG_OPTIONS,
+    PROVIDER_METADATA_OVERRIDES_CFG_FALLBACK,
+    conf_vars,
+    create_fresh_airflow_config,
+)
+from tests_common.test_utils.fake_secrets_backend import (
+    FAKE_BACKEND_PATH,
+    FAKE_CONFIG_BACKEND_PATH,
+    FAKE_UNREACHABLE_BACKEND_PATH,
+)
 from tests_common.test_utils.markers import skip_if_force_lowest_dependencies_marker
 from tests_common.test_utils.reset_warning_registry import reset_warning_registry
 from unit.utils.test_config import (
@@ -415,37 +426,16 @@ class TestConf:
         ):
             assert test_conf.getboolean(section, key) is False
 
-    @skip_if_force_lowest_dependencies_marker
-    @mock.patch("airflow.providers.hashicorp._internal_client.vault_client.hvac")
     @conf_vars(
         {
-            ("secrets", "backend"): "airflow.providers.hashicorp.secrets.vault.VaultBackend",
-            ("secrets", "backend_kwargs"): '{"url": "http://127.0.0.1:8200", "token": "token"}',
+            ("secrets", "backend"): FAKE_CONFIG_BACKEND_PATH,
+            ("secrets", "backend_kwargs"): (
+                '{"config_values": {"sql_alchemy_conn": "sqlite:////Users/airflow/airflow/airflow.db"}}'
+            ),
         }
     )
-    def test_config_from_secret_backend(self, mock_hvac):
+    def test_config_from_secret_backend(self):
         """Get Config Value from a Secret Backend"""
-        mock_client = mock.MagicMock()
-        mock_hvac.Client.return_value = mock_client
-        mock_client.secrets.kv.v2.read_secret_version.return_value = {
-            "request_id": "2d48a2ad-6bcb-e5b6-429d-da35fdf31f56",
-            "lease_id": "",
-            "renewable": False,
-            "lease_duration": 0,
-            "data": {
-                "data": {"value": "sqlite:////Users/airflow/airflow/airflow.db"},
-                "metadata": {
-                    "created_time": "2020-03-28T02:10:54.301784Z",
-                    "deletion_time": "",
-                    "destroyed": False,
-                    "version": 1,
-                },
-            },
-            "wrap_info": None,
-            "warnings": None,
-            "auth": None,
-        }
-
         test_config = textwrap.dedent(
             """
             [test]
@@ -501,21 +491,9 @@ class TestConf:
         # is True
         assert test_conf.as_dict(display_sensitive=True, include_cmds=False)
 
-    @skip_if_force_lowest_dependencies_marker
-    @mock.patch("airflow.providers.hashicorp._internal_client.vault_client.hvac")
-    @conf_vars(
-        {
-            ("secrets", "backend"): "airflow.providers.hashicorp.secrets.vault.VaultBackend",
-            ("secrets", "backend_kwargs"): '{"url": "http://127.0.0.1:8200", "token": "token"}',
-        }
-    )
-    def test_config_raise_exception_from_secret_backend_connection_error(self, mock_hvac):
+    @conf_vars({("secrets", "backend"): FAKE_UNREACHABLE_BACKEND_PATH})
+    def test_config_raise_exception_from_secret_backend_connection_error(self):
         """Get Config Value from a Secret Backend"""
-        mock_client = mock.MagicMock()
-        # mock_client.side_effect = AirflowConfigException
-        mock_hvac.Client.return_value = mock_client
-        mock_client.secrets.kv.v2.read_secret_version.return_value = Exception
-
         test_config = textwrap.dedent(
             """
             [test]
@@ -794,7 +772,9 @@ class TestConf:
             assert conf_maintain_cmds["database"]["sql_alchemy_conn"] == conf_conn
 
     @mock.patch.dict(
-        "os.environ", {"AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD": "echo -n 'postgresql://'"}, clear=True
+        "os.environ",
+        {"AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD": "echo -n 'postgresql+psycopg2://'"},
+        clear=True,
     )
     def test_as_dict_respects_sensitive_cmds_from_env(self):
         test_conf = copy.deepcopy(conf)
@@ -805,16 +785,12 @@ class TestConf:
         assert "sql_alchemy_conn" in conf_materialize_cmds["database"]
         assert "sql_alchemy_conn_cmd" not in conf_materialize_cmds["database"]
 
-        assert conf_materialize_cmds["database"]["sql_alchemy_conn"] == "postgresql://"
+        assert conf_materialize_cmds["database"]["sql_alchemy_conn"] == "postgresql+psycopg2://"
 
-    @skip_if_force_lowest_dependencies_marker
     @conf_vars(
         {
-            (
-                "workers",
-                "secrets_backend",
-            ): "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
-            ("workers", "secrets_backend_kwargs"): '{"connections_prefix": "/airflow", "profile_name": null}',
+            ("workers", "secrets_backend"): FAKE_BACKEND_PATH,
+            ("workers", "secrets_backend_kwargs"): '{"connections_prefix": "/airflow"}',
         }
     )
     def test_initialize_secrets_backends_on_workers(self):
@@ -823,32 +799,25 @@ class TestConf:
         backend_classes = [backend.__class__.__name__ for backend in backends]
 
         assert len(backends) == 3
-        assert "SystemsManagerParameterStoreBackend" in backend_classes
+        assert "FakeSecretsBackend" in backend_classes
         assert "EnvironmentVariablesBackend" in backend_classes
         assert "ExecutionAPISecretsBackend" in backend_classes
 
-    @skip_if_force_lowest_dependencies_marker
     @conf_vars(
         {
-            (
-                "workers",
-                "secrets_backend",
-            ): "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
+            ("workers", "secrets_backend"): FAKE_BACKEND_PATH,
             ("workers", "secrets_backend_kwargs"): '{"use_ssl": false}',
         }
     )
     def test_secrets_backends_kwargs_on_workers(self):
         """Tests if secrets backend kwargs are loaded correctly for workers."""
         backends = initialize_secrets_backends(DEFAULT_SECRETS_SEARCH_PATH_WORKERS)
-        systems_manager = next(
-            backend
-            for backend in backends
-            if backend.__class__.__name__ == "SystemsManagerParameterStoreBackend"
+        fake_backend = next(
+            backend for backend in backends if backend.__class__.__name__ == "FakeSecretsBackend"
         )
-        assert systems_manager.kwargs == {}
-        assert systems_manager.use_ssl is False
+        assert fake_backend.kwargs == {}
+        assert fake_backend.use_ssl is False
 
-    @skip_if_force_lowest_dependencies_marker
     @pytest.mark.parametrize(
         (
             "secrets_backend",
@@ -861,21 +830,21 @@ class TestConf:
         [
             # pick right backend and kwargs
             pytest.param(
-                "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
-                '{"connections_prefix": "/airflow", "profile_name": null}',
+                FAKE_BACKEND_PATH,
+                '{"connections_prefix": "/airflow", "variables_prefix": null}',
                 "airflow.secrets.local_filesystem.LocalFilesystemBackend",
                 '{"connections_file_path": "/files/conn.json", "variables_file_path": "/files/var.json"}',
-                "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
-                {"connections_prefix": "/airflow", "profile_name": None},
+                FAKE_BACKEND_PATH,
+                {"connections_prefix": "/airflow", "variables_prefix": None},
                 id="both-defined",
             ),
             # do not pick kwargs of secrets backend when not defined for worker
             pytest.param(
-                "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
+                FAKE_BACKEND_PATH,
                 "",
                 "airflow.secrets.local_filesystem.LocalFilesystemBackend",
                 '{"connections_file_path": "/files/conn.json", "variables_file_path": "/files/var.json"}',
-                "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
+                FAKE_BACKEND_PATH,
                 {},
                 id="worker-backend-defined-not-kwargs",
             ),
@@ -952,14 +921,7 @@ class TestConf:
         result = _collect_kwarg_env_vars("AIRFLOW__SECRETS__BACKEND_KWARG__")
         assert result == {"role_id": "abc"}
 
-    @conf_vars(
-        {
-            (
-                "workers",
-                "secrets_backend",
-            ): "airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend",
-        }
-    )
+    @conf_vars({("workers", "secrets_backend"): FAKE_BACKEND_PATH})
     @mock.patch.dict(
         "os.environ",
         {"AIRFLOW__WORKERS__SECRETS_BACKEND_KWARG__CONNECTIONS_PREFIX": "/worker/connections"},
@@ -968,7 +930,7 @@ class TestConf:
         """Per-key env var is picked up for the workers secrets backend."""
         backends = ensure_secrets_loaded(DEFAULT_SECRETS_SEARCH_PATH_WORKERS)
         secrets_backend = backends[0]
-        assert secrets_backend.__class__.__name__ == "SystemsManagerParameterStoreBackend"
+        assert secrets_backend.__class__.__name__ == "FakeSecretsBackend"
         assert secrets_backend.connections_prefix == "/worker/connections"
 
     @mock.patch("airflow._shared.secrets_masker.mask_secret")
@@ -1111,6 +1073,93 @@ class TestConf:
         expected_raw_output = "my_string_config = This is the first line.\nThis is the second line.\n"
 
         assert expected_raw_output in content
+
+    @pytest.mark.parametrize(
+        ("input_scheme", "expected_scheme"),
+        [
+            pytest.param(
+                "postgres://user:pass@host/db", "postgresql+psycopg://user:pass@host/db", id="postgres"
+            ),
+            pytest.param(
+                "postgres+psycopg2://user:pass@host/db",
+                "postgresql+psycopg://user:pass@host/db",
+                id="postgres+psycopg2",
+            ),
+            pytest.param(
+                "postgresql://user:pass@host/db",
+                "postgresql+psycopg://user:pass@host/db",
+                id="postgresql-bare",
+            ),
+            pytest.param(
+                "postgresql+psycopg2://user:pass@host/db",
+                "postgresql+psycopg2://user:pass@host/db",
+                id="postgresql+psycopg2-noop",
+            ),
+            pytest.param("mysql://user:pass@host/db", "mysql://user:pass@host/db", id="mysql-untouched"),
+        ],
+    )
+    @mock.patch.dict("os.environ", {}, clear=False)
+    @mock.patch("airflow.configuration.find_spec", return_value=object())
+    def test_upgrade_postgres_metastore_conn(self, mock_find_spec, input_scheme, expected_scheme):
+        """Assumes psycopg (v3) is installed; see the sibling ``_without_psycopg3`` test for the
+        fallback, since whether psycopg3 is actually present varies across CI environments
+        (e.g. a lowest-dependencies job that doesn't install it)."""
+        os.environ["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = input_scheme
+        test_conf = AirflowConfigParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            test_conf._upgrade_postgres_metastore_conn()
+        assert test_conf.get("database", "sql_alchemy_conn") == expected_scheme
+
+    @pytest.mark.parametrize(
+        ("input_url", "should_warn"),
+        [
+            pytest.param("postgres://user:pass@host/db", True, id="postgres"),
+            pytest.param("postgres+psycopg2://user:pass@host/db", True, id="postgres+psycopg2"),
+            pytest.param("postgresql://user:pass@host/db", False, id="postgresql-bare"),
+        ],
+    )
+    @mock.patch.dict("os.environ", {}, clear=False)
+    @mock.patch("airflow.configuration.find_spec", return_value=object())
+    def test_upgrade_postgres_metastore_conn_warning(self, mock_find_spec, input_url, should_warn):
+        """Only the really unsupported ``postgres`` schemes warn; bare ``postgresql`` is valid."""
+        os.environ["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = input_url
+        test_conf = AirflowConfigParser()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            test_conf._upgrade_postgres_metastore_conn()
+        future = [w for w in caught if issubclass(w.category, FutureWarning)]
+        if should_warn:
+            assert len(future) == 1
+            assert "Unsupported scheme" in str(future[0].message)
+        else:
+            assert future == []
+
+    @pytest.mark.parametrize(
+        ("input_scheme", "expected_scheme"),
+        [
+            pytest.param(
+                "postgres://user:pass@host/db", "postgresql+psycopg2://user:pass@host/db", id="postgres"
+            ),
+            pytest.param(
+                "postgresql+psycopg2://user:pass@host/db",
+                "postgresql+psycopg2://user:pass@host/db",
+                id="postgresql+psycopg2-noop",
+            ),
+        ],
+    )
+    @mock.patch.dict("os.environ", {}, clear=False)
+    @mock.patch("airflow.configuration.find_spec", return_value=None)
+    def test_upgrade_postgres_metastore_conn_without_psycopg3(
+        self, mock_find_spec, input_scheme, expected_scheme
+    ):
+        """Falls back to psycopg2 when the psycopg (v3) package isn't installed."""
+        os.environ["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = input_scheme
+        test_conf = AirflowConfigParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            test_conf._upgrade_postgres_metastore_conn()
+        assert test_conf.get("database", "sql_alchemy_conn") == expected_scheme
 
 
 @mock.patch.dict(
@@ -1849,6 +1898,7 @@ def test_sensitive_values():
         ("database", "sql_alchemy_conn"),
         ("database", "sql_alchemy_conn_async"),
         ("core", "fernet_key"),
+        ("core", "sql_alchemy_conn"),  # NOTE: Added for 3.2.1
         ("api_auth", "jwt_secret"),
         ("api", "secret_key"),
         ("secrets", "backend_kwargs"),
@@ -1876,50 +1926,231 @@ def test_sensitive_values():
 
 
 @skip_if_force_lowest_dependencies_marker
-def test_restore_and_reload_provider_configuration():
+def test_provider_configuration_toggle_with_context_manager():
+    """Test that make_sure_configuration_loaded toggles provider config on/off."""
     from airflow.settings import conf
 
-    assert conf.providers_configuration_loaded is True
+    assert conf._use_providers_configuration is True
+    # With providers enabled, the provider value is returned via the fallback lookup chain.
     assert conf.get("celery", "celery_app_name") == "airflow.providers.celery.executors.celery_executor"
-    conf.restore_core_default_configuration()
-    assert conf.providers_configuration_loaded is False
-    # built-in pre-2-7 celery executor
-    assert conf.get("celery", "celery_app_name") == "airflow.executors.celery_executor"
-    conf.load_providers_configuration()
-    assert conf.providers_configuration_loaded is True
+
+    with conf.make_sure_configuration_loaded(with_providers=False):
+        assert conf._use_providers_configuration is False
+        with pytest.raises(
+            AirflowConfigException,
+            match=re.escape("section/key [celery/celery_app_name] not found in config"),
+        ):
+            conf.get("celery", "celery_app_name")
+    # After the context manager exits, provider config is restored.
+    assert conf._use_providers_configuration is True
     assert conf.get("celery", "celery_app_name") == "airflow.providers.celery.executors.celery_executor"
 
 
 @skip_if_force_lowest_dependencies_marker
-def test_error_when_contributing_to_existing_section():
+def test_provider_sections_do_not_overlap_with_core():
+    """Test that provider config sections don't overlap with core configuration sections."""
     from airflow.settings import conf
 
-    with conf.make_sure_configuration_loaded(with_providers=True):
-        assert conf.providers_configuration_loaded is True
-        assert conf.get("celery", "celery_app_name") == "airflow.providers.celery.executors.celery_executor"
-        conf.restore_core_default_configuration()
-        assert conf.providers_configuration_loaded is False
-        conf.configuration_description["celery"] = {
-            "description": "Celery Executor configuration",
-            "options": {
-                "celery_app_name": {
-                    "default": "test",
-                }
-            },
-        }
-        conf._default_values.add_section("celery")
-        conf._default_values.set("celery", "celery_app_name", "test")
-        assert conf.get("celery", "celery_app_name") == "test"
-        # patching restoring_core_default_configuration to avoid reloading the defaults
-        with patch.object(conf, "restore_core_default_configuration"):
+    core_sections = set(conf._configuration_description.keys())
+    provider_sections = set(conf._provider_metadata_configuration_description.keys())
+    overlap = core_sections & provider_sections
+    assert not overlap, (
+        f"Provider configuration sections overlap with core sections: {overlap}. "
+        "Providers must only add new sections, not contribute to existing ones."
+    )
+
+
+@pytest.mark.parametrize(
+    ("sqlite_version_info", "expect_error"),
+    [
+        ((3, 15, 0), False),
+        ((3, 14, 9), True),
+    ],
+)
+def test_validate_sqlite3_version(sqlite_version_info, expect_error, monkeypatch):
+    """_validate_sqlite3_version compares against sqlite3.sqlite_version_info, not a parsed string."""
+    monkeypatch.setenv("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "sqlite:////tmp/airflow.db")
+    test_conf = AirflowConfigParser()
+    with mock.patch("sqlite3.sqlite_version_info", sqlite_version_info):
+        if expect_error:
+            with pytest.raises(AirflowConfigException, match="SQLite C library too old"):
+                test_conf._validate_sqlite3_version()
+        else:
+            test_conf._validate_sqlite3_version()
+
+
+@skip_if_force_lowest_dependencies_marker
+class TestProviderConfigPriority:
+    """Tests that conf.get and conf.has_option respect provider metadata and cfg fallbacks with correct priority."""
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        PROVIDER_METADATA_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in PROVIDER_METADATA_CONFIG_OPTIONS],
+    )
+    def test_get_returns_provider_metadata_value(self, section, option, expected):
+        """conf.get returns provider metadata (provider.yaml) values."""
+        from airflow.settings import conf
+
+        assert conf.get(section, option) == expected
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        CFG_FALLBACK_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in CFG_FALLBACK_CONFIG_OPTIONS],
+    )
+    def test_cfg_fallback_has_expected_value(self, section, option, expected):
+        """provider_config_fallback_defaults.cfg contains expected default values."""
+        from airflow.settings import conf
+
+        assert conf.get_from_provider_cfg_config_fallback_defaults(section, option) == expected
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        PROVIDER_METADATA_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in PROVIDER_METADATA_CONFIG_OPTIONS],
+    )
+    def test_has_option_true_for_provider_metadata(self, section, option, expected):
+        """conf.has_option returns True for options defined in provider metadata."""
+        from airflow.settings import conf
+
+        assert conf.has_option(section, option) is True
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        CFG_FALLBACK_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in CFG_FALLBACK_CONFIG_OPTIONS],
+    )
+    def test_has_option_true_for_cfg_fallback(self, section, option, expected):
+        """conf.has_option returns True for options in provider_config_fallback_defaults.cfg."""
+        from airflow.settings import conf
+
+        assert conf.has_option(section, option) is True
+
+    def test_has_option_false_for_nonexistent_option(self):
+        """conf.has_option returns False for options not in any source."""
+        from airflow.settings import conf
+
+        assert conf.has_option("celery", "totally_nonexistent_option_xyz") is False
+
+    @pytest.mark.parametrize(
+        ("section", "option", "metadata_value", "cfg_value"),
+        PROVIDER_METADATA_OVERRIDES_CFG_FALLBACK,
+        ids=[f"{s}.{o}" for s, o, _, _ in PROVIDER_METADATA_OVERRIDES_CFG_FALLBACK],
+    )
+    def test_provider_metadata_overrides_cfg_fallback(self, section, option, metadata_value, cfg_value):
+        """Provider metadata values take priority over provider_config_fallback_defaults.cfg values."""
+        from airflow.settings import conf
+
+        assert conf.get(section, option) == metadata_value
+        assert conf.get_from_provider_cfg_config_fallback_defaults(section, option) == cfg_value
+
+    @pytest.mark.parametrize(
+        ("section", "option", "metadata_value", "cfg_value"),
+        PROVIDER_METADATA_OVERRIDES_CFG_FALLBACK,
+        ids=[f"{s}.{o}" for s, o, _, _ in PROVIDER_METADATA_OVERRIDES_CFG_FALLBACK],
+    )
+    def test_get_default_value_priority(self, section, option, metadata_value, cfg_value):
+        """get_default_value checks provider metadata before cfg fallback."""
+        from airflow.settings import conf
+
+        assert conf.get_default_value(section, option) == metadata_value
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        CFG_FALLBACK_CONFIG_OPTIONS + PROVIDER_METADATA_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in CFG_FALLBACK_CONFIG_OPTIONS + PROVIDER_METADATA_CONFIG_OPTIONS],
+    )
+    def test_providers_disabled_dont_get_cfg_defaults_or_provider_metadata(self, section, option, expected):
+        """With providers disabled, conf.get raises for provider-only options."""
+        test_conf = create_fresh_airflow_config()
+        with test_conf.make_sure_configuration_loaded(with_providers=False):
             with pytest.raises(
                 AirflowConfigException,
-                match="The provider apache-airflow-providers-celery is attempting to contribute "
-                "configuration section celery that has already been added before. "
-                "The source of it: Airflow's core package",
+                match=re.escape(f"section/key [{section}/{option}] not found in config"),
             ):
-                conf.load_providers_configuration()
-        assert conf.get("celery", "celery_app_name") == "test"
+                test_conf.get(section, option)
+
+    def test_provider_section_absent_when_providers_disabled(self):
+        """Provider-contributed sections are excluded from configuration_description when providers disabled."""
+        test_conf = create_fresh_airflow_config()
+        with test_conf.make_sure_configuration_loaded(with_providers=False):
+            desc = test_conf.configuration_description
+            provider_only_sections = set(test_conf._provider_metadata_configuration_description.keys())
+            for section in provider_only_sections:
+                if section not in test_conf._configuration_description:
+                    assert section not in desc
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        CFG_FALLBACK_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in CFG_FALLBACK_CONFIG_OPTIONS],
+    )
+    def test_has_option_returns_false_for_cfg_fallback_when_providers_disabled(
+        self, section, option, expected
+    ):
+        """With providers disabled, conf.has_option returns False for cfg-fallback-only options."""
+        test_conf = create_fresh_airflow_config()
+        with test_conf.make_sure_configuration_loaded(with_providers=False):
+            assert test_conf.has_option(section, option) is False
+
+    @pytest.mark.parametrize(
+        ("section", "option", "expected"),
+        PROVIDER_METADATA_CONFIG_OPTIONS,
+        ids=[f"{s}.{o}" for s, o, _ in PROVIDER_METADATA_CONFIG_OPTIONS],
+    )
+    def test_has_option_returns_false_for_provider_metadata_when_providers_disabled(
+        self, section, option, expected
+    ):
+        """With providers disabled, conf.has_option returns False for provider-metadata-only options."""
+        test_conf = create_fresh_airflow_config()
+        with test_conf.make_sure_configuration_loaded(with_providers=False):
+            assert test_conf.has_option(section, option) is False
+
+    def test_env_var_overrides_provider_values(self):
+        """Environment variables override both provider metadata and cfg fallback values."""
+        from airflow.settings import conf
+
+        with mock.patch.dict("os.environ", {"AIRFLOW__CELERY__CELERY_APP_NAME": "env_override"}):
+            assert conf.get("celery", "celery_app_name") == "env_override"
+
+    def test_user_config_overrides_provider_values(self):
+        """User-set config values (airflow.cfg) override provider defaults."""
+        from airflow.settings import conf
+
+        custom_value = "my_custom.celery_executor"
+        with conf_vars({("celery", "celery_app_name"): custom_value}):
+            assert conf.get("celery", "celery_app_name") == custom_value
+
+    def test_getsection_returns_env_var_only_provider_section(self, monkeypatch):
+        """Env vars are picked up for a provider section whose keys all default to None."""
+        from airflow.settings import conf
+
+        monkeypatch.setenv("AIRFLOW__CELERY_BROKER_TRANSPORT_OPTIONS__VISIBILITY_TIMEOUT", "21600")
+        monkeypatch.setenv("AIRFLOW__CELERY_BROKER_TRANSPORT_OPTIONS__MASTER_NAME", "mymaster")
+
+        section = conf.getsection("celery_broker_transport_options")
+
+        assert section is not None
+        assert section["visibility_timeout"] == 21600
+        assert section["master_name"] == "mymaster"
+
+    def test_getsection_returns_env_var_only_provider_section_via_cfg_fallback(self, monkeypatch):
+        """Env vars are picked up for a section that lives only in provider cfg fallback defaults."""
+        from airflow.settings import conf
+
+        monkeypatch.setenv("AIRFLOW__ELASTICSEARCH__END_OF_LOG_MARK", "env_override_mark")
+
+        section = conf.getsection("elasticsearch")
+
+        assert section is not None
+        assert section["end_of_log_mark"] == "env_override_mark"
+
+    def test_getsection_returns_none_for_truly_unknown_section(self):
+        """Sections not declared anywhere and with no env vars still return None."""
+        from airflow.settings import conf
+
+        assert conf.getsection("section_that_does_not_exist_anywhere") is None
 
 
 # Technically it's not a DB test, but we want to make sure it's not interfering with xdist non-db tests

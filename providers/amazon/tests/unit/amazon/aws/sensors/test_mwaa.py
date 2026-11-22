@@ -22,7 +22,7 @@ import pytest
 
 from airflow.providers.amazon.aws.hooks.mwaa import MwaaHook
 from airflow.providers.amazon.aws.sensors.mwaa import MwaaDagRunSensor, MwaaTaskSensor
-from airflow.providers.common.compat.sdk import AirflowException
+from airflow.providers.common.compat.sdk import AirflowException, TaskDeferred
 from airflow.utils.state import DagRunState, TaskInstanceState
 
 SENSOR_DAG_RUN_KWARGS = {
@@ -45,6 +45,10 @@ SENSOR_TASK_KWARGS = {
     "poke_interval": 5,
     "max_retries": 100,
 }
+
+REGION_NAME = "eu-west-2"
+VERIFY = False
+BOTOCORE_CONFIG = {"read_timeout": 42}
 
 SENSOR_STATE_KWARGS = {
     "success_states": ["a", "b"],
@@ -98,6 +102,43 @@ class TestMwaaDagRunSuccessSensor:
         with pytest.raises(AirflowException, match=f".*{state}.*"):
             MwaaDagRunSensor(**SENSOR_DAG_RUN_KWARGS, **SENSOR_STATE_KWARGS).poke({})
 
+    def test_execute_complete_error(self):
+        sensor = MwaaDagRunSensor(**SENSOR_DAG_RUN_KWARGS, **SENSOR_STATE_KWARGS)
+        error_event = {"status": "error", "message": "Dag run failed", "dag_run_id": "test_run"}
+        with pytest.raises(AirflowException, match="Error in MWAA Dag run"):
+            sensor.execute_complete({}, error_event)
+
+    def test_execute_complete_success(self):
+        sensor = MwaaDagRunSensor(**SENSOR_DAG_RUN_KWARGS, **SENSOR_STATE_KWARGS)
+        success_event = {"status": "success", "dag_run_id": "test_run"}
+        sensor.execute_complete({}, success_event)  # should not raise
+
+    def test_deferred_trigger_receives_hook_configuration(self):
+        sensor = MwaaDagRunSensor(
+            **{**SENSOR_DAG_RUN_KWARGS, "deferrable": True},
+            **SENSOR_STATE_KWARGS,
+            region_name=REGION_NAME,
+            verify=VERIFY,
+            botocore_config=BOTOCORE_CONFIG,
+        )
+
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute({})
+
+        assert exc_info.value.trigger.serialize()[1] == {
+            "waiter_delay": SENSOR_DAG_RUN_KWARGS["poke_interval"],
+            "waiter_max_attempts": SENSOR_DAG_RUN_KWARGS["max_retries"],
+            "aws_conn_id": "aws_default",
+            "external_env_name": SENSOR_DAG_RUN_KWARGS["external_env_name"],
+            "external_dag_id": SENSOR_DAG_RUN_KWARGS["external_dag_id"],
+            "external_dag_run_id": SENSOR_DAG_RUN_KWARGS["external_dag_run_id"],
+            "success_states": set(SENSOR_STATE_KWARGS["success_states"]),
+            "failure_states": set(SENSOR_STATE_KWARGS["failure_states"]),
+            "region_name": REGION_NAME,
+            "verify": VERIFY,
+            "botocore_config": BOTOCORE_CONFIG,
+        }
+
 
 class TestMwaaTaskSuccessSensor:
     def test_init_success(self):
@@ -137,3 +178,41 @@ class TestMwaaTaskSuccessSensor:
         mock_invoke_rest_api.return_value = {"RestApiResponse": {"state": state}}
         with pytest.raises(AirflowException, match=f".*{state}.*"):
             MwaaTaskSensor(**SENSOR_TASK_KWARGS, **SENSOR_STATE_KWARGS).poke({})
+
+    def test_execute_complete_error(self):
+        sensor = MwaaTaskSensor(**SENSOR_TASK_KWARGS, **SENSOR_STATE_KWARGS)
+        error_event = {"status": "error", "message": "Task failed", "task_id": "test_task"}
+        with pytest.raises(AirflowException, match="Error in MWAA task"):
+            sensor.execute_complete({}, error_event)
+
+    def test_execute_complete_success(self):
+        sensor = MwaaTaskSensor(**SENSOR_TASK_KWARGS, **SENSOR_STATE_KWARGS)
+        success_event = {"status": "success", "task_id": "test_task"}
+        sensor.execute_complete({}, success_event)  # should not raise
+
+    def test_deferred_trigger_receives_hook_configuration(self):
+        sensor = MwaaTaskSensor(
+            **SENSOR_TASK_KWARGS,
+            **SENSOR_STATE_KWARGS,
+            region_name=REGION_NAME,
+            verify=VERIFY,
+            botocore_config=BOTOCORE_CONFIG,
+        )
+
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute({})
+
+        assert exc_info.value.trigger.serialize()[1] == {
+            "waiter_delay": SENSOR_TASK_KWARGS["poke_interval"],
+            "waiter_max_attempts": SENSOR_TASK_KWARGS["max_retries"],
+            "aws_conn_id": "aws_default",
+            "external_env_name": SENSOR_TASK_KWARGS["external_env_name"],
+            "external_dag_id": SENSOR_TASK_KWARGS["external_dag_id"],
+            "external_dag_run_id": SENSOR_TASK_KWARGS["external_dag_run_id"],
+            "external_task_id": SENSOR_TASK_KWARGS["external_task_id"],
+            "success_states": set(SENSOR_STATE_KWARGS["success_states"]),
+            "failure_states": set(SENSOR_STATE_KWARGS["failure_states"]),
+            "region_name": REGION_NAME,
+            "verify": VERIFY,
+            "botocore_config": BOTOCORE_CONFIG,
+        }

@@ -136,12 +136,12 @@ function common::get_constraints_location() {
 
 function common::show_packaging_tool_version_and_location() {
    echo "PATH=${PATH}"
-   echo "Installed pip: $(pip --version): $(which pip)"
+   echo "Installed pip: $(pip --version): $(command -v pip)"
    if [[ ${PACKAGING_TOOL} == "pip" ]]; then
        echo "${COLOR_BLUE}Using 'pip' to install Airflow${COLOR_RESET}"
    else
        echo "${COLOR_BLUE}Using 'uv' to install Airflow${COLOR_RESET}"
-       echo "Installed uv: $(uv --version 2>/dev/null || echo "Not installed yet"): $(which uv 2>/dev/null)"
+       echo "Installed uv: $(uv --version 2>/dev/null || echo "Not installed yet"): $(command -v uv 2>/dev/null)"
    fi
 }
 
@@ -153,7 +153,7 @@ function common::install_packaging_tools() {
         echo
     else
         echo
-        echo "${COLOR_BLUE}Checking packaging tools for system Python installation: $(which python)${COLOR_RESET}"
+        echo "${COLOR_BLUE}Checking packaging tools for system Python installation: $(command -v python)${COLOR_RESET}"
         echo
     fi
     if [[ ${AIRFLOW_PIP_VERSION=} == "" ]]; then
@@ -217,32 +217,23 @@ function common::install_packaging_tools() {
     fi
 }
 
+function common::debian_codename() {
+    # shellcheck disable=SC1091
+    (. /etc/os-release; printf '%s\n' "${VERSION_CODENAME}")
+}
+
+function common::debian_release() {
+    # shellcheck disable=SC1091
+    (. /etc/os-release; printf '%s\n' "${VERSION_ID}")
+}
+
 function common::import_trusted_gpg() {
     common::get_colors
 
     local key=${1:?${COLOR_RED}First argument expects OpenPGP Key ID${COLOR_RESET}}
     local name=${2:?${COLOR_RED}Second argument expected trust storage name${COLOR_RESET}}
-    # Please note that not all servers could be used for retrieve keys
-    #  sks-keyservers.net: Unmaintained and DNS taken down due to GDPR requests.
-    #  keys.openpgp.org: User ID Mandatory, not suitable for APT repositories
-    #  keyring.debian.org: Only accept keys in Debian keyring.
-    #  pgp.mit.edu: High response time.
-    local keyservers=(
-        "hkps://keyserver.ubuntu.com"
-        "hkps://pgp.surf.nl"
-    )
+    local key_file="/scripts/docker/keys/${name}.asc"
 
-    GNUPGHOME="$(mktemp -d)"
-    export GNUPGHOME
-    set +e
-    for keyserver in $(shuf -e "${keyservers[@]}"); do
-        echo "${COLOR_BLUE}Try to receive GPG public key ${key} from ${keyserver}${COLOR_RESET}"
-        gpg --keyserver "${keyserver}" --recv-keys "${key}" 2>&1 && break
-        echo "${COLOR_YELLOW}Unable to receive GPG public key ${key} from ${keyserver}${COLOR_RESET}"
-    done
-    set -e
-    gpg --export "${key}" > "/etc/apt/trusted.gpg.d/${name}.gpg"
-    gpgconf --kill all
-    rm -rf "${GNUPGHOME}"
-    unset GNUPGHOME
+    echo "${COLOR_BLUE}Installing GPG public key ${key} from ${key_file}${COLOR_RESET}"
+    gpg --dearmor < "${key_file}" > "/etc/apt/trusted.gpg.d/${name}.gpg"
 }

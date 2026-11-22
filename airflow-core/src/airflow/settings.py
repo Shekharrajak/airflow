@@ -23,14 +23,17 @@ import logging
 import os
 import sys
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import cache, partial
 from importlib import metadata
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, Literal
 
 import pluggy
 from packaging.version import Version
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError, NoSuchModuleError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession as SAAsyncSession,
@@ -61,17 +64,19 @@ from airflow.utils.orm_event_handlers import setup_event_handlers
 
 _USE_PSYCOPG3: bool
 try:
-    from importlib.util import find_spec
-
     _USE_PSYCOPG3 = find_spec("psycopg") is not None
 
 except (ImportError, ModuleNotFoundError):
     _USE_PSYCOPG3 = False
 
+_USE_ASYNCMY = find_spec("asyncmy") is not None
+
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
     from airflow.api_fastapi.common.types import UIAlert
+    from airflow.models.dagrun import DagRun
+    from airflow.models.taskinstance import TaskInstance
 
 log = logging.getLogger(__name__)
 
@@ -203,8 +208,10 @@ def dag_policy(dag):
     return get_policy_plugin_manager().hook.dag_policy(dag=dag)
 
 
-def task_instance_mutation_hook(task_instance):
-    return get_policy_plugin_manager().hook.task_instance_mutation_hook(task_instance=task_instance)
+def task_instance_mutation_hook(task_instance: TaskInstance, dag_run: DagRun | None = None):
+    return get_policy_plugin_manager().hook.task_instance_mutation_hook(
+        task_instance=task_instance, dag_run=dag_run
+    )
 
 
 task_instance_mutation_hook.is_noop = True  # type: ignore
@@ -235,16 +242,46 @@ def load_policy_plugins(pm: pluggy.PluginManager):
     pm.load_setuptools_entrypoints("airflow.policy")
 
 
+def _translate_asyncpg_sslmode(async_uri: str) -> str:
+    """
+    Rename the libpq ``sslmode`` query param to asyncpg's ``ssl`` equivalent.
+
+    asyncpg has no ``sslmode`` connect arg -- SQLAlchemy's asyncpg dialect passes URL
+    query params straight to ``asyncpg.connect()``, which spells the option ``ssl`` and
+    accepts the same libpq mode strings (``disable``/``prefer``/``require``/``verify-ca``/
+    ``verify-full``). A sync Postgres URI commonly carries ``sslmode`` (the official Helm
+    chart sets it unconditionally), so the derived async URI must translate it; otherwise
+    every async DB call raises ``TypeError: connect() got an unexpected keyword argument
+    'sslmode'``.
+    """
+    url = make_url(async_uri)
+    if "sslmode" not in url.query:
+        return async_uri
+    query = dict(url.query)
+    query["ssl"] = query.pop("sslmode")
+    return url.set(query=query).render_as_string(hide_password=False)
+
+
 def _get_async_conn_uri_from_sync(sync_uri):
-    AIO_LIBS_MAPPING = {"sqlite": "aiosqlite", "postgresql": "asyncpg", "mysql": "aiomysql"}
-    """Mapping of sync scheme to async scheme."""
+    # Derive the async URI scheme from the sync one by swapping in the async driver:
+    AIO_LIBS_MAPPING = {
+        "sqlite": "aiosqlite",
+        "postgresql": "psycopg_async" if _USE_PSYCOPG3 else "asyncpg",
+        "mysql": "asyncmy" if _USE_ASYNCMY else "aiomysql",
+    }
 
     scheme, rest = sync_uri.split(":", maxsplit=1)
     scheme = scheme.split("+", maxsplit=1)[0]
     aiolib = AIO_LIBS_MAPPING.get(scheme)
-    if aiolib:
-        return f"{scheme}+{aiolib}:{rest}"
-    return sync_uri
+    if not aiolib:
+        return sync_uri
+    async_uri = f"{scheme}+{aiolib}:{rest}"
+    if aiolib == "asyncpg":
+        # asyncpg-only: it is not libpq-based and has no ``sslmode`` connect arg. A
+        # libpq-based async driver (e.g. psycopg3) understands ``sslmode`` natively and
+        # would in turn reject ``ssl``, so this translation must stay gated on asyncpg.
+        async_uri = _translate_asyncpg_sslmode(async_uri)
+    return async_uri
 
 
 def configure_vars():
@@ -339,24 +376,110 @@ def _is_sqlite_db_path_relative(sqla_conn_str: str) -> bool:
     return True
 
 
+_PSYCOPG3_DRIVERS = frozenset({"psycopg", "psycopg_async"})
+
+
+def _psycopg3_connect_args(sql_alchemy_conn: str | None) -> dict[str, Any]:
+    """
+    Disable psycopg3's automatic server-side statement preparation.
+
+    psycopg3 prepares a statement server-side after ``prepare_threshold`` executions
+    (5 by default). Transaction pooling can route the next transaction to a different
+    server connection, so a pooler that does not itself track prepared statements fails
+    with ``InvalidSqlStatementName`` once a statement outlives the backend that prepared
+    it, or ``DuplicatePreparedStatement`` when a second client reuses the same generated
+    name. Preparation is only safe behind PgBouncer from 1.22 onwards, with
+    ``max_prepared_statements`` raised above 0 (its default until 1.24) and libpq 17 or
+    newer on the client; Airflow's chart sets ``pool_mode = transaction`` and ships 1.23.1
+    without that setting, so the recommended deployment is an affected one.
+
+    This disables preparation outright, not just the automatic threshold, so bulk
+    ``executemany`` writes re-parse per row rather than reusing one prepared statement.
+    Overridable via ``[database] sql_alchemy_connect_args``.
+
+    The driver is resolved through SQLAlchemy rather than matched against the URL prefix
+    so that it always agrees with the dialect that gets loaded: ``sql_alchemy_conn_async``
+    is taken verbatim from config without scheme normalization, and a bare
+    ``postgresql://`` resolves to psycopg on SQLAlchemy 2.1.
+    """
+    if not sql_alchemy_conn:
+        return {}
+    try:
+        driver = make_url(sql_alchemy_conn).get_driver_name()
+    except (ArgumentError, NoSuchModuleError):
+        # Leave it to create_engine, which reports a bad URL with far more context.
+        return {}
+    if driver not in _PSYCOPG3_DRIVERS:
+        return {}
+    return {"prepare_threshold": None}
+
+
 def _get_connect_args(mode: Literal["sync", "async"]) -> Any:
-    key = {
-        "sync": "sql_alchemy_connect_args",
-        "async": "sql_alchemy_connect_args_async",
+    key, sql_alchemy_conn = {
+        "sync": ("sql_alchemy_connect_args", SQL_ALCHEMY_CONN),
+        "async": ("sql_alchemy_connect_args_async", SQL_ALCHEMY_CONN_ASYNC),
     }[mode]
-    if conf.has_option("database", key):
-        return conf.getimport("database", key)
-    return {}
+    defaults = _psycopg3_connect_args(sql_alchemy_conn)
+    if not conf.has_option("database", key):
+        return defaults
+    configured = conf.getimport("database", key)
+    if not isinstance(configured, Mapping):
+        if defaults:
+            log.warning(
+                "[database] %s is not a mapping, so the psycopg3 default "
+                "prepare_threshold=None was not applied. Engine creation will "
+                "fail unless it resolves to a mapping.",
+                key,
+            )
+        return configured
+    # Anything the operator sets wins, including putting prepare_threshold back.
+    return {**defaults, **configured}
+
+
+def create_metadata_engine(
+    sql_alchemy_conn: str,
+    *,
+    engine_args: dict[str, Any],
+    connect_args: dict[str, Any],
+) -> Engine:
+    """
+    Create the SQLAlchemy Engine for the Airflow metadata database.
+
+    Override in ``airflow_local_settings.py`` to customize engine creation,
+    e.g. to register ``do_connect`` event handlers for token-based authentication.
+    """
+    return create_engine(
+        sql_alchemy_conn,
+        connect_args=connect_args,
+        **engine_args,
+        future=True,
+    )
+
+
+def create_async_metadata_engine(
+    sql_alchemy_conn_async: str,
+    *,
+    connect_args: dict[str, Any],
+    engine_args: dict[str, Any] | None = None,
+) -> AsyncEngine:
+    """
+    Create the async SQLAlchemy Engine for the Airflow metadata database.
+
+    Override in ``airflow_local_settings.py`` to customize async engine creation.
+    For ``do_connect`` handlers, register on ``engine.sync_engine``.
+
+    :param engine_args: Pool and engine configuration (pool_size, pool_recycle, etc.).
+    """
+    return create_async_engine(
+        sql_alchemy_conn_async,
+        connect_args=connect_args,
+        **(engine_args or {}),
+        future=True,
+    )
 
 
 def _configure_async_session() -> None:
-    """
-    Configure async SQLAlchemy session.
-
-    This exists so tests can reconfigure the session. How SQLAlchemy configures
-    this does not work well with Pytest and you can end up with issues when the
-    session and runs in a different event loop from the test itself.
-    """
+    """Configure the async engine and session factory."""
     global AsyncSession, async_engine
 
     if not SQL_ALCHEMY_CONN_ASYNC:
@@ -364,11 +487,26 @@ def _configure_async_session() -> None:
         AsyncSession = None
         return
 
-    async_engine = create_async_engine(
+    # Apply the same pool health settings used by the sync engine.
+    # Without these, the async pool uses SQLAlchemy defaults (pool_recycle=-1,
+    # pool_pre_ping=False) which means dead connections from PostgreSQL idle
+    # timeouts or pgbouncer disconnects are never detected.
+    engine_args: dict[str, Any] = {}
+    if not conf.getboolean("database", "SQL_ALCHEMY_POOL_ENABLED"):
+        engine_args["poolclass"] = NullPool
+    elif not SQL_ALCHEMY_CONN_ASYNC.startswith("sqlite"):
+        engine_args["pool_size"] = conf.getint("database", "SQL_ALCHEMY_POOL_SIZE", fallback=5)
+        engine_args["pool_recycle"] = conf.getint("database", "SQL_ALCHEMY_POOL_RECYCLE", fallback=1800)
+        engine_args["pool_pre_ping"] = conf.getboolean("database", "SQL_ALCHEMY_POOL_PRE_PING", fallback=True)
+        engine_args["max_overflow"] = conf.getint("database", "SQL_ALCHEMY_MAX_OVERFLOW", fallback=10)
+    engine_args.update(_get_isolation_level_args(SQL_ALCHEMY_CONN_ASYNC))
+
+    async_engine = create_async_metadata_engine(
         SQL_ALCHEMY_CONN_ASYNC,
         connect_args=_get_connect_args("async"),
-        future=True,
+        engine_args=engine_args,
     )
+    setup_event_handlers(async_engine.sync_engine)
     AsyncSession = async_sessionmaker(
         bind=async_engine,
         class_=SAAsyncSession,
@@ -408,11 +546,10 @@ def configure_orm(disable_connection_pool=False, pool_class=None):
         # to so the `test` thread and the tested endpoints can use common objects.
         connect_args["check_same_thread"] = False
 
-    engine = create_engine(
+    engine = create_metadata_engine(
         SQL_ALCHEMY_CONN,
+        engine_args=engine_args,
         connect_args=connect_args,
-        **engine_args,
-        future=True,
     )
     _configure_async_session()
     mask_secret(engine.url.password)
@@ -445,17 +582,32 @@ def configure_orm(disable_connection_pool=False, pool_class=None):
         register_at_fork(after_in_child=clean_in_fork)
 
 
+def _is_sqlite_in_memory(url: str) -> bool:
+    """
+    Check if a SQLAlchemy connection URL points to an in-memory SQLite database.
+
+    Handles driver prefixes (e.g. ``sqlite+pysqlite://``), query parameters, and
+    various in-memory forms like ``:memory:`` and ``file::memory:``.
+    """
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return False
+    db = parsed.database
+    return not db or db == ":memory:" or ":memory:" in db
+
+
 def prepare_engine_args(disable_connection_pool=False, pool_class=None):
     """Prepare SQLAlchemy engine args."""
+    use_psycopg2_tuning = SQL_ALCHEMY_CONN.startswith("postgresql+psycopg2")
     DEFAULT_ENGINE_ARGS: dict[str, dict[str, Any]] = {
         "postgresql": (
             {
                 "insertmanyvalues_page_size": 10000,
             }
             | (
-                {}
-                if _USE_PSYCOPG3
-                else {"executemany_mode": "values_plus_batch", "executemany_batch_page_size": 2000}
+                {"executemany_mode": "values_plus_batch", "executemany_batch_page_size": 2000}
+                if use_psycopg2_tuning
+                else {}
             )
         )
     }
@@ -474,8 +626,12 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
     elif disable_connection_pool or not conf.getboolean("database", "SQL_ALCHEMY_POOL_ENABLED"):
         engine_args["poolclass"] = NullPool
         log.debug("settings.prepare_engine_args(): Using NullPool")
-    elif not SQL_ALCHEMY_CONN.startswith("sqlite"):
-        # Pool size engine args not supported by sqlite.
+    elif _is_sqlite_in_memory(SQL_ALCHEMY_CONN):
+        # In-memory SQLite uses SingletonThreadPool which doesn't support pool_size/max_overflow.
+        log.debug("settings.prepare_engine_args(): Skipping pool settings for in-memory SQLite")
+    else:
+        # Pool settings for all file-based databases including SQLite.
+        # SQLAlchemy 2.0+ uses QueuePool by default for file-based SQLite.
         # If no config value is defined for the pool size, select a reasonable value.
         # 0 means no limit, which could lead to exceeding the Database connection limit.
         pool_size = conf.getint("database", "SQL_ALCHEMY_POOL_SIZE", fallback=5)
@@ -502,7 +658,7 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
         # Typically, this is a simple statement like "SELECT 1", but may also make use
         # of some DBAPI-specific method to test the connection for liveness.
         # More information here:
-        # https://docs.sqlalchemy.org/en/14/core/pooling.html#disconnect-handling-pessimistic
+        # https://docs.sqlalchemy.org/en/20/core/pooling.html#disconnect-handling-pessimistic
         pool_pre_ping = conf.getboolean("database", "SQL_ALCHEMY_POOL_PRE_PING", fallback=True)
 
         log.debug(
@@ -518,23 +674,36 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
         engine_args["pool_pre_ping"] = pool_pre_ping
         engine_args["max_overflow"] = max_overflow
 
-    # The default isolation level for MySQL (REPEATABLE READ) can introduce inconsistencies when
-    # running multiple schedulers, as repeated queries on the same session may read from stale snapshots.
-    # 'READ COMMITTED' is the default value for PostgreSQL.
-    # More information here:
-    # https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html
-    if SQL_ALCHEMY_CONN.startswith("mysql"):
-        engine_args["isolation_level"] = "READ COMMITTED"
+    engine_args.update(_get_isolation_level_args(SQL_ALCHEMY_CONN))
 
     return engine_args
 
 
+def _get_isolation_level_args(sql_alchemy_conn: str) -> dict[str, str]:
+    """
+    Return the isolation level engine argument for the metadata database connection.
+
+    The default isolation level for MySQL (REPEATABLE READ) can introduce inconsistencies when
+    running multiple schedulers, as repeated queries on the same session may read from stale snapshots.
+    'READ COMMITTED' is the default value for PostgreSQL.
+    More information here:
+    https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html
+    """
+    if sql_alchemy_conn.startswith("mysql"):
+        return {"isolation_level": "READ COMMITTED"}
+    return {}
+
+
 def dispose_orm(do_log: bool = True):
     """Properly close pooled database connections."""
-    global Session, engine, NonScopedSession
+    global Session, engine, NonScopedSession, async_engine, AsyncSession
 
     _globals = globals()
-    if _globals.get("engine") is None and _globals.get("Session") is None:
+    if (
+        _globals.get("engine") is None
+        and _globals.get("Session") is None
+        and _globals.get("async_engine") is None
+    ):
         return
 
     if do_log:
@@ -551,6 +720,17 @@ def dispose_orm(do_log: bool = True):
     if "engine" in _globals and engine is not None:
         engine.dispose()
         engine = None
+
+    if "async_engine" in _globals and async_engine is not None:
+        async_engine.sync_engine.dispose()
+        async_engine = None
+        AsyncSession = None
+
+
+async def dispose_async_engine() -> None:
+    """Close checked-in connections on their event loop, retaining the engine and session factory."""
+    if async_engine is not None:
+        await async_engine.dispose()
 
 
 def reconfigure_orm(disable_connection_pool=False, pool_class=None):
@@ -570,15 +750,7 @@ def configure_adapters():
 
     if SQL_ALCHEMY_CONN.startswith("mysql"):
         try:
-            try:
-                import MySQLdb.converters
-            except ImportError:
-                raise RuntimeError(
-                    "You do not have `mysqlclient` package installed. "
-                    "Please install it with `pip install mysqlclient` and make sure you have system "
-                    "mysql libraries installed, as well as well as `pkg-config` system package "
-                    "installed in case you see compilation error during installation."
-                )
+            import MySQLdb.converters
 
             MySQLdb.converters.conversions[Pendulum] = MySQLdb.converters.DateTime2literal
         except ImportError:
@@ -589,6 +761,13 @@ def configure_adapters():
             pymysql.converters.conversions[Pendulum] = pymysql.converters.escape_datetime
         except ImportError:
             pass
+        if "MySQLdb.converters" not in sys.modules and "pymysql.converters" not in sys.modules:
+            raise RuntimeError(
+                "You have a MySQL connection string but neither `mysqlclient` nor `PyMySQL` is "
+                "installed. Install one of them, e.g. `pip install mysqlclient` (make sure the "
+                "system mysql libraries and `pkg-config` are present in case you see a compilation "
+                "error during installation) or `pip install PyMySQL`."
+            )
 
 
 def _configure_secrets_masker():

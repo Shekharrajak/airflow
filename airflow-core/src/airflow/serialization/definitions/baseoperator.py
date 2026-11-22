@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import methodtools
 
 from airflow.serialization.definitions.node import DAGNode
+from airflow.serialization.definitions.operatorlink import XComOperatorLink
 from airflow.serialization.definitions.param import SerializedParamsDict
 from airflow.serialization.enums import DagAttributeTypes
 from airflow.task.priority_strategy import PriorityWeightStrategy, validate_and_load_priority_weight_strategy
@@ -41,7 +42,6 @@ if TYPE_CHECKING:
     from airflow.sdk import Context
     from airflow.serialization.definitions.dag import SerializedDAG
     from airflow.serialization.definitions.mappedoperator import SerializedMappedOperator
-    from airflow.serialization.definitions.operatorlink import XComOperatorLink
     from airflow.serialization.definitions.taskgroup import SerializedMappedTaskGroup, SerializedTaskGroup
     from airflow.task.trigger_rule import TriggerRule
     from airflow.ti_deps.deps.base_ti_dep import BaseTIDep
@@ -68,6 +68,8 @@ class SerializedBaseOperator(DAGNode):
 
     _can_skip_downstream: bool
     _is_empty: bool
+    _arg_bindings: list[dict[str, Any]] | None = None
+    _external_clear_target: dict[str, Any] | None = None
     _needs_expansion: bool
     _task_display_name: str | None = None
     _weight_rule: str | PriorityWeightStrategy = "downstream"
@@ -76,6 +78,7 @@ class SerializedBaseOperator(DAGNode):
     dag: SerializedDAG | None = None
     depends_on_past: bool = False
     do_xcom_push: bool = True
+    returns_dag_result: bool = False
     doc: str | None = None
     doc_md: str | None = None
     doc_json: str | None = None
@@ -95,12 +98,13 @@ class SerializedBaseOperator(DAGNode):
 
     inlets: Sequence = []
     is_setup: bool = False
+    is_stub: bool = False
     is_teardown: bool = False
 
     map_index_template: str | None = None
     max_active_tis_per_dag: int | None = None
     max_active_tis_per_dagrun: int | None = None
-    max_retry_delay: datetime.timedelta | float | None = None
+    max_retry_delay: datetime.timedelta | None = None
     multiple_outputs: bool = False
 
     # Boolean flags for callback existence
@@ -126,6 +130,7 @@ class SerializedBaseOperator(DAGNode):
     retries: int = 0
     retry_delay: datetime.timedelta = datetime.timedelta(seconds=300)
     retry_exponential_backoff: float = 0
+    has_retry_policy: bool = False
     run_as_user: str | None = None
     task_group: SerializedTaskGroup | None = None
 
@@ -178,6 +183,7 @@ class SerializedBaseOperator(DAGNode):
                 "allow_nested_operators",
                 "depends_on_past",
                 "do_xcom_push",
+                "returns_dag_result",
                 "doc",
                 "doc_json",
                 "doc_md",
@@ -284,6 +290,8 @@ class SerializedBaseOperator(DAGNode):
         link = self.operator_extra_link_dict.get(name) or self.global_operator_extra_link_dict.get(name)
         if not link:
             return None
+        if isinstance(link, XComOperatorLink):
+            return link.get_link(self, ti_key=ti.key, region_id=ti.region_id)
         return link.get_link(self, ti_key=ti.key)
 
     @property
@@ -293,6 +301,16 @@ class SerializedBaseOperator(DAGNode):
     @property
     def inherits_from_skipmixin(self) -> bool:
         return self._can_skip_downstream
+
+    @property
+    def arg_bindings(self) -> list[dict[str, Any]] | None:
+        """The stub task's materialized TaskFlow arg-binding spec, or None for regular tasks."""
+        return self._arg_bindings
+
+    @property
+    def external_clear_target(self) -> dict[str, Any] | None:
+        """The cross-Dag clear target the operator declared at parse time, as written by the Dag processor."""
+        return self._external_clear_target
 
     @property
     def operator_name(self) -> str:

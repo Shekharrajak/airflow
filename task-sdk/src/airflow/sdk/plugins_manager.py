@@ -23,11 +23,11 @@ import logging
 from functools import cache
 from typing import TYPE_CHECKING
 
-from airflow import settings
+from airflow import settings  # noqa: SDK002
 from airflow.sdk._shared.module_loading import import_string
-from airflow.sdk._shared.observability.metrics.stats import Stats
+from airflow.sdk._shared.observability.metrics import stats
 from airflow.sdk._shared.plugins_manager import (
-    AirflowPlugin,
+    AirflowPlugin as AirflowPlugin,
     _load_entrypoint_plugins,
     _load_plugins_from_plugin_directory,
     integrate_listener_plugins as _integrate_listener_plugins,
@@ -85,7 +85,11 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
     def __register_plugins(plugin_instances: list[AirflowPlugin], errors: dict[str, str]) -> None:
         for plugin_instance in plugin_instances:
             if plugin_instance.name in loaded_plugins:
-                return
+                message = f"Plugin {plugin_instance.name!r} already registered, skipping"
+                log.warning(message)
+                name = str(plugin_instance.source) if plugin_instance.source else plugin_instance.name or ""
+                import_errors[name] = message
+                continue
 
             loaded_plugins.add(plugin_instance.name)
             try:
@@ -97,7 +101,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
                 import_errors[name] = str(e)
         import_errors.update(errors)
 
-    with Stats.timer() as timer:
+    with stats.timer() as timer:
         load_examples = conf.getboolean("core", "LOAD_EXAMPLES")
         __register_plugins(
             *_load_plugins_from_plugin_directory(
@@ -126,6 +130,19 @@ def integrate_macros_plugins() -> None:
         macros_module_name_prefix="airflow.sdk.execution_time.macros",
         plugins=plugins,
     )
+
+
+@cache
+def get_macro_plugin_teams() -> dict[str, str | None]:
+    """
+    Map the name of each plugin contributing macros to the team owning it.
+
+    Macros are attached to one module per plugin name, so this is what lets a task be
+    offered its own team's and the global plugins' macros but not another team's. Only
+    plugins that actually contribute macros get a module, hence a submodule to hide.
+    """
+    plugins, _ = _get_plugins()
+    return {plugin.name: plugin.team_name for plugin in plugins if plugin.name and plugin.macros}
 
 
 def integrate_listener_plugins(listener_manager: ListenerManager) -> None:

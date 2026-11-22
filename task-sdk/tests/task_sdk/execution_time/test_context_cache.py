@@ -79,7 +79,7 @@ class TestConnectionCacheIntegration:
         result = _get_connection(conn_id)
         assert result.conn_id == conn_id
         assert result.conn_type == "mysql"
-        mock_backend.get_connection.assert_called_once_with(conn_id=conn_id)
+        mock_backend.get_connection.assert_called_once_with(conn_id=conn_id, team_name=None)
 
         cached_uri = SecretCache.get_connection_uri(conn_id)
         cached_conn = Connection.from_uri(cached_uri, conn_id=conn_id)
@@ -97,6 +97,8 @@ class TestConnectionCacheIntegration:
             port=3306,
             login="user",
             password="pass",
+            schema=None,
+            extra=None,
         )
 
         mock_ensure_backends.return_value = [ExecutionAPISecretsBackend()]
@@ -178,9 +180,21 @@ class TestVariableCacheIntegration:
 
         result = _get_variable(key, deserialize_json=False)
         assert result == value
-        mock_backend.get_variable.assert_called_once_with(key=key)
+        mock_backend.get_variable.assert_called_once_with(key=key, team_name=None)
         cached_value = SecretCache.get_variable(key)
         assert cached_value == value
+
+    @patch("airflow.sdk.execution_time.supervisor.ensure_secrets_backend_loaded")
+    def test_get_variable_cache_is_keyed_by_team(self, mock_ensure_backends, monkeypatch):
+        monkeypatch.setattr("airflow.sdk.execution_time.context._current_team_name", "team_a")
+        SecretCache.save_variable("my_var", "global_value")
+
+        mock_backend = MagicMock(spec=["get_variable"])
+        mock_backend.get_variable.return_value = "team_a_value"
+        mock_ensure_backends.return_value = [mock_backend]
+
+        assert _get_variable("my_var", deserialize_json=False) == "team_a_value"
+        assert SecretCache.get_variable("my_var", team_name="team_a") == "team_a_value"
 
     @patch("airflow.sdk.execution_time.supervisor.ensure_secrets_backend_loaded")
     def test_get_variable_from_api_saves_to_cache(self, mock_ensure_backends, mock_supervisor_comms):
@@ -281,6 +295,10 @@ class TestAsyncConnectionCache:
             conn_type="mysql",
             host="host",
             port=3306,
+            schema=None,
+            login=None,
+            password=None,
+            extra=None,
         )
 
         # Configure asend to return the conn_result when awaited
@@ -296,6 +314,35 @@ class TestAsyncConnectionCache:
         cached_conn = Connection.from_uri(cached_uri, conn_id=conn_id)
         assert cached_conn.conn_type == "mysql"
         assert cached_conn.host == "host"
+
+    @pytest.mark.asyncio
+    @patch("airflow.sdk.execution_time.context.amask_secret")
+    async def test_async_get_connection_masks_secrets(self, mock_amask_secret):
+        """Test that async connection secrets are masked from logs using amask_secret."""
+        from airflow.sdk.execution_time.context import _async_get_connection
+
+        conn_id = "test_conn"
+        conn = Connection(
+            conn_id=conn_id, conn_type="mysql", login="user", password="password", extra='{"key": "value"}'
+        )
+
+        mock_backend = MagicMock(spec=["aget_connection"])
+        mock_backend.aget_connection = AsyncMock(return_value=conn)
+
+        with patch(
+            "airflow.sdk.execution_time.supervisor.ensure_secrets_backend_loaded", return_value=[mock_backend]
+        ):
+            result = await _async_get_connection(conn_id)
+
+            assert result.conn_id == conn_id
+            # Check that password and extra were masked using amask_secret (async version)
+            mock_amask_secret.assert_has_calls(
+                [
+                    call("password"),
+                    call('{"key": "value"}'),
+                ],
+                any_order=True,
+            )
 
 
 class TestCacheDisabled:
@@ -315,7 +362,16 @@ class TestCacheDisabled:
     def test_get_connection_no_cache_when_disabled(self, mock_ensure_backends, mock_supervisor_comms):
         """Test that cache is not used when disabled."""
         conn_id = "test_conn"
-        conn_result = ConnectionResult(conn_id=conn_id, conn_type="mysql", host="host")
+        conn_result = ConnectionResult(
+            conn_id=conn_id,
+            conn_type="mysql",
+            host="host",
+            schema=None,
+            login=None,
+            password=None,
+            port=None,
+            extra=None,
+        )
 
         mock_ensure_backends.return_value = [ExecutionAPISecretsBackend()]
 

@@ -20,12 +20,14 @@ import contextlib
 import copy
 import json
 import logging
+import warnings
 from collections.abc import ItemsView, Iterable, Mapping, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from airflow.sdk._shared.timezones.rfc3339 import is_iso8601_datetime, is_rfc3339_datetime
 from airflow.sdk.definitions._internal.mixins import ResolveMixin
 from airflow.sdk.definitions._internal.types import NOTSET, is_arg_set
-from airflow.sdk.exceptions import ParamValidationError
+from airflow.sdk.exceptions import ParamValidationError, RemovedInAirflow4Warning
 
 if TYPE_CHECKING:
     from airflow.sdk.definitions.context import Context
@@ -33,6 +35,20 @@ if TYPE_CHECKING:
     from airflow.sdk.types import Operator
 
 logger = logging.getLogger(__name__)
+
+
+def _check_date_time(value: Any) -> bool:
+    if is_rfc3339_datetime(value):
+        return True
+    if not is_iso8601_datetime(value):
+        return False
+    # stacklevel=1: a deeper level lands in a jsonschema frame, where the warning is dropped.
+    warnings.warn(
+        f"Param value {value!r} for format='date-time' is deprecated. Use RFC 3339 with a timezone offset.",
+        RemovedInAirflow4Warning,
+        stacklevel=1,
+    )
+    return True
 
 
 class Param:
@@ -95,8 +111,7 @@ class Param:
         :param suppress_exception: To raise an exception or not when the validations fails.
             If true and validations fails, the return value would be None.
         """
-        import jsonschema
-        from jsonschema import FormatChecker
+        from jsonschema import FormatChecker, validate
         from jsonschema.exceptions import ValidationError
 
         if value is not NOTSET:
@@ -106,8 +121,15 @@ class Param:
             if suppress_exception:
                 return None
             raise ParamValidationError("No value passed and Param has no default value")
+        format_checker = FormatChecker()
+        format_checker.checks("date-time")(_check_date_time)
         try:
-            jsonschema.validate(final_val, self.schema, format_checker=FormatChecker())
+            validate(
+                final_val,
+                self.schema,
+                format_checker=format_checker,
+            )
+
         except ValidationError as err:
             if suppress_exception:
                 return None

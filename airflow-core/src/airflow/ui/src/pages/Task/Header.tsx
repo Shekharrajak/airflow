@@ -20,9 +20,12 @@ import { useTranslation } from "react-i18next";
 import { FiBookOpen } from "react-icons/fi";
 
 import type { TaskResponse } from "openapi/requests/types.gen";
-import { TaskIcon } from "src/assets/TaskIcon";
+
 import DisplayMarkdownButton from "src/components/DisplayMarkdownButton";
 import { HeaderCard } from "src/components/HeaderCard";
+import { SmoothOperatorButton } from "src/components/SmoothOperator/SmoothOperator";
+
+import { TaskIcon } from "src/assets/TaskIcon";
 
 export const Header = ({ task }: { readonly task: TaskResponse }) => {
   const { t: translate } = useTranslation();
@@ -30,14 +33,19 @@ export const Header = ({ task }: { readonly task: TaskResponse }) => {
   return (
     <HeaderCard
       actions={
-        task.doc_md === null ? undefined : (
-          <DisplayMarkdownButton
-            header={translate("task.documentation")}
-            icon={<FiBookOpen />}
-            mdContent={task.doc_md}
-            text={translate("docs.documentation")}
-          />
-        )
+        <>
+          {task.doc_md === null ? undefined : (
+            <DisplayMarkdownButton
+              bg="bg"
+              header={translate("task.documentation")}
+              icon={<FiBookOpen />}
+              mdContent={task.doc_md}
+              text={translate("docs.documentation")}
+              variant="outline"
+            />
+          )}
+          <SmoothOperatorButton operatorName={task.operator_name} taskId={task.task_id ?? ""} />
+        </>
       }
       icon={<TaskIcon />}
       stats={[
@@ -45,6 +53,7 @@ export const Header = ({ task }: { readonly task: TaskResponse }) => {
         { label: translate("task.triggerRule"), value: task.trigger_rule },
       ]}
       title={`${task.task_display_name}${task.is_mapped ? " [ ]" : ""}`}
+      type="task"
     />
   );
 };

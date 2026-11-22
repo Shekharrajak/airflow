@@ -1,4 +1,3 @@
-
  .. Licensed to the Apache Software Foundation (ASF) under one
     or more contributor license agreements.  See the NOTICE file
     distributed with this work for additional information
@@ -19,4 +18,7 @@
 FAB auth manager token API
 ==========================
 
-It's a stub file. It will be automatically converted during the build process into valid documentation by the Sphinx plugin. See: /docs/conf.py
+.. swagger-plugin:: ../../src/airflow/providers/fab/auth_manager/api_fastapi/openapi/v2-fab-auth-manager-generated.yaml
+    :id: fab-auth-manager-api-ref
+    :page-title: FAB auth manager token API
+    :swagger-options: { "tryItOutEnabled": "false", "supportedSubmitMethods": [] }

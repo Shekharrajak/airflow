@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
 from typing import Annotated, Literal
@@ -111,6 +111,25 @@ class ExtraMenuItem:
     href: str
 
 
+@dataclass
+class CliLoginMethods:
+    """
+    Login methods an auth manager offers to command-line clients such as airflowctl.
+
+    Field names follow the OAuth 2.0 Authorization Server Metadata (RFC 8414). An empty
+    ``grant_types_supported`` means the auth manager offers no login method to these clients.
+    Unlike RFC 8414, endpoints are absolute paths, such as ``/auth/token/cli``, that clients
+    resolve against the API server URL, because the auth manager may not know the public URL
+    clients use to reach the API server. They include the path of ``[api] base_url``, if any.
+    """
+
+    grant_types_supported: list[str] = field(default_factory=list)
+    code_challenge_methods_supported: list[str] = field(default_factory=list)
+    authorization_endpoint: str | None = None
+    device_authorization_endpoint: str | None = None
+    token_endpoint: str | None = None
+
+
 class MenuItem(Enum):
     """Define all menu items defined in the menu."""
 
@@ -120,6 +139,8 @@ class MenuItem(Enum):
     CONFIG = "Config"
     CONNECTIONS = "Connections"
     DAGS = "Dags"
+    DAG_BUNDLES = "Dag Bundles"
+    DEADLINES = "Deadlines"
     DOCS = "Docs"
     JOBS = "Jobs"
     PLUGINS = "Plugins"
@@ -188,19 +209,31 @@ class OklchColor(BaseModel):
         return f"oklch({self.lightness} {self.chroma} {self.hue})"
 
 
+# Private type aliases for theme token shapes
+_ColorShade = dict[Literal["value"], OklchColor]
+_SHADE_LITERAL = Literal["50", "100", "200", "300", "400", "500", "600", "700", "800", "900", "950"]
+_ColorScale = dict[_SHADE_LITERAL, _ColorShade]
+
+
+class ThemeColors(BaseModel):
+    """Color tokens for the UI theme. All fields are optional; at least one must be provided."""
+
+    brand: _ColorScale | None = None
+    gray: _ColorScale | None = None
+    black: _ColorShade | None = None
+    white: _ColorShade | None = None
+
+    @model_validator(mode="after")
+    def check_at_least_one_color(self) -> ThemeColors:
+        if not any([self.brand, self.gray, self.black, self.white]):
+            raise ValueError("At least one color token must be provided: brand, gray, black, or white")
+        return self
+
+
 class Theme(BaseModel):
     """JSON to modify Chakra's theme."""
 
-    tokens: dict[
-        Literal["colors"],
-        dict[
-            Literal["brand"],
-            dict[
-                Literal["50", "100", "200", "300", "400", "500", "600", "700", "800", "900", "950"],
-                dict[Literal["value"], OklchColor],
-            ],
-        ],
-    ]
+    tokens: dict[Literal["colors"], ThemeColors] | None = None
     globalCss: dict[str, dict] | None = None
     icon: ThemeIconType = None
     icon_dark_mode: ThemeIconType = None

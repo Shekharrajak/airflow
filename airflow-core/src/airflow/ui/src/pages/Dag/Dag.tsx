@@ -16,10 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useEffect, useRef, useState } from "react";
+
 import { ReactFlowProvider } from "@xyflow/react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FiBarChart, FiCode, FiUser, FiCalendar } from "react-icons/fi";
+import { FiBarChart, FiCode, FiCalendar, FiGitCommit } from "react-icons/fi";
 import { LuChartColumn } from "react-icons/lu";
 import { MdDetails, MdOutlineEventNote } from "react-icons/md";
 import { RiArrowGoBackFill } from "react-icons/ri";
@@ -27,12 +28,13 @@ import { useParams } from "react-router-dom";
 
 import { useDagServiceGetDagDetails, useDagServiceGetLatestRunInfo } from "openapi/queries";
 import { ApiError } from "openapi/requests/core/ApiError";
+
+import { DetailsLayout } from "src/layouts/Details/DetailsLayout";
+
 import { TaskIcon } from "src/assets/TaskIcon";
 import { usePluginTabs } from "src/hooks/usePluginTabs";
-import { useRequiredActionTabs } from "src/hooks/useRequiredActionTabs";
-import { DetailsLayout } from "src/layouts/Details/DetailsLayout";
 import { useRefreshOnNewDagRuns } from "src/queries/useRefreshOnNewDagRuns";
-import { isStatePending, useAutoRefresh } from "src/utils";
+import { isStatePending, useAutoRefresh, useDocumentTitle } from "src/utils";
 
 import { DagNotFound } from "./DagNotFound";
 import { Header } from "./Header";
@@ -49,16 +51,21 @@ export const Dag = () => {
     { icon: <FiBarChart />, label: translate("tabs.runs"), value: "runs" },
     { icon: <TaskIcon />, label: translate("tabs.tasks"), value: "tasks" },
     { icon: <FiCalendar />, label: translate("tabs.calendar"), value: "calendar" },
-    { icon: <FiUser />, label: translate("tabs.requiredActions"), value: "required_actions" },
     { icon: <RiArrowGoBackFill />, label: translate("tabs.backfills"), value: "backfills" },
     { icon: <MdOutlineEventNote />, label: translate("tabs.auditLog"), value: "events" },
     { icon: <FiCode />, label: translate("tabs.code"), value: "code" },
+    { icon: <FiGitCommit />, label: translate("tabs.versions"), value: "versions" },
     { icon: <MdDetails />, label: translate("tabs.details"), value: "details" },
     ...externalTabs,
   ];
 
   const refetchInterval = useAutoRefresh({ dagId });
   const [hasPendingRuns, setHasPendingRuns] = useState<boolean | undefined>(false);
+  const previousLatestRunIdRef = useRef<string>("");
+
+  useEffect(() => {
+    previousLatestRunIdRef.current = "";
+  }, [dagId]);
 
   const {
     data: dag,
@@ -70,20 +77,24 @@ export const Dag = () => {
     },
     undefined,
     {
-      refetchInterval: (query) => {
+      refetchInterval: (query) =>
         // Auto-refresh when there are active runs or pending runs
-        if (hasPendingRuns ?? (query.state.data && (query.state.data.active_runs_count ?? 0) > 0)) {
-          return refetchInterval;
-        }
-
-        return false;
-      },
+        query.state.data?.scheduling_state === "draining" ||
+        (hasPendingRuns ?? (query.state.data && (query.state.data.active_runs_count ?? 0) > 0))
+          ? refetchInterval
+          : false,
     },
   );
 
+  useDocumentTitle(dag?.dag_display_name ?? dagId);
+
   // Ensures continuous refresh to detect new runs when there's no
   // pending state and new runs are initiated from other page
-  useRefreshOnNewDagRuns(dagId, hasPendingRuns);
+  useRefreshOnNewDagRuns(
+    dagId,
+    hasPendingRuns,
+    dag?.is_paused === true || dag?.scheduling_state === "draining",
+  );
 
   const {
     data: latestRun,
@@ -96,9 +107,19 @@ export const Dag = () => {
     undefined,
     {
       enabled: Boolean(dagId),
-      refetchInterval: (query) => {
-        if (query.state.data && isStatePending(query.state.data.state)) {
-          setHasPendingRuns(true);
+      refetchInterval: ({ state: { data } }) => {
+        if (data) {
+          const { run_id: runId, state } = data;
+          const runIdChanged =
+            previousLatestRunIdRef.current !== "" && previousLatestRunIdRef.current !== runId;
+
+          if (runIdChanged || isStatePending(state)) {
+            setHasPendingRuns(true);
+          }
+
+          previousLatestRunIdRef.current = runId;
+        } else {
+          previousLatestRunIdRef.current = "";
         }
 
         return hasPendingRuns ? refetchInterval : false;
@@ -106,14 +127,7 @@ export const Dag = () => {
     },
   );
 
-  const { tabs: processedTabs } = useRequiredActionTabs({ dagId }, tabs, {
-    refetchInterval:
-      (dag?.active_runs_count ?? 0) > 0 || (latestRun && isStatePending(latestRun.state))
-        ? refetchInterval
-        : false,
-  });
-
-  const displayTabs = processedTabs.filter((tab) => {
+  const displayTabs = tabs.filter((tab) => {
     if (dag?.timetable_summary === null && tab.value === "backfills") {
       return false;
     }

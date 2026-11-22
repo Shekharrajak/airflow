@@ -24,13 +24,20 @@ from airflow.providers.common.compat.sdk import dag, task
 
 
 # [START howto_decorator_llm_pipeline]
-@dag
+# Pydantic output classes must be defined at module scope so they can be
+# imported by name when downstream tasks deserialize the XCom payload.
+class TicketAnalysis(BaseModel):
+    """Structured analysis of a single support ticket."""
+
+    priority: str
+    category: str
+    summary: str
+    suggested_action: str
+
+
+@dag(tags=["example"])
 def example_llm_analysis_pipeline():
-    class TicketAnalysis(BaseModel):
-        priority: str
-        category: str
-        summary: str
-        suggested_action: str
+    """Triage a queue of support tickets: one model call per ticket, typed results, ready for a schedule."""
 
     @task
     def get_support_tickets():
@@ -62,14 +69,19 @@ def example_llm_analysis_pipeline():
         ),
         output_type=TicketAnalysis,
     )
+    # [START howto_decorator_llm_prompt_argument]
     def analyze_ticket(ticket: str):
-        return f"Analyze this support ticket:\n\n{ticket}"
+        # The returned prompt is rendered as a Jinja template. Reference the argument by name so
+        # the ticket text is inserted as it is, rather than formatting it into the template.
+        return "Analyze this support ticket:\n\n{{ ticket }}"
+
+    # [END howto_decorator_llm_prompt_argument]
 
     @task
-    def store_results(analyses: list[dict]):
+    def store_results(analyses: list[TicketAnalysis]):
         """Store ticket analyses. In production, this would write to a database or ticketing system."""
         for analysis in analyses:
-            print(f"[{analysis['priority'].upper()}] {analysis['category']}: {analysis['summary']}")
+            print(f"[{analysis.priority.upper()}] {analysis.category}: {analysis.summary}")
 
     tickets = get_support_tickets()
     analyses = analyze_ticket.expand(ticket=tickets)

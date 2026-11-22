@@ -22,7 +22,7 @@ import re
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from subprocess import check_call, check_output
 from typing import Literal
@@ -100,7 +100,7 @@ class BaseK8STest:
         with open(output_file_path, "w") as output_file:
             print("=" * 80, file=output_file)
             print(f"Describe resources for namespace {namespace}", file=output_file)
-            print(f"Datetime: {datetime.now(tz=timezone.utc)}", file=output_file)
+            print(f"Datetime: {datetime.now(tz=UTC)}", file=output_file)
             print("=" * 80, file=output_file)
             print("Describing pods", file=output_file)
             print("-" * 80, file=output_file)
@@ -130,8 +130,8 @@ class BaseK8STest:
     @staticmethod
     def _num_pods_in_namespace(namespace: str):
         air_pod = check_output(["kubectl", "get", "pods", "-n", namespace]).decode()
-        air_pod = air_pod.splitlines()
-        names = [re.compile(r"\s+").split(x)[0] for x in air_pod if "airflow" in x]
+        pod_lines = air_pod.splitlines()
+        names = [re.compile(r"\s+").split(x)[0] for x in pod_lines if "airflow" in x]
         return len(names)
 
     @staticmethod
@@ -238,9 +238,63 @@ class BaseK8STest:
                 tries += 1
             except requests.exceptions.ConnectionError as e:
                 check_call(["echo", f"api call failed. trying again. error {e}"])
-        if state != expected_final_state:
-            print(f"The expected state is wrong {state} != {expected_final_state} (expected)!")
-        assert state == expected_final_state
+        outcome = f"ended {state!r}" if state else "was never seen (API returned 404 or timed out)"
+        assert state == expected_final_state, (
+            f"Task {dag_id}.{task_id} in run {dag_run_id} {outcome}, expected {expected_final_state!r}"
+        )
+
+    def _print_task_instance_states(self, host, dag_id, dag_run_id):
+        """Print every task instance of a Dag run with its state, failed ones first.
+
+        This is only diagnostic output for a failing test, so it never raises.
+        """
+        try:
+            get_string = f"http://{host}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances"
+            result = self.session.get(get_string, params={"limit": 100})
+            if result.status_code != 200:
+                print(
+                    f"Could not list task instances of run {dag_run_id}: {result.status_code} {result.text}"
+                )
+                return
+            result_json = result.json()
+            task_instances = result_json["task_instances"]
+            failed_states = ("failed", "upstream_failed")
+            task_instances = sorted(task_instances, key=lambda ti: ti["state"] not in failed_states)
+            print(f"Task instances of {dag_id} run {dag_run_id}:")
+            for ti in task_instances:
+                map_index = f"[{ti['map_index']}]" if ti["map_index"] >= 0 else ""
+                print(f"  {ti['task_id']}{map_index}: {ti['state']} (try {ti['try_number']})")
+            total = result_json.get("total_entries")
+            if total is not None and total > len(task_instances):
+                print(f"  ... and {total - len(task_instances)} more")
+        except Exception as e:
+            print(f"Could not list task instances of run {dag_run_id}: {e!r}")
+
+    def wait_until_task_in_executor(self, host, dag_run_id, dag_id, task_id, timeout=60):
+        """Poll until the task instance has been handed to the executor.
+
+        Once the state is ``queued`` (or any post-queued state), the scheduler
+        has already pushed the task to the executor queue, so a subsequent
+        scheduler crash does not race with the very first scheduling step.
+        """
+        deadline = time.monotonic() + timeout
+        post_queued_states = {"queued", "running", "success", "failed", "upstream_failed", "removed"}
+        get_string = f"http://{host}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}"
+        state: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                result = self.session.get(get_string)
+                if result.status_code == 200:
+                    state = result.json().get("state")
+                    print(f"[wait_until_task_in_executor] {task_id} state={state}")
+                    if state in post_queued_states:
+                        return state
+            except requests.exceptions.ConnectionError as exc:
+                print(f"[wait_until_task_in_executor] api call failed, retrying. error={exc}")
+            time.sleep(2)
+        raise AssertionError(
+            f"task {task_id} did not reach a post-queued state within {timeout}s (last seen state: {state})"
+        )
 
     @staticmethod
     def ensure_resource_health(
@@ -265,6 +319,7 @@ class BaseK8STest:
     def ensure_dag_expected_state(self, host, logical_date, dag_id, expected_final_state, timeout):
         tries = 0
         state = ""
+        dag_run_id = None
         max_tries = max(int(timeout / 5), 1)
         # Wait some time for the operator to complete
         while tries < max_tries:
@@ -277,9 +332,11 @@ class BaseK8STest:
             result_json = result.json()
             print(f"Received: {result}")
             state = None
+            dag_run_id = None
             for dag_run in result_json["dag_runs"]:
                 if dag_run["logical_date"] == logical_date:
                     state = dag_run["state"]
+                    dag_run_id = dag_run["dag_run_id"]
             check_call(["echo", f"Attempt {tries}: Current state of dag is {state}"])
             print(f"Attempt {tries}: Current state of dag is {state}")
 
@@ -291,9 +348,14 @@ class BaseK8STest:
             self._describe_resources("airflow")
             self._describe_resources("default")
             tries += 1
-        assert state == expected_final_state
-
-        # Maybe check if we can retrieve the logs, but then we need to extend the API
+        if dag_run_id is None:
+            raise AssertionError(f"No run of Dag {dag_id} with logical date {logical_date} was found")
+        if state != expected_final_state:
+            self._print_task_instance_states(host, dag_id, dag_run_id)
+        assert state == expected_final_state, (
+            f"Dag {dag_id} run {dag_run_id} (logical date {logical_date}) ended {state!r}, "
+            f"expected {expected_final_state!r}"
+        )
 
     def start_dag(self, dag_id, host):
         patch_string = f"http://{host}/dags/{dag_id}"
@@ -323,7 +385,7 @@ class BaseK8STest:
         post_string = f"http://{host}/dags/{dag_id}/dagRuns"
         print(f"Calling [start_dag]#2 {post_string}")
 
-        logical_date = datetime.now(timezone.utc).isoformat()
+        logical_date = datetime.now(UTC).isoformat()
         # Trigger a new dagrun
         result = self.session.post(post_string, json={"logical_date": logical_date})
         try:

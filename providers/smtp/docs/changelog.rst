@@ -27,6 +27,164 @@
 Changelog
 ---------
 
+3.2.2
+.....
+
+Misc
+~~~~
+
+* ``Give the SMTP emailer its own defaults for the [smtp] options (#76346)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+3.2.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix async SmtpHook connections failing when STARTTLS is enabled, and raise aiosmtplib minimum to 5.1.0 (#75529)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``[main] Upgrade important CI environment (#76278)``
+
+3.2.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add emailer utilities to the SMTP provider (#74623)``
+
+Doc-only
+~~~~~~~~
+
+* ``Fix SMTP email backend documentation link (#75243)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+3.1.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Reconnect SMTP connections after leaving a hook context manager (#74416)``
+
+Misc
+~~~~
+
+* ``Drop support for Python 3.10 (#74157)``
+
+Doc-only
+~~~~~~~~
+
+* ``Update provider READMEs for the Python 3.11 baseline (#74158)``
+* ``Use "Airflow versions" in user-facing docs, not "cores" (#74045)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``[main] Upgrade important CI environment (#73629)``
+
+3.1.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Template every connection id accepted by provider operators (#73286)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Revert "[main] Upgrade important CI environment (#73308)" (#73621)``
+   * ``[main] Upgrade important CI environment (#73308)``
+
+3.0.4
+.....
+
+Misc
+~~~~
+
+* ``Fix late-binding loop variable in the SMTP OAuth2 callback (#70640)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Bump the minimum common-compat version (#72503)``
+   * ``Adopt flit 4 as the provider distribution build backend (#71186)``
+
+3.0.3
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Escape attachment filename in Content-Disposition header (#69435)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+3.0.2
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix "AttributeError: 'NoneType' object has no attribute 'close'" for SmtpHook (#62409)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Fix inconsistency between generated provider docs and pyproject.toml (#68991)``
+
+3.0.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix SMTP connection test for noop tuple response (#66406)``
+* ``Fix SMTP email callback to use email_conn_id (#65072)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add explicit [tool.flit.sdist] sections to flit-based pyproject.tomls (#65861)``
+   * ``Providers wave 2026-04-21 (#65614)``
+   * ``Providers wave 2026-04-21``
+
+3.0.0
+.....
+
+Breaking changes
+~~~~~~~~~~~~~~~~
+
+The SMTP STARTTLS upgrade performed by ``SmtpHook.get_conn`` and ``SmtpHook.aget_conn`` now
+validates the SMTP server's certificate against the system's trusted CA bundle by default.
+Previously the ``starttls()`` call was made without an SSL context, so any certificate was
+accepted.
+
+Deployments that intentionally point ``SmtpHook`` at an SMTP server with a self-signed or
+otherwise non-validating certificate and need to preserve the previous behaviour must set the
+``ssl_context`` field in the SMTP connection extras to ``"none"``. Leaving the field unset (or
+setting it to ``"default"``) now applies ``ssl.create_default_context()`` to the STARTTLS
+upgrade as well as to the existing ``SMTP_SSL`` path.
+
+* ``Validate SMTP server certificate on STARTTLS upgrade (#65346)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+2.4.5
+.....
+
+Misc
+~~~~
+
+* ``Load hook metadata from YAML without importing Hook class (#63826)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
 
 2.4.4
 .....

@@ -37,6 +37,24 @@ def get_provider_info():
         ],
         "hooks": [{"integration-name": "ODBC", "python-modules": ["airflow.providers.odbc.hooks.odbc"]}],
         "connection-types": [
-            {"hook-class-name": "airflow.providers.odbc.hooks.odbc.OdbcHook", "connection-type": "odbc"}
+            {
+                "hook-class-name": "airflow.providers.odbc.hooks.odbc.OdbcHook",
+                "hook-name": "ODBC",
+                "connection-type": "odbc",
+            }
         ],
+        "config": {
+            "providers.odbc": {
+                "description": "This section applies for the ODBC provider and connection type.",
+                "options": {
+                    "allow_driver_in_extra": {
+                        "description": "Whether to allow using ``driver`` set in the connection's ``extra`` field. If set to False,\n``driver`` will be ignored. If enabling this functionality, you should make sure that you\ntrust the users who can edit connections to not use it maliciously.\n",
+                        "version_added": "4.0.0",
+                        "type": "boolean",
+                        "example": None,
+                        "default": "False",
+                    }
+                },
+            }
+        },
     }

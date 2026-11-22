@@ -39,6 +39,7 @@ class MemrayTraceComponents(Enum):
     scheduler = "scheduler"
     dag_processor = "dag_processor"
     api = "api"
+    triggerer = "triggerer"
 
 
 def enable_memray_trace(component: MemrayTraceComponents) -> Callable[[Callable[PS, RT]], Callable[PS, RT]]:
@@ -50,11 +51,14 @@ def enable_memray_trace(component: MemrayTraceComponents) -> Callable[[Callable[
     """
 
     def decorator(func: Callable[PS, RT]) -> Callable[PS, RT]:
+        # Keep this ignore[return]: memray's stub types Tracker.__exit__ as -> bool, so mypy assumes
+        # exceptions may be swallowed. It only looks unused when memray isn't installed (CI installs it).
         @wraps(func)
         def wrapper(*args: PS.args, **kwargs: PS.kwargs) -> RT:  # type: ignore[return]
             _memray_trace_components = conf.getenumlist(
                 "profiling", "memray_trace_components", MemrayTraceComponents
             )
+            is_detailed_tracing = conf.getboolean("profiling", "memray_detailed_tracing")
             if component not in _memray_trace_components:
                 return func(*args, **kwargs)
 
@@ -63,7 +67,9 @@ def enable_memray_trace(component: MemrayTraceComponents) -> Callable[[Callable[
 
                 profile_path = f"{AIRFLOW_HOME}/{component.value}_memory.bin"
                 with memray.Tracker(
-                    profile_path,
+                    file_name=profile_path,
+                    native_traces=is_detailed_tracing,
+                    trace_python_allocators=is_detailed_tracing,
                 ):
                     log.info("Memray tracing enabled for %s. Output: %s", component.value, profile_path)
                     return func(*args, **kwargs)

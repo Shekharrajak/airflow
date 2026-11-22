@@ -17,16 +17,16 @@
  under the License.
 */}}
 
-################################
+############################
 ## Airflow Redis StatefulSet
-#################################
-{{- if and .Values.redis.enabled (or (contains "CeleryExecutor" .Values.executor) (contains "CeleryKubernetesExecutor" .Values.executor)) }}
+############################
+{{- if and .Values.redis.enabled (contains "CeleryExecutor" .Values.executor) }}
 {{- $nodeSelector := or .Values.redis.nodeSelector .Values.nodeSelector }}
 {{- $affinity := or .Values.redis.affinity .Values.affinity }}
 {{- $tolerations := or .Values.redis.tolerations .Values.tolerations }}
 {{- $topologySpreadConstraints := or .Values.redis.topologySpreadConstraints .Values.topologySpreadConstraints }}
-{{- $securityContext := include "localPodSecurityContext" .Values.redis }}
-{{- $containerSecurityContext := include "externalContainerSecurityContext" .Values.redis }}
+{{- $securityContext := include "localPodSecurityContext" (list .Values.redis .Values) }}
+{{- $containerSecurityContext := include "externalContainerSecurityContext" (list .Values.redis .Values) }}
 {{- $containerLifecycleHooks := .Values.redis.containerLifecycleHooks }}
 {{- $persistence := .Values.redis.persistence.enabled }}
 apiVersion: apps/v1
@@ -83,16 +83,21 @@ spec:
       topologySpreadConstraints: {{- toYaml $topologySpreadConstraints | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "redis.serviceAccountName" . }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
       {{- if .Values.schedulerName }}
       schedulerName: {{ .Values.schedulerName }}
       {{- end }}
       imagePullSecrets: {{ include "image_pull_secrets" . | nindent 8 }}
+      {{- if $securityContext }}
       securityContext: {{ $securityContext | nindent 8 }}
+      {{- end }}
       containers:
         - name: redis
           image: {{ template "redis_image" . }}
           imagePullPolicy: {{ .Values.images.redis.pullPolicy }}
+          {{- if $containerSecurityContext }}
           securityContext: {{ $containerSecurityContext | nindent 12 }}
+          {{- end }}
           {{- if $containerLifecycleHooks }}
           lifecycle: {{- tpl (toYaml $containerLifecycleHooks) . | nindent 12 }}
           {{- end }}

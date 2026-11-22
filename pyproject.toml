@@ -17,12 +17,12 @@
 
 [build-system]
 requires = [
-    "hatchling==1.29.0",
-    "packaging==26.0",
-    "pathspec==1.0.4",
-    "pluggy==1.6.0",
-    "tomli==2.4.0; python_version < '3.11'",
-    "trove-classifiers==2026.1.14.14",
+    "hatchling==1.33.0",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.7.0",
+    "tomlkit==0.15.2",
+    "trove-classifiers==2026.9.21.13",
 ]
 build-backend = "hatchling.build"
 
@@ -32,7 +32,7 @@ description = "Programmatically author, schedule and monitor data pipelines"
 readme = { file = "generated/PYPI_README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.10,!=3.15"
+requires-python = ">=3.11,!=3.15"
 authors = [
     { name = "Apache Software Foundation", email = "dev@airflow.apache.org" },
 ]
@@ -47,7 +47,6 @@ classifiers = [
     "Framework :: Apache Airflow",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -56,14 +55,18 @@ classifiers = [
 ]
 
 # Version is defined in src/airflow/__init__.py and it is automatically synchronized by prek
-version = "3.2.0"
+version = "3.5.0"
 
 dependencies = [
-    "apache-airflow-task-sdk<1.3.0,>=1.2.0",
-    "apache-airflow-core==3.2.0",
+    "apache-airflow-task-sdk<1.6.0,>=1.5.0",
+    "apache-airflow-core==3.5.0",
 ]
 
 packages = []
+
+[project.scripts]
+# Definition allowing direct execution via `uvx apache-airflow ...`
+apache-airflow = "airflow.__main__:main"
 
 [project.optional-dependencies]
 # Automatically generated airflow optional dependencies (update_airflow_pyproject_toml.py)
@@ -97,14 +100,26 @@ packages = []
 "airbyte" = [
     "apache-airflow-providers-airbyte>=5.0.0"
 ]
+"akeyless" = [
+    "apache-airflow-providers-akeyless>=0.1.0"
+]
 "alibaba" = [
     "apache-airflow-providers-alibaba>=3.0.0"
 ]
 "amazon" = [
     "apache-airflow-providers-amazon>=9.0.0"
 ]
+"anthropic" = [
+    "apache-airflow-providers-anthropic>=0.1.0"
+]
+"apache.arrow" = [
+    "apache-airflow-providers-apache-arrow>=0.1.0"
+]
+"apache.beam" = [
+    "apache-airflow-providers-apache-beam>=5.8.1"
+]
 "apache.cassandra" = [
-    "apache-airflow-providers-apache-cassandra>=3.7.0; python_version !=\"3.14\""
+    "apache-airflow-providers-apache-cassandra>=3.7.0"
 ]
 "apache.drill" = [
     "apache-airflow-providers-apache-drill>=2.8.1"
@@ -146,7 +161,7 @@ packages = []
     "apache-airflow-providers-apache-spark>=4.11.1"
 ]
 "apache.tinkerpop" = [
-    "apache-airflow-providers-apache-tinkerpop>=1.0.0"
+    "apache-airflow-providers-apache-tinkerpop>=1.0.0; python_version !=\"3.14\""
 ]
 "apprise" = [
     "apache-airflow-providers-apprise>=1.4.1"
@@ -163,6 +178,9 @@ packages = []
 "celery" = [
     "apache-airflow-providers-celery>=3.8.3"
 ]
+"clickhousedb" = [
+    "apache-airflow-providers-clickhousedb>=1.0.0"
+]
 "cloudant" = [
     "apache-airflow-providers-cloudant>=4.0.1"
 ]
@@ -173,7 +191,7 @@ packages = []
     "apache-airflow-providers-cohere>=1.4.0"
 ]
 "common.ai" = [
-    "apache-airflow-providers-common-ai>=0.0.1" # Set from local provider pyproject.toml
+    "apache-airflow-providers-common-ai>=0.1.0"
 ]
 "common.compat" = [
     "apache-airflow-providers-common-compat>=1.2.1"
@@ -205,17 +223,20 @@ packages = []
 "docker" = [
     "apache-airflow-providers-docker>=3.14.1"
 ]
+"duckdb" = [
+    "apache-airflow-providers-duckdb>=0.2.0"
+]
 "edge3" = [
     "apache-airflow-providers-edge3>=1.0.0"
 ]
 "elasticsearch" = [
-    "apache-airflow-providers-elasticsearch>=6.5.0" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
+    "apache-airflow-providers-elasticsearch>=6.6.0" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
 ]
 "exasol" = [
     "apache-airflow-providers-exasol>=4.6.1"
 ]
 "fab" = [
-    "apache-airflow-providers-fab>=2.2.0" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
+    "apache-airflow-providers-fab>=3.6.0" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
 ]
 "facebook" = [
     "apache-airflow-providers-facebook>=3.7.0"
@@ -240,6 +261,15 @@ packages = []
 ]
 "http" = [
     "apache-airflow-providers-http>=4.13.2"
+]
+"huggingface" = [
+    "apache-airflow-providers-huggingface>=0.1.0"
+]
+"ibm.db2" = [
+    "apache-airflow-providers-ibm-db2>=0.1.0; platform_machine !=\"aarch64\""
+]
+"ibm.mq" = [
+    "apache-airflow-providers-ibm-mq>=0.1.0; platform_machine !=\"aarch64\" and platform_machine !=\"arm64\""
 ]
 "imap" = [
     "apache-airflow-providers-imap>=3.8.0"
@@ -271,6 +301,9 @@ packages = []
 "microsoft.winrm" = [
     "apache-airflow-providers-microsoft-winrm>=3.6.1"
 ]
+"modal" = [
+    "apache-airflow-providers-modal>=0.1.0"
+]
 "mongo" = [
     "apache-airflow-providers-mongo>=4.2.2"
 ]
@@ -293,7 +326,7 @@ packages = []
     "apache-airflow-providers-openlineage>=2.3.0" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
 ]
 "opensearch" = [
-    "apache-airflow-providers-opensearch>=1.5.0"
+    "apache-airflow-providers-opensearch>=1.9.3" # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
 ]
 "opsgenie" = [
     "apache-airflow-providers-opsgenie>=5.8.0"
@@ -376,6 +409,9 @@ packages = []
 "vertica" = [
     "apache-airflow-providers-vertica>=3.9.1"
 ]
+"vespa" = [
+    "apache-airflow-providers-vespa>=0.1.0"
+]
 "weaviate" = [
     "apache-airflow-providers-weaviate>=3.0.0"
 ]
@@ -389,12 +425,16 @@ packages = []
     "apache-airflow-providers-zendesk>=4.9.0"
 ]
 "all" = [
-    "apache-airflow[aiobotocore,amazon-aws-auth,apache-atlas,apache-webhdfs,async,cloudpickle,github-enterprise,google-auth,graphviz,gunicorn,kerberos,ldap,memray,otel,pandas,polars,rabbitmq,s3fs,sentry,statsd,uv]",
+    "apache-airflow[aiobotocore,amazon-aws-auth,apache-atlas,apache-webhdfs,async,cloudpickle,fab-oauth,github-enterprise,google-auth,graphviz,gunicorn,kerberos,ldap,memray,otel,pandas,polars,rabbitmq,s3fs,sentry,statsd,uv]",
     "apache-airflow-core[all]",
     "apache-airflow-providers-airbyte>=5.0.0",
+    "apache-airflow-providers-akeyless>=0.1.0",
     "apache-airflow-providers-alibaba>=3.0.0",
     "apache-airflow-providers-amazon>=9.0.0",
-    "apache-airflow-providers-apache-cassandra>=3.7.0; python_version !=\"3.14\"",
+    "apache-airflow-providers-anthropic>=0.1.0",
+    "apache-airflow-providers-apache-arrow>=0.1.0",
+    "apache-airflow-providers-apache-beam>=5.8.1",
+    "apache-airflow-providers-apache-cassandra>=3.7.0",
     "apache-airflow-providers-apache-drill>=2.8.1",
     "apache-airflow-providers-apache-druid>=3.12.0",
     "apache-airflow-providers-apache-flink>=1.6.0",
@@ -408,16 +448,17 @@ packages = []
     "apache-airflow-providers-apache-pig>=4.6.0",
     "apache-airflow-providers-apache-pinot>=4.5.1",
     "apache-airflow-providers-apache-spark>=4.11.1",
-    "apache-airflow-providers-apache-tinkerpop>=1.0.0",
+    "apache-airflow-providers-apache-tinkerpop>=1.0.0; python_version !=\"3.14\"",
     "apache-airflow-providers-apprise>=1.4.1",
     "apache-airflow-providers-arangodb>=2.7.0",
     "apache-airflow-providers-asana>=2.7.0",
     "apache-airflow-providers-atlassian-jira>=2.7.1",
     "apache-airflow-providers-celery>=3.8.3",
+    "apache-airflow-providers-clickhousedb>=1.0.0",
     "apache-airflow-providers-cloudant>=4.0.1",
     "apache-airflow-providers-cncf-kubernetes>=9.0.0",
     "apache-airflow-providers-cohere>=1.4.0",
-    "apache-airflow-providers-common-ai>=0.0.1", # Set from local provider pyproject.toml
+    "apache-airflow-providers-common-ai>=0.1.0",
     "apache-airflow-providers-common-compat>=1.2.1",
     "apache-airflow-providers-common-io>=1.4.2",
     "apache-airflow-providers-common-messaging>=2.0.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
@@ -428,10 +469,11 @@ packages = []
     "apache-airflow-providers-dingding>=3.7.0",
     "apache-airflow-providers-discord>=3.9.0",
     "apache-airflow-providers-docker>=3.14.1",
+    "apache-airflow-providers-duckdb>=0.2.0",
     "apache-airflow-providers-edge3>=1.0.0",
-    "apache-airflow-providers-elasticsearch>=6.5.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
+    "apache-airflow-providers-elasticsearch>=6.6.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
     "apache-airflow-providers-exasol>=4.6.1",
-    "apache-airflow-providers-fab>=2.2.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
+    "apache-airflow-providers-fab>=3.6.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
     "apache-airflow-providers-facebook>=3.7.0",
     "apache-airflow-providers-ftp>=3.12.0",
     "apache-airflow-providers-git>=0.0.2", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
@@ -440,6 +482,9 @@ packages = []
     "apache-airflow-providers-grpc>=3.7.0",
     "apache-airflow-providers-hashicorp>=4.0.0",
     "apache-airflow-providers-http>=4.13.2",
+    "apache-airflow-providers-huggingface>=0.1.0",
+    "apache-airflow-providers-ibm-db2>=0.1.0; platform_machine !=\"aarch64\"",
+    "apache-airflow-providers-ibm-mq>=0.1.0; platform_machine !=\"aarch64\" and platform_machine !=\"arm64\"",
     "apache-airflow-providers-imap>=3.8.0",
     "apache-airflow-providers-influxdb>=2.8.0",
     "apache-airflow-providers-informatica>=0.1.1",
@@ -450,6 +495,7 @@ packages = []
     "apache-airflow-providers-microsoft-mssql>=3.9.2",
     "apache-airflow-providers-microsoft-psrp>=3.0.0",
     "apache-airflow-providers-microsoft-winrm>=3.6.1",
+    "apache-airflow-providers-modal>=0.1.0",
     "apache-airflow-providers-mongo>=4.2.2",
     "apache-airflow-providers-mysql>=5.7.2",
     "apache-airflow-providers-neo4j>=3.8.0",
@@ -457,7 +503,7 @@ packages = []
     "apache-airflow-providers-openai>=1.5.0",
     "apache-airflow-providers-openfaas>=3.7.0",
     "apache-airflow-providers-openlineage>=2.3.0", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
-    "apache-airflow-providers-opensearch>=1.5.0",
+    "apache-airflow-providers-opensearch>=1.9.3", # Set from MIN_VERSION_OVERRIDE in update_airflow_pyproject_toml.py
     "apache-airflow-providers-opsgenie>=5.8.0",
     "apache-airflow-providers-oracle>=3.12.0",
     "apache-airflow-providers-pagerduty>=3.8.1",
@@ -485,6 +531,7 @@ packages = []
     "apache-airflow-providers-teradata>=2.6.1",
     "apache-airflow-providers-trino>=5.8.1",
     "apache-airflow-providers-vertica>=3.9.1",
+    "apache-airflow-providers-vespa>=0.1.0",
     "apache-airflow-providers-weaviate>=3.0.0",
     "apache-airflow-providers-yandex>=4.0.0",
     "apache-airflow-providers-ydb>=1.4.0",
@@ -508,15 +555,18 @@ packages = []
    "apache-airflow-providers-amazon[python3-saml]",
 ]
 "cloudpickle" = [
-    "cloudpickle>=2.2.1",
+    # Remove this cap once snowflake-snowpark-python relaxes its own cloudpickle pin;
+    # tracked at https://github.com/apache/airflow/issues/70084
+    "cloudpickle>=2.2.1,<3.1.2",
+]
+"fab-oauth" = [
+    "apache-airflow-providers-fab[oauth]",
 ]
 "github-enterprise" = [
-    "apache-airflow-providers-fab>=2.2.0",
-    "authlib>=1.0.0",
+    "apache-airflow-providers-fab[oauth]",
 ]
 "google-auth" = [
-    "apache-airflow-providers-fab>=2.2.0",
-    "authlib>=1.0.0",
+    "apache-airflow-providers-fab[oauth]",
 ]
 "ldap" = [
     "python-ldap>=3.4.4",
@@ -539,7 +589,7 @@ packages = []
     "apache-airflow-providers-amazon[s3fs]",
 ]
 "uv" = [
-    "uv>=0.10.12",
+    "uv>=0.13.7",
 ]
 
 [project.urls]
@@ -552,8 +602,15 @@ Homepage = "https://airflow.apache.org/"
 "Source Code" = "https://github.com/apache/airflow"
 LinkedIn = "https://www.linkedin.com/company/apache-airflow/"
 Mastodon = "https://fosstodon.org/@airflow"
-Bluesky = "https://bsky.app/profile/apache-airflow.bsky.social"
+Bluesky = "https://bsky.app/profile/airflow.apache.org"
 YouTube = "https://www.youtube.com/channel/UCSXwxpWZQ7XZ1WL3wqevChA/"
+
+[tool.hatch.build]
+# Prune .gitignore'd directories (node_modules, .venv, ...) during the file walk instead of only
+# filtering their files: an editable build of this root package otherwise descends into
+# ts-sdk/node_modules and crashes with FileNotFoundError when a concurrent `pnpm install`
+# (ts-sdk prek hooks run alongside root ones) swaps the pnpm symlinks under it.
+skip-excluded-dirs = true
 
 [tool.hatch.build.targets.sdist]
 exclude = ["*"]
@@ -578,6 +635,11 @@ extend-exclude = [
 
 [tool.ruff.lint]
 typing-modules = ["airflow.typing_compat"]
+external = ["MIG"]
+# Pin the base rule set instead of inheriting Ruff's default, which Ruff changes
+# between releases (0.16 widened it from ~250 to ~510 rules). Everything Airflow
+# actually opts into lives in extend-select below.
+select = ["E4", "E7", "E9", "F"]
 extend-select = [
     # Enable entire ruff rule section
     "I", # Missing required import (auto-fixable)
@@ -588,6 +650,7 @@ extend-select = [
     "G", # flake8-logging-format rules
     "LOG", # flake8-logging rules, most of them autofixable
     "PT", # flake8-pytest-style rules
+    "B015", # Useless comparison: bare `a == b` is a no-op; prepend `assert` or remove
     "TID25", # flake8-tidy-imports rules
     "E", # pycodestyle rules
     "W", # pycodestyle rules
@@ -615,6 +678,7 @@ extend-select = [
     "PLW2101", # Threading lock directly created in with statement has no effect
     "PLW2901", # Outer {outer_kind} variable {name} overwritten by inner {inner_kind} target
     "PLW3301", # Nested {func} calls can be flattened
+    "PLE1205", # Logging format string has too many arguments (extra args are silently dropped)
     # Per rule enables
     "RUF006", # Checks for asyncio dangling task
     "RUF015", # Checks for unnecessary iterable allocation for first element
@@ -640,15 +704,19 @@ extend-select = [
     "B004", # Checks for use of hasattr(x, "__call__") and replaces it with callable(x)
     "B006", # Checks for uses of mutable objects as function argument defaults.
     "B007", # Checks for unused variables in the loop
+    "B008", # Do not perform function call in argument defaults (use extend-immutable-calls for FastAPI DI)
     "B012", # Checks for `break`, `continue`, and `return` statements in `finally` blocks
     "B017", # Checks for pytest.raises context managers that catch Exception or BaseException.
     "B019", # Use of functools.lru_cache or functools.cache on methods can lead to memory leaks
+    "B023", # Function definition does not bind loop variable (late binding of closure over loop var)
     "B028", # No explicit stacklevel keyword argument found
     "TRY002", # Prohibit use of `raise Exception`, use specific exceptions instead.
     "RET505", # Unnecessary {branch} after return statement
     "RET506", # Unnecessary {branch} after raise statement
     "RET507", # Unnecessary {branch} after continue statement
     "RET508", # Unnecessary {branch} after break statement
+    "SIM105", # Use contextlib.suppress({exception}) instead of try-except-pass
+    "PTH206", # Checks for uses of .split(os.sep)
 ]
 ignore = [
     "D100", # Unwanted; Docstring at the top of every file.
@@ -680,13 +748,35 @@ ignore = [
     "COM812",
     "COM819",
     "E501", # Formatted code may exceed the line length, leading to line-too-long (E501) errors.
-    "ASYNC110", # TODO: Use `anyio.Event` instead of awaiting `anyio.sleep` in a `while` loop
-    "SIM105", # Use contextlib.suppress({exception}) instead of try-except-pass
+    # New in Ruff 0.16, inside sections Airflow selects wholesale. Deferred so a tooling
+    # bump does not also carry semantic changes; both need per-site judgement.
+    "ISC004", # Implicit string concat in a collection literal; 109 sites, unsafe autofix
+    # LOG004 is not a mechanical replacement: switching to `.error()` where an exception is
+    # in flight silently drops the traceback, while leaving `.exception()` where none is
+    # only prints a bare `NoneType: None`. Review already caught one bad guess in 13.
+    "LOG004", # `.exception()` outside an exception handler; 13 sites
+    # Both became reportable once the baseline moved to Python 3.11. Neither is a mechanical
+    # change: StrEnum alters what ``str()`` and ``format()`` return for serialized enum values,
+    # and ``asyncio.timeout`` means dropping the public ``timeout`` parameter from async APIs.
+    "UP042", # Class inherits from both `str` and `enum.Enum`; 98 sites
+    "ASYNC109", # Async function with a `timeout` parameter; 49 sites
 ]
 unfixable = [
     # PT022 replace empty `yield` to empty `return`. Might be fixed with a combination of PLR1711
     # In addition, it can't do anything with invalid typing annotations, protected by mypy.
     "PT022",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency injection uses function calls in argument defaults intentionally.
+# SHA256 is a stateless algorithm descriptor (cryptography library).
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Security",
+    "cryptography.hazmat.primitives.hashes.SHA256",
 ]
 
 [tool.ruff.format]
@@ -782,7 +872,7 @@ testing = ["dev", "providers.tests", "tests_common", "tests", "system", "unit", 
 "docker-tests/*" = ["D", "TID253", "S101", "TRY002"]
 "task-sdk-integration-tests/*" = ["D", "TID253", "S101", "TRY002"]
 "kubernetes-tests/*" = ["D", "TID253", "S101", "TRY002"]
-"helm-tests/*" = ["D", "TID253", "S101", "TRY002"]
+"chart/tests/*" = ["D", "TID253", "S101", "TRY002"]
 "providers/**/tests/*" = ["D", "TID253", "S101", "TRY002"]
 "performance/tests/*" = ["S101"]
 "dev/registry/tests/*" = ["S101"]
@@ -835,7 +925,7 @@ testing = ["dev", "providers.tests", "tests_common", "tests", "system", "unit", 
 "devel-common/src/sphinx_exts/exampleinclude.py" = ["E402", 'F401', ]
 
 # All the modules which do not follow B028 yet: https://docs.astral.sh/ruff/rules/no-explicit-stacklevel/
-"helm-tests/tests/helm_tests/airflow_aux/test_basic_helm_chart.py" = ["B028"]
+"chart/tests/helm_tests/airflow_aux/test_basic_helm_chart.py" = ["B028"]
 
 # While pandas import is banned, sql.pyi should be excluded from it as it does not have a TYPE_CHECKING
 # mechanism and whole .pyi is really "type-checking" only
@@ -855,13 +945,14 @@ banned-module-level-imports = ["numpy", "pandas", "polars"]
 "airflow.AirflowException".msg = "Use airflow.exceptions.AirflowException instead."
 
 # Deprecated imports
+"airflow.utils.operator_helpers.KeywordParameters".msg = "Use airflow.providers.common.compat.sdk.KeywordParameters or airflow.sdk.bases.decorator.KeywordParameters"
+"airflow.utils.operator_helpers.determine_kwargs".msg = "Use airflow.providers.common.compat.sdk.determine_kwargs or airflow.sdk.bases.decorator.determine_kwargs"
 "airflow.models.errors.ImportError".msg = "Use airflow.models.errors.ParseImportError"
 "airflow.models.ImportError".msg = "Use airflow.models.errors.ParseImportError"
 
 # Note: we have to specify these all here (not in sub pyproject.toml files), else we'd have to duplicate these
 # all rules in each project https://github.com/astral-sh/ruff/issues/18723
-# Add this once providers are sorted
-# "airflow.utils.timezone".msg = "Use airflow.sdk.timezone (or airflow._shared.timezones.timezone from within airflow-core)"
+"airflow.utils.timezone".msg = "Use airflow.sdk.timezone (or airflow._shared.timezones.timezone from within airflow-core)"
 # "airflow_shared".msg = "Use airflow._shared or airflow.sdk._shared instead"
 
 # Deprecated in Python 3.11, Pending Removal in Python 3.15: https://github.com/python/cpython/issues/90817
@@ -943,6 +1034,7 @@ filterwarnings = [
     # Avoid building cartesian product which might impact performance
     "error:SELECT statement has a cartesian product between FROM:sqlalchemy.exc.SAWarning:airflow",
     'error:Coercing Subquery object into a select\(\) for use in IN\(\):sqlalchemy.exc.SAWarning:airflow',
+    'error:implicitly coercing SELECT object to scalar subquery:sqlalchemy.exc.SAWarning:airflow',
     'error:Class.*will not make use of SQL compilation caching',
     "ignore::DeprecationWarning:flask_appbuilder.filemanager",
     "ignore::DeprecationWarning:flask_appbuilder.widgets",
@@ -1016,8 +1108,8 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = false
 plugins = [
-    "dev/airflow_mypy/plugin/decorators.py",
-    "dev/airflow_mypy/plugin/outputs.py",
+    "airflow_mypy.plugins.decorators",
+    "airflow_mypy.plugins.outputs",
 ]
 pretty = true
 show_error_codes = true
@@ -1041,17 +1133,25 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/airflow-ctl-tests/tests",
     "$MYPY_CONFIG_FILE_DIR/dev",
     "$MYPY_CONFIG_FILE_DIR/devel-common/src",
-    "$MYPY_CONFIG_FILE_DIR/helm-tests/tests",
+    "$MYPY_CONFIG_FILE_DIR/chart/tests",
     "$MYPY_CONFIG_FILE_DIR/kubernetes-tests/tests",
     "$MYPY_CONFIG_FILE_DIR/docker-tests/tests",
     "$MYPY_CONFIG_FILE_DIR/task-sdk-integration-tests/tests",
     # Automatically generated mypy paths (update_airflow_pyproject_toml.py)
     "$MYPY_CONFIG_FILE_DIR/providers/airbyte/src",
     "$MYPY_CONFIG_FILE_DIR/providers/airbyte/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/akeyless/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/akeyless/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/alibaba/src",
     "$MYPY_CONFIG_FILE_DIR/providers/alibaba/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/amazon/src",
     "$MYPY_CONFIG_FILE_DIR/providers/amazon/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/anthropic/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/anthropic/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/apache/arrow/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/apache/arrow/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/apache/beam/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/apache/beam/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/apache/cassandra/src",
     "$MYPY_CONFIG_FILE_DIR/providers/apache/cassandra/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/apache/drill/src",
@@ -1092,6 +1192,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/atlassian/jira/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/celery/src",
     "$MYPY_CONFIG_FILE_DIR/providers/celery/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/clickhousedb/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/clickhousedb/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/cloudant/src",
     "$MYPY_CONFIG_FILE_DIR/providers/cloudant/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/cncf/kubernetes/src",
@@ -1102,6 +1204,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/common/ai/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/common/compat/src",
     "$MYPY_CONFIG_FILE_DIR/providers/common/compat/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/common/dataquality/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/common/dataquality/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/common/io/src",
     "$MYPY_CONFIG_FILE_DIR/providers/common/io/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/common/messaging/src",
@@ -1120,6 +1224,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/discord/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/docker/src",
     "$MYPY_CONFIG_FILE_DIR/providers/docker/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/duckdb/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/duckdb/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/edge3/src",
     "$MYPY_CONFIG_FILE_DIR/providers/edge3/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/elasticsearch/src",
@@ -1144,6 +1250,12 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/hashicorp/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/http/src",
     "$MYPY_CONFIG_FILE_DIR/providers/http/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/huggingface/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/huggingface/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/ibm/db2/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/ibm/db2/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/ibm/mq/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/ibm/mq/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/imap/src",
     "$MYPY_CONFIG_FILE_DIR/providers/imap/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/influxdb/src",
@@ -1164,6 +1276,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/psrp/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/winrm/src",
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/winrm/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/modal/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/modal/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/mongo/src",
     "$MYPY_CONFIG_FILE_DIR/providers/mongo/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/mysql/src",
@@ -1234,6 +1348,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/trino/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/vertica/src",
     "$MYPY_CONFIG_FILE_DIR/providers/vertica/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/vespa/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/vespa/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/weaviate/src",
     "$MYPY_CONFIG_FILE_DIR/providers/weaviate/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/yandex/src",
@@ -1294,7 +1410,7 @@ dev = [
     "apache-airflow-devel-common[no-doc]",
     "apache-airflow-docker-tests",
     "apache-airflow-task-sdk-integration-tests",
-    "apache-airflow-helm-tests",
+    "apache-airflow-helm-chart",
     "apache-airflow-kubernetes-tests",
     "apache-airflow-task-sdk[all]",
     "apache-airflow-ctl",
@@ -1309,6 +1425,8 @@ dev = [
     "apache-airflow-shared-providers-discovery",
     "apache-airflow-shared-secrets-backend",
     "apache-airflow-shared-secrets-masker",
+    "apache-airflow-shared-serialization",
+    "apache-airflow-shared-state",
     "apache-airflow-shared-template-rendering",
     "apache-airflow-shared-timezones",
 ]
@@ -1337,10 +1455,399 @@ leveldb = [
     "plyvel>=1.5.1"
 ]
 
+# Aggregate of every group the CI image installs by default. Single source of
+# truth referenced from the Dockerfiles, the image install script, and the
+# breeze constraints checker. When a provider needs to register a
+# hard-to-install extra (proprietary client, needs system libs, etc.), add a
+# dedicated [dependency-groups] entry above and include it here — no Dockerfile
+# or breeze edits required. See contributing-docs/12_provider_distributions.rst.
+ci-image = [
+    {include-group = "dev"},
+    {include-group = "docs"},
+    {include-group = "docs-gen"},
+    {include-group = "leveldb"},
+]
+
 [tool.uv]
-required-version = ">=0.6.3"
+# Bump this only when the project actually relies on a newer uv feature/fix. It is a
+# minimum contributors must install, NOT the uv CI pins to — keeping it in lockstep
+# with AIRFLOW_UV_VERSION would force everyone to upgrade uv on every release. The
+# breeze/prek uv version checks read this value dynamically and tolerate a stale
+# floor; `scripts/ci/prek/upgrade_important_versions.py` deliberately skips it.
+required-version = ">=0.13.4"
 no-build-isolation-package = ["sphinx-redoc"]
-constraint-dependencies = ["lxml==6.0.2"]  # Remove after https://github.com/aws/amazon-redshift-python-driver/pull/272
+# Common AI's "llamaindex" extra cannot be installed alongside its "openai" extra:
+# llama-index-llms-openai (up to 0.8.3) caps openai below 3, and pydantic-ai-slim[openai]>=2.33
+# needs openai>=3. Declaring them as conflicting lets uv.lock resolve each one on its own, so the
+# CI image gets openai 3 and the LlamaIndex tests run in the agent framework job instead, with
+# the openai 2.x that llama-index pulls in. Remove this once run-llama/llama_index#22939 is
+# released and the llama-index packages are back in Common AI's dev group, together with the
+# workarounds that exist only because of it: LOWEST_DEPENDENCIES_EXCLUDED_EXTRAS in
+# scripts/docker/entrypoint_ci.sh (otherwise the "llamaindex" extra silently stays out of the
+# lowest-dependency sync), the llama-index entry in the agent framework CI matrix and in breeze's
+# verification plan, and released=(openai) in scripts/in_container/run_agent_framework_tests.sh.
+conflicts = [
+    [
+        { package = "apache-airflow-providers-common-ai", extra = "llamaindex" },
+        { package = "apache-airflow-providers-common-ai", extra = "openai" },
+    ],
+]
+# Synchroonize with scripts/ci/prek/upgrade_important_versions.py
+exclude-newer = "4 days"
+
+[tool.uv.exclude-newer-package]
+# Automatically generated exclude-newer-package entries (update_airflow_pyproject_toml.py)
+apache-airflow = false
+apache-airflow-breeze = false
+apache-airflow-core = false
+apache-airflow-ctl = false
+apache-airflow-ctl-tests = false
+apache-airflow-dev = false
+apache-airflow-devel-common = false
+apache-airflow-docker-stack = false
+apache-airflow-docker-tests = false
+apache-airflow-e2e-tests = false
+apache-airflow-helm-chart = false
+apache-airflow-kubernetes-tests = false
+apache-airflow-mypy = false
+apache-airflow-providers = false
+apache-airflow-providers-airbyte = false
+apache-airflow-providers-akeyless = false
+apache-airflow-providers-alibaba = false
+apache-airflow-providers-amazon = false
+apache-airflow-providers-anthropic = false
+apache-airflow-providers-apache-arrow = false
+apache-airflow-providers-apache-beam = false
+apache-airflow-providers-apache-cassandra = false
+apache-airflow-providers-apache-drill = false
+apache-airflow-providers-apache-druid = false
+apache-airflow-providers-apache-flink = false
+apache-airflow-providers-apache-hdfs = false
+apache-airflow-providers-apache-hive = false
+apache-airflow-providers-apache-iceberg = false
+apache-airflow-providers-apache-impala = false
+apache-airflow-providers-apache-kafka = false
+apache-airflow-providers-apache-kylin = false
+apache-airflow-providers-apache-livy = false
+apache-airflow-providers-apache-pig = false
+apache-airflow-providers-apache-pinot = false
+apache-airflow-providers-apache-spark = false
+apache-airflow-providers-apache-tinkerpop = false
+apache-airflow-providers-apprise = false
+apache-airflow-providers-arangodb = false
+apache-airflow-providers-asana = false
+apache-airflow-providers-atlassian-jira = false
+apache-airflow-providers-celery = false
+apache-airflow-providers-clickhousedb = false
+apache-airflow-providers-cloudant = false
+apache-airflow-providers-cncf-kubernetes = false
+apache-airflow-providers-cohere = false
+apache-airflow-providers-common-ai = false
+apache-airflow-providers-common-compat = false
+apache-airflow-providers-common-dataquality = false
+apache-airflow-providers-common-io = false
+apache-airflow-providers-common-messaging = false
+apache-airflow-providers-common-sql = false
+apache-airflow-providers-databricks = false
+apache-airflow-providers-datadog = false
+apache-airflow-providers-dbt-cloud = false
+apache-airflow-providers-dingding = false
+apache-airflow-providers-discord = false
+apache-airflow-providers-docker = false
+apache-airflow-providers-duckdb = false
+apache-airflow-providers-edge3 = false
+apache-airflow-providers-elasticsearch = false
+apache-airflow-providers-exasol = false
+apache-airflow-providers-fab = false
+apache-airflow-providers-facebook = false
+apache-airflow-providers-ftp = false
+apache-airflow-providers-git = false
+apache-airflow-providers-github = false
+apache-airflow-providers-google = false
+apache-airflow-providers-grpc = false
+apache-airflow-providers-hashicorp = false
+apache-airflow-providers-http = false
+apache-airflow-providers-huggingface = false
+apache-airflow-providers-ibm-db2 = false
+apache-airflow-providers-ibm-mq = false
+apache-airflow-providers-imap = false
+apache-airflow-providers-influxdb = false
+apache-airflow-providers-informatica = false
+apache-airflow-providers-jdbc = false
+apache-airflow-providers-jenkins = false
+apache-airflow-providers-keycloak = false
+apache-airflow-providers-microsoft-azure = false
+apache-airflow-providers-microsoft-mssql = false
+apache-airflow-providers-microsoft-psrp = false
+apache-airflow-providers-microsoft-winrm = false
+apache-airflow-providers-modal = false
+apache-airflow-providers-mongo = false
+apache-airflow-providers-mysql = false
+apache-airflow-providers-neo4j = false
+apache-airflow-providers-odbc = false
+apache-airflow-providers-openai = false
+apache-airflow-providers-openfaas = false
+apache-airflow-providers-openlineage = false
+apache-airflow-providers-opensearch = false
+apache-airflow-providers-opsgenie = false
+apache-airflow-providers-oracle = false
+apache-airflow-providers-pagerduty = false
+apache-airflow-providers-papermill = false
+apache-airflow-providers-pgvector = false
+apache-airflow-providers-pinecone = false
+apache-airflow-providers-postgres = false
+apache-airflow-providers-presto = false
+apache-airflow-providers-qdrant = false
+apache-airflow-providers-redis = false
+apache-airflow-providers-salesforce = false
+apache-airflow-providers-samba = false
+apache-airflow-providers-segment = false
+apache-airflow-providers-sendgrid = false
+apache-airflow-providers-sftp = false
+apache-airflow-providers-singularity = false
+apache-airflow-providers-slack = false
+apache-airflow-providers-smtp = false
+apache-airflow-providers-snowflake = false
+apache-airflow-providers-sqlite = false
+apache-airflow-providers-ssh = false
+apache-airflow-providers-standard = false
+apache-airflow-providers-tableau = false
+apache-airflow-providers-telegram = false
+apache-airflow-providers-teradata = false
+apache-airflow-providers-trino = false
+apache-airflow-providers-vertica = false
+apache-airflow-providers-vespa = false
+apache-airflow-providers-weaviate = false
+apache-airflow-providers-yandex = false
+apache-airflow-providers-ydb = false
+apache-airflow-providers-zendesk = false
+apache-airflow-scripts = false
+apache-airflow-shared-configuration = false
+apache-airflow-shared-dagnode = false
+apache-airflow-shared-listeners = false
+apache-airflow-shared-logging = false
+apache-airflow-shared-module-loading = false
+apache-airflow-shared-observability = false
+apache-airflow-shared-plugins-manager = false
+apache-airflow-shared-providers-discovery = false
+apache-airflow-shared-secrets-backend = false
+apache-airflow-shared-secrets-masker = false
+apache-airflow-shared-serialization = false
+apache-airflow-shared-state = false
+apache-airflow-shared-template-rendering = false
+apache-airflow-shared-timezones = false
+apache-airflow-task-sdk = false
+apache-airflow-task-sdk-integration-tests = false
+# End of automatically generated exclude-newer-package entries
+
+# Manual overrides (kept outside the auto-generated block above so the
+# update_airflow_pyproject_toml.py script doesn't clobber them).
+# Temporary: google-cloud-aiplatform 1.164.0 is the first release whose "evaluation" extra
+# allows the litellm versions that carry the Python 3.14 security fixes, and it was published
+# 2026-08-12, inside the "4 days" exclude-newer window. This pins the per-package cutoff just
+# past that release so 1.164.0 resolves while any later release stays quarantined.
+# Remove once the rolling window advances past 2026-08-12.
+google-cloud-aiplatform = "2026-08-13T00:00:00Z"
+
+# Package managers bypass the cooldown so a fix (e.g. a security or trust-store fix) can be
+# picked up as soon as it is released; keep in sync with `[tool.uv.pip.exclude-newer-package]`
+# and dev/breeze/pyproject.toml.
+pip = false
+uv = false
+
+# pypdf 6.21.4 fixes GHSA-mfr5-77xh-9j7h, GHSA-cggf-277g-3q54 and GHSA-5849-834g-hvw5 (high).
+# Remove this `exclude-newer-package` after 2026-11-02, when that release has been out for 4 days.
+pypdf = "2026-10-29T00:00:00Z"
+
+[tool.airflow.dependency-floors]
+# Floors of these dependencies are raised by `breeze ci upgrade` (scripts/ci/prek/upgrade_dependency_floors.py),
+# see dev/breeze/doc/adr/0018-raise-dependency-floors-automatically.md.
+# A floor is never raised to a release uploaded more recently than this.
+min-age = "180 days"
+packages = [
+    "boto3",
+    "botocore",
+    "google-cloud-*",
+    "google-api-python-client",
+    "azure-*",
+]
+# Members of a group always get the same floor.
+groups = [
+    ["boto3", "botocore"],
+]
+
+# Never bumped. Packages capped or excluded anywhere (<, <=, !=, ==, ~=) are skipped automatically;
+# list here the ones that must stay put for another reason, or whose cap should not be the only record.
+[tool.airflow.dependency-floors.exclude]
+sagemaker-studio = "Do not change without approval from AWS (providers/amazon/pyproject.toml)"
+pandas = "DataFrame XComs need pandas<3 (#70791)"
+pymysql = "Capped below 1.2 in PyPI constraints generation (#67491)"
+fastapi = "Repeated breakage on new releases (#59681, #59710, #59856, #61579, #68578)"
+deltalake = "Missing ARM wheels on new releases (#59977, #60098, #60376)"
+gunicorn = "API server startup deadlocks above 25.1 (#62524)"
+qdrant-client = "Capped (#62193)"
+airbyte-api = "1.x breaks provider tests (#69081)"
+mysql-connector-python = "Releases without wheels for >=3.12 (#60889, #66026)"
+anthropic = "Provider SDK migration is version-sensitive (#72072, #72094)"
+
+[tool.uv.pip]
+# Synchroonize with scripts/ci/prek/upgrade_important_versions.py
+exclude-newer = "4 days"
+
+[tool.uv.pip.exclude-newer-package]
+# Automatically generated exclude-newer-package-pip entries (update_airflow_pyproject_toml.py)
+apache-airflow = false
+apache-airflow-breeze = false
+apache-airflow-core = false
+apache-airflow-ctl = false
+apache-airflow-ctl-tests = false
+apache-airflow-dev = false
+apache-airflow-devel-common = false
+apache-airflow-docker-stack = false
+apache-airflow-docker-tests = false
+apache-airflow-e2e-tests = false
+apache-airflow-helm-chart = false
+apache-airflow-kubernetes-tests = false
+apache-airflow-mypy = false
+apache-airflow-providers = false
+apache-airflow-providers-airbyte = false
+apache-airflow-providers-akeyless = false
+apache-airflow-providers-alibaba = false
+apache-airflow-providers-amazon = false
+apache-airflow-providers-anthropic = false
+apache-airflow-providers-apache-arrow = false
+apache-airflow-providers-apache-beam = false
+apache-airflow-providers-apache-cassandra = false
+apache-airflow-providers-apache-drill = false
+apache-airflow-providers-apache-druid = false
+apache-airflow-providers-apache-flink = false
+apache-airflow-providers-apache-hdfs = false
+apache-airflow-providers-apache-hive = false
+apache-airflow-providers-apache-iceberg = false
+apache-airflow-providers-apache-impala = false
+apache-airflow-providers-apache-kafka = false
+apache-airflow-providers-apache-kylin = false
+apache-airflow-providers-apache-livy = false
+apache-airflow-providers-apache-pig = false
+apache-airflow-providers-apache-pinot = false
+apache-airflow-providers-apache-spark = false
+apache-airflow-providers-apache-tinkerpop = false
+apache-airflow-providers-apprise = false
+apache-airflow-providers-arangodb = false
+apache-airflow-providers-asana = false
+apache-airflow-providers-atlassian-jira = false
+apache-airflow-providers-celery = false
+apache-airflow-providers-clickhousedb = false
+apache-airflow-providers-cloudant = false
+apache-airflow-providers-cncf-kubernetes = false
+apache-airflow-providers-cohere = false
+apache-airflow-providers-common-ai = false
+apache-airflow-providers-common-compat = false
+apache-airflow-providers-common-dataquality = false
+apache-airflow-providers-common-io = false
+apache-airflow-providers-common-messaging = false
+apache-airflow-providers-common-sql = false
+apache-airflow-providers-databricks = false
+apache-airflow-providers-datadog = false
+apache-airflow-providers-dbt-cloud = false
+apache-airflow-providers-dingding = false
+apache-airflow-providers-discord = false
+apache-airflow-providers-docker = false
+apache-airflow-providers-duckdb = false
+apache-airflow-providers-edge3 = false
+apache-airflow-providers-elasticsearch = false
+apache-airflow-providers-exasol = false
+apache-airflow-providers-fab = false
+apache-airflow-providers-facebook = false
+apache-airflow-providers-ftp = false
+apache-airflow-providers-git = false
+apache-airflow-providers-github = false
+apache-airflow-providers-google = false
+apache-airflow-providers-grpc = false
+apache-airflow-providers-hashicorp = false
+apache-airflow-providers-http = false
+apache-airflow-providers-huggingface = false
+apache-airflow-providers-ibm-db2 = false
+apache-airflow-providers-ibm-mq = false
+apache-airflow-providers-imap = false
+apache-airflow-providers-influxdb = false
+apache-airflow-providers-informatica = false
+apache-airflow-providers-jdbc = false
+apache-airflow-providers-jenkins = false
+apache-airflow-providers-keycloak = false
+apache-airflow-providers-microsoft-azure = false
+apache-airflow-providers-microsoft-mssql = false
+apache-airflow-providers-microsoft-psrp = false
+apache-airflow-providers-microsoft-winrm = false
+apache-airflow-providers-modal = false
+apache-airflow-providers-mongo = false
+apache-airflow-providers-mysql = false
+apache-airflow-providers-neo4j = false
+apache-airflow-providers-odbc = false
+apache-airflow-providers-openai = false
+apache-airflow-providers-openfaas = false
+apache-airflow-providers-openlineage = false
+apache-airflow-providers-opensearch = false
+apache-airflow-providers-opsgenie = false
+apache-airflow-providers-oracle = false
+apache-airflow-providers-pagerduty = false
+apache-airflow-providers-papermill = false
+apache-airflow-providers-pgvector = false
+apache-airflow-providers-pinecone = false
+apache-airflow-providers-postgres = false
+apache-airflow-providers-presto = false
+apache-airflow-providers-qdrant = false
+apache-airflow-providers-redis = false
+apache-airflow-providers-salesforce = false
+apache-airflow-providers-samba = false
+apache-airflow-providers-segment = false
+apache-airflow-providers-sendgrid = false
+apache-airflow-providers-sftp = false
+apache-airflow-providers-singularity = false
+apache-airflow-providers-slack = false
+apache-airflow-providers-smtp = false
+apache-airflow-providers-snowflake = false
+apache-airflow-providers-sqlite = false
+apache-airflow-providers-ssh = false
+apache-airflow-providers-standard = false
+apache-airflow-providers-tableau = false
+apache-airflow-providers-telegram = false
+apache-airflow-providers-teradata = false
+apache-airflow-providers-trino = false
+apache-airflow-providers-vertica = false
+apache-airflow-providers-vespa = false
+apache-airflow-providers-weaviate = false
+apache-airflow-providers-yandex = false
+apache-airflow-providers-ydb = false
+apache-airflow-providers-zendesk = false
+apache-airflow-scripts = false
+apache-airflow-shared-configuration = false
+apache-airflow-shared-dagnode = false
+apache-airflow-shared-listeners = false
+apache-airflow-shared-logging = false
+apache-airflow-shared-module-loading = false
+apache-airflow-shared-observability = false
+apache-airflow-shared-plugins-manager = false
+apache-airflow-shared-providers-discovery = false
+apache-airflow-shared-secrets-backend = false
+apache-airflow-shared-secrets-masker = false
+apache-airflow-shared-serialization = false
+apache-airflow-shared-state = false
+apache-airflow-shared-template-rendering = false
+apache-airflow-shared-timezones = false
+apache-airflow-task-sdk = false
+apache-airflow-task-sdk-integration-tests = false
+# End of automatically generated exclude-newer-package-pip entries
+
+# Manual overrides — see the matching block under
+# `[tool.uv.exclude-newer-package]` above for rationale.
+# Temporary: see the google-cloud-aiplatform note in `[tool.uv.exclude-newer-package]`.
+google-cloud-aiplatform = "2026-08-13T00:00:00Z"
+# Package managers bypass the cooldown — see `[tool.uv.exclude-newer-package]`.
+pip = false
+uv = false
+# Temporary: see the pypdf note in `[tool.uv.exclude-newer-package]`.
+pypdf = "2026-10-29T00:00:00Z"
 
 [tool.uv.sources]
 # These names must match the names as defined in the pyproject.toml of the workspace items,
@@ -1348,6 +1855,7 @@ constraint-dependencies = ["lxml==6.0.2"]  # Remove after https://github.com/aws
 apache-airflow = {workspace = true}
 apache-airflow-breeze = {workspace = true}
 apache-airflow-dev = {workspace = true}
+apache-airflow-mypy = {workspace = true}
 apache-airflow-scripts = {workspace = true}
 apache-airflow-core = {workspace = true}
 apache-airflow-ctl = {workspace = true}
@@ -1357,10 +1865,10 @@ apache-airflow-devel-common = { workspace = true }
 apache-airflow-docker-tests = { workspace = true }
 apache-airflow-e2e-tests = { workspace = true }
 apache-airflow-task-sdk-integration-tests = { workspace = true }
-apache-airflow-helm-tests = { workspace = true }
+apache-airflow-helm-chart = { workspace = true }
 apache-airflow-kubernetes-tests = { workspace = true }
 apache-airflow-providers = { workspace = true }
-apache-aurflow-docker-stack = { workspace = true }
+apache-airflow-docker-stack = { workspace = true }
 apache-airflow-shared-configuration = { workspace = true }
 apache-airflow-shared-dagnode = { workspace = true }
 apache-airflow-shared-listeners = { workspace = true }
@@ -1371,12 +1879,18 @@ apache-airflow-shared-plugins-manager = { workspace = true }
 apache-airflow-shared-providers-discovery = { workspace = true }
 apache-airflow-shared-secrets-backend = { workspace = true }
 apache-airflow-shared-secrets-masker = { workspace = true }
+apache-airflow-shared-serialization = { workspace = true }
+apache-airflow-shared-state = { workspace = true }
 apache-airflow-shared-template-rendering = { workspace = true }
 apache-airflow-shared-timezones = { workspace = true }
 # Automatically generated provider workspace items (update_airflow_pyproject_toml.py)
 apache-airflow-providers-airbyte = { workspace = true }
+apache-airflow-providers-akeyless = { workspace = true }
 apache-airflow-providers-alibaba = { workspace = true }
 apache-airflow-providers-amazon = { workspace = true }
+apache-airflow-providers-anthropic = { workspace = true }
+apache-airflow-providers-apache-arrow = { workspace = true }
+apache-airflow-providers-apache-beam = { workspace = true }
 apache-airflow-providers-apache-cassandra = { workspace = true }
 apache-airflow-providers-apache-drill = { workspace = true }
 apache-airflow-providers-apache-druid = { workspace = true }
@@ -1397,11 +1911,13 @@ apache-airflow-providers-arangodb = { workspace = true }
 apache-airflow-providers-asana = { workspace = true }
 apache-airflow-providers-atlassian-jira = { workspace = true }
 apache-airflow-providers-celery = { workspace = true }
+apache-airflow-providers-clickhousedb = { workspace = true }
 apache-airflow-providers-cloudant = { workspace = true }
 apache-airflow-providers-cncf-kubernetes = { workspace = true }
 apache-airflow-providers-cohere = { workspace = true }
 apache-airflow-providers-common-ai = { workspace = true }
 apache-airflow-providers-common-compat = { workspace = true }
+apache-airflow-providers-common-dataquality = { workspace = true }
 apache-airflow-providers-common-io = { workspace = true }
 apache-airflow-providers-common-messaging = { workspace = true }
 apache-airflow-providers-common-sql = { workspace = true }
@@ -1411,6 +1927,7 @@ apache-airflow-providers-dbt-cloud = { workspace = true }
 apache-airflow-providers-dingding = { workspace = true }
 apache-airflow-providers-discord = { workspace = true }
 apache-airflow-providers-docker = { workspace = true }
+apache-airflow-providers-duckdb = { workspace = true }
 apache-airflow-providers-edge3 = { workspace = true }
 apache-airflow-providers-elasticsearch = { workspace = true }
 apache-airflow-providers-exasol = { workspace = true }
@@ -1423,6 +1940,9 @@ apache-airflow-providers-google = { workspace = true }
 apache-airflow-providers-grpc = { workspace = true }
 apache-airflow-providers-hashicorp = { workspace = true }
 apache-airflow-providers-http = { workspace = true }
+apache-airflow-providers-huggingface = { workspace = true }
+apache-airflow-providers-ibm-db2 = { workspace = true }
+apache-airflow-providers-ibm-mq = { workspace = true }
 apache-airflow-providers-imap = { workspace = true }
 apache-airflow-providers-influxdb = { workspace = true }
 apache-airflow-providers-informatica = { workspace = true }
@@ -1433,6 +1953,7 @@ apache-airflow-providers-microsoft-azure = { workspace = true }
 apache-airflow-providers-microsoft-mssql = { workspace = true }
 apache-airflow-providers-microsoft-psrp = { workspace = true }
 apache-airflow-providers-microsoft-winrm = { workspace = true }
+apache-airflow-providers-modal = { workspace = true }
 apache-airflow-providers-mongo = { workspace = true }
 apache-airflow-providers-mysql = { workspace = true }
 apache-airflow-providers-neo4j = { workspace = true }
@@ -1468,6 +1989,7 @@ apache-airflow-providers-telegram = { workspace = true }
 apache-airflow-providers-teradata = { workspace = true }
 apache-airflow-providers-trino = { workspace = true }
 apache-airflow-providers-vertica = { workspace = true }
+apache-airflow-providers-vespa = { workspace = true }
 apache-airflow-providers-weaviate = { workspace = true }
 apache-airflow-providers-yandex = { workspace = true }
 apache-airflow-providers-ydb = { workspace = true }
@@ -1480,6 +2002,7 @@ members = [
     "airflow-core",
     "airflow-e2e-tests",
     "dev/breeze",
+    "dev/mypy",
     "dev/registry",
     "airflow-ctl",
     "airflow-ctl-tests",
@@ -1488,7 +2011,7 @@ members = [
     "scripts",
     "docker-tests",
     "task-sdk-integration-tests",
-    "helm-tests",
+    "chart",
     "kubernetes-tests",
     "task-sdk",
     "providers-summary-docs",
@@ -1503,12 +2026,18 @@ members = [
     "shared/providers_discovery",
     "shared/secrets_backend",
     "shared/secrets_masker",
+    "shared/serialization",
+    "shared/state",
     "shared/template_rendering",
     "shared/timezones",
     # Automatically generated provider workspace members (update_airflow_pyproject_toml.py)
     "providers/airbyte",
+    "providers/akeyless",
     "providers/alibaba",
     "providers/amazon",
+    "providers/anthropic",
+    "providers/apache/arrow",
+    "providers/apache/beam",
     "providers/apache/cassandra",
     "providers/apache/drill",
     "providers/apache/druid",
@@ -1529,11 +2058,13 @@ members = [
     "providers/asana",
     "providers/atlassian/jira",
     "providers/celery",
+    "providers/clickhousedb",
     "providers/cloudant",
     "providers/cncf/kubernetes",
     "providers/cohere",
     "providers/common/ai",
     "providers/common/compat",
+    "providers/common/dataquality",
     "providers/common/io",
     "providers/common/messaging",
     "providers/common/sql",
@@ -1543,6 +2074,7 @@ members = [
     "providers/dingding",
     "providers/discord",
     "providers/docker",
+    "providers/duckdb",
     "providers/edge3",
     "providers/elasticsearch",
     "providers/exasol",
@@ -1555,6 +2087,9 @@ members = [
     "providers/grpc",
     "providers/hashicorp",
     "providers/http",
+    "providers/huggingface",
+    "providers/ibm/db2",
+    "providers/ibm/mq",
     "providers/imap",
     "providers/influxdb",
     "providers/informatica",
@@ -1565,6 +2100,7 @@ members = [
     "providers/microsoft/mssql",
     "providers/microsoft/psrp",
     "providers/microsoft/winrm",
+    "providers/modal",
     "providers/mongo",
     "providers/mysql",
     "providers/neo4j",
@@ -1600,6 +2136,7 @@ members = [
     "providers/teradata",
     "providers/trino",
     "providers/vertica",
+    "providers/vespa",
     "providers/weaviate",
     "providers/yandex",
     "providers/ydb",

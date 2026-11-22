@@ -23,12 +23,30 @@ description: |
 
 state: ready
 lifecycle: production
-source-date-epoch: 1774298274
+source-date-epoch: 1795014796
 # Note that those versions are maintained by release manager - do not update them manually
 # with the exception of case where other provider in sources has >= new provider version.
 # In such case adding >= NEW_VERSION and bumping to NEW_VERSION in a provider have
 # to be done in the same PR
 versions:
+  - 9.41.0
+  - 9.40.0
+  - 9.39.0
+  - 9.38.0
+  - 9.37.0
+  - 9.36.0
+  - 9.35.1
+  - 9.35.0
+  - 9.34.0
+  - 9.33.0
+  - 9.32.0
+  - 9.31.0
+  - 9.30.0
+  - 9.29.0
+  - 9.28.0
+  - 9.27.0
+  - 9.26.0
+  - 9.25.0
   - 9.24.0
   - 9.23.0
   - 9.22.0
@@ -127,6 +145,15 @@ integrations:
     how-to-guide:
       - /docs/apache-airflow-providers-amazon/operators/athena/athena_boto.rst
       - /docs/apache-airflow-providers-amazon/operators/athena/athena_sql.rst
+      - /docs/apache-airflow-providers-amazon/operators/athena/athena_spark.rst
+    tags: [aws]
+  # DuckDB itself is not an AWS service: the generic hook, operator and ``duckdb`` connection type
+  # live in the ``duckdb`` provider. What lives here is only the AWS-specific part, brokering AWS
+  # credentials and endpoints into a DuckDB session configured by its own connection type
+  - integration-name: DuckDB on AWS
+    external-doc-url: https://duckdb.org/docs/stable/extensions/httpfs/s3api
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/duckdb.rst
     tags: [aws]
   - integration-name: Amazon Bedrock
     external-doc-url: https://aws.amazon.com/bedrock/
@@ -174,6 +201,8 @@ integrations:
   - integration-name: Amazon Elastic Container Registry (ECR)
     external-doc-url: https://aws.amazon.com/ecr/
     logo: /docs/integration-logos/Amazon-Elastic-Container-Registry_light-bg@4x.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/ecr.rst
     tags: [aws]
   - integration-name: Amazon ECS
     external-doc-url: https://aws.amazon.com/ecs/
@@ -296,6 +325,12 @@ integrations:
     how-to-guide:
       - /docs/apache-airflow-providers-amazon/operators/s3/s3.rst
     tags: [aws]
+  - integration-name: Amazon S3 Tables
+    external-doc-url: https://aws.amazon.com/s3/features/tables/
+    logo: /docs/integration-logos/Amazon-Simple-Storage-Service-S3_light-bg@4x.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/s3_tables.rst
+    tags: [aws]
   - integration-name: Amazon Systems Manager (SSM)
     external-doc-url: https://aws.amazon.com/systems-manager/
     logo: /docs/integration-logos/AWS-Systems-Manager_light-bg@4x.png
@@ -321,6 +356,7 @@ integrations:
     logo: /docs/integration-logos/AWS-Glue_light-bg@4x.png
     how-to-guide:
       - /docs/apache-airflow-providers-amazon/operators/glue.rst
+      - /docs/apache-airflow-providers-amazon/operators/glue_catalog.rst
     tags: [aws]
   - integration-name: AWS Lambda
     external-doc-url: https://aws.amazon.com/lambda/
@@ -366,6 +402,12 @@ integrations:
     external-doc-url: https://aws.amazon.com/verified-permissions/
     logo: /docs/integration-logos/Amazon-Verified-Permissions.png
     tags: [aws]
+  - integration-name: Amazon MWAA Serverless
+    external-doc-url: https://docs.aws.amazon.com/mwaa/latest/userguide/mwaa-serverless.html
+    logo: /docs/integration-logos/Amazon-MWAA.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/mwaa_serverless.rst
+    tags: [aws]
   - integration-name: Amazon Neptune
     external-doc-url: https://aws.amazon.com/neptune/
     logo: /docs/integration-logos/Amazon-Neptune_64.png
@@ -384,12 +426,28 @@ integrations:
     how-to-guide:
       - /docs/apache-airflow-providers-amazon/operators/mwaa.rst
     tags: [aws]
+  - integration-name: Amazon Neptune Analytics
+    external-doc-url: https://docs.aws.amazon.com/neptune-analytics/latest/userguide/gettingStarted.html
+    logo: /docs/integration-logos/Amazon-Neptune_64.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/neptune_analytics.rst
+    tags: [aws]
+  - integration-name: Amazon MSK
+    external-doc-url: https://aws.amazon.com/msk/
+    tags: [aws]
+  - integration-name: Amazon S3 Vectors
+    external-doc-url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html
+    logo: /docs/integration-logos/Amazon-Simple-Storage-Service-S3_light-bg@4x.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-amazon/operators/s3_vectors.rst
+    tags: [aws]
 
 
 operators:
   - integration-name: Amazon Athena
     python-modules:
       - airflow.providers.amazon.aws.operators.athena
+      - airflow.providers.amazon.aws.operators.athena_spark
   - integration-name: Amazon Web Services
     python-modules:
       - airflow.providers.amazon.aws.operators.base_aws
@@ -414,6 +472,9 @@ operators:
   - integration-name: Amazon EC2
     python-modules:
       - airflow.providers.amazon.aws.operators.ec2
+  - integration-name: Amazon Elastic Container Registry (ECR)
+    python-modules:
+      - airflow.providers.amazon.aws.operators.ecr
   - integration-name: Amazon ECS
     python-modules:
       - airflow.providers.amazon.aws.operators.ecs
@@ -435,6 +496,7 @@ operators:
   - integration-name: AWS Glue
     python-modules:
       - airflow.providers.amazon.aws.operators.glue
+      - airflow.providers.amazon.aws.operators.glue_catalog
       - airflow.providers.amazon.aws.operators.glue_crawler
   - integration-name: AWS Lambda
     python-modules:
@@ -445,15 +507,25 @@ operators:
   - integration-name: Amazon Managed Workflows for Apache Airflow (MWAA)
     python-modules:
       - airflow.providers.amazon.aws.operators.mwaa
+  - integration-name: Amazon MWAA Serverless
+    python-modules:
+      - airflow.providers.amazon.aws.operators.mwaa_serverless
+  - integration-name: Amazon OpenSearch Serverless
+    python-modules:
+      - airflow.providers.amazon.aws.operators.opensearch_serverless
   - integration-name: Amazon Simple Storage Service (S3)
     python-modules:
       - airflow.providers.amazon.aws.operators.s3
+  - integration-name: Amazon S3 Tables
+    python-modules:
+      - airflow.providers.amazon.aws.operators.s3_tables
   - integration-name: Amazon SageMaker
     python-modules:
       - airflow.providers.amazon.aws.operators.sagemaker
   - integration-name: Amazon SageMaker Unified Studio
     python-modules:
       - airflow.providers.amazon.aws.operators.sagemaker_unified_studio
+      - airflow.providers.amazon.aws.operators.sagemaker_unified_studio_notebook
   - integration-name: Amazon Simple Email Service (SES)
     python-modules:
       - airflow.providers.amazon.aws.operators.ses
@@ -488,11 +560,16 @@ operators:
   - integration-name: Amazon Neptune
     python-modules:
       - airflow.providers.amazon.aws.operators.neptune
+      - airflow.providers.amazon.aws.operators.neptune_analytics
+  - integration-name: Amazon S3 Vectors
+    python-modules:
+      - airflow.providers.amazon.aws.operators.s3_vectors
 
 sensors:
   - integration-name: Amazon Athena
     python-modules:
       - airflow.providers.amazon.aws.sensors.athena
+      - airflow.providers.amazon.aws.sensors.athena_spark
   - integration-name: Amazon Web Services
     python-modules:
       - airflow.providers.amazon.aws.sensors.base_aws
@@ -546,6 +623,9 @@ sensors:
   - integration-name: Amazon Managed Workflows for Apache Airflow (MWAA)
     python-modules:
       - airflow.providers.amazon.aws.sensors.mwaa
+  - integration-name: Amazon MWAA Serverless
+    python-modules:
+      - airflow.providers.amazon.aws.sensors.mwaa_serverless
   - integration-name: Amazon OpenSearch Serverless
     python-modules:
       - airflow.providers.amazon.aws.sensors.opensearch_serverless
@@ -564,6 +644,7 @@ sensors:
   - integration-name: Amazon SageMaker Unified Studio
     python-modules:
       - airflow.providers.amazon.aws.sensors.sagemaker_unified_studio
+      - airflow.providers.amazon.aws.sensors.sagemaker_unified_studio_notebook
   - integration-name: Amazon Simple Queue Service (SQS)
     python-modules:
       - airflow.providers.amazon.aws.sensors.sqs
@@ -582,6 +663,10 @@ asset-uris:
     handler: airflow.providers.amazon.aws.assets.s3.sanitize_uri
     to_openlineage_converter: airflow.providers.amazon.aws.assets.s3.convert_asset_to_openlineage
     factory: airflow.providers.amazon.aws.assets.s3.create_asset
+  - schemes: [redshift]
+    handler: airflow.providers.amazon.aws.assets.redshift.sanitize_uri
+    factory: airflow.providers.amazon.aws.assets.redshift.create_asset
+    to_openlineage_converter: airflow.providers.amazon.aws.assets.redshift.convert_asset_to_openlineage
 
 # dataset has been renamed to asset in Airflow 3.0
 # This is kept for backward compatibility.
@@ -590,6 +675,10 @@ dataset-uris:
     handler: airflow.providers.amazon.aws.assets.s3.sanitize_uri
     to_openlineage_converter: airflow.providers.amazon.aws.assets.s3.convert_asset_to_openlineage
     factory: airflow.providers.amazon.aws.assets.s3.create_asset
+  - schemes: [redshift]
+    handler: airflow.providers.amazon.aws.assets.redshift.sanitize_uri
+    factory: airflow.providers.amazon.aws.assets.redshift.create_asset
+    to_openlineage_converter: airflow.providers.amazon.aws.assets.redshift.convert_asset_to_openlineage
 
 filesystems:
   - airflow.providers.amazon.aws.fs.s3
@@ -599,6 +688,9 @@ hooks:
     python-modules:
       - airflow.providers.amazon.aws.hooks.athena
       - airflow.providers.amazon.aws.hooks.athena_sql
+  - integration-name: DuckDB on AWS
+    python-modules:
+      - airflow.providers.amazon.aws.hooks.duckdb
   - integration-name: Amazon Bedrock
     python-modules:
       - airflow.providers.amazon.aws.hooks.bedrock
@@ -691,12 +783,16 @@ hooks:
   - integration-name: Amazon Simple Storage Service (S3)
     python-modules:
       - airflow.providers.amazon.aws.hooks.s3
+  - integration-name: Amazon S3 Tables
+    python-modules:
+      - airflow.providers.amazon.aws.hooks.s3_tables
   - integration-name: Amazon SageMaker
     python-modules:
       - airflow.providers.amazon.aws.hooks.sagemaker
   - integration-name: Amazon SageMaker Unified Studio
     python-modules:
       - airflow.providers.amazon.aws.hooks.sagemaker_unified_studio
+      - airflow.providers.amazon.aws.hooks.sagemaker_unified_studio_notebook
   - integration-name: Amazon Simple Email Service (SES)
     python-modules:
       - airflow.providers.amazon.aws.hooks.ses
@@ -733,6 +829,10 @@ hooks:
   - integration-name: Amazon Neptune
     python-modules:
       - airflow.providers.amazon.aws.hooks.neptune
+      - airflow.providers.amazon.aws.hooks.neptune_analytics
+  - integration-name: Amazon MSK
+    python-modules:
+      - airflow.providers.amazon.aws.hooks.msk
 
 bundles:
   - integration-name: Amazon Simple Storage Service (S3)
@@ -755,12 +855,18 @@ triggers:
   - integration-name: Amazon Comprehend
     python-modules:
       - airflow.providers.amazon.aws.triggers.comprehend
+  - integration-name: Amazon DynamoDB
+    python-modules:
+      - airflow.providers.amazon.aws.triggers.dynamodb
   - integration-name: Amazon EC2
     python-modules:
       - airflow.providers.amazon.aws.triggers.ec2
   - integration-name: AWS Lambda
     python-modules:
       - airflow.providers.amazon.aws.triggers.lambda_function
+  - integration-name: Amazon Kinesis Data Stream
+    python-modules:
+      - airflow.providers.amazon.aws.triggers.kinesis
   - integration-name: Amazon Managed Workflows for Apache Airflow (MWAA)
     python-modules:
       - airflow.providers.amazon.aws.triggers.mwaa
@@ -780,6 +886,7 @@ triggers:
   - integration-name: Amazon SageMaker Unified Studio
     python-modules:
       - airflow.providers.amazon.aws.triggers.sagemaker_unified_studio
+      - airflow.providers.amazon.aws.triggers.sagemaker_unified_studio_notebook
   - integration-name: AWS Glue
     python-modules:
       - airflow.providers.amazon.aws.triggers.glue
@@ -814,9 +921,13 @@ triggers:
   - integration-name: Amazon Neptune
     python-modules:
       - airflow.providers.amazon.aws.triggers.neptune
+      - airflow.providers.amazon.aws.triggers.neptune_analytics
   - integration-name: AWS Database Migration Service
     python-modules:
       - airflow.providers.amazon.aws.triggers.dms
+  - integration-name: Amazon QuickSight
+    python-modules:
+      - airflow.providers.amazon.aws.triggers.quicksight
 
 transfers:
   - source-integration-name: Amazon DynamoDB
@@ -873,6 +984,7 @@ transfers:
     python-module: airflow.providers.amazon.aws.transfers.s3_to_ftp
   - source-integration-name: Exasol
     target-integration-name: Amazon Simple Storage Service (S3)
+    how-to-guide: /docs/apache-airflow-providers-amazon/transfer/exasol_to_s3.rst
     python-module: airflow.providers.amazon.aws.transfers.exasol_to_s3
   - source-integration-name: File Transfer Protocol (FTP)
     target-integration-name: Amazon Simple Storage Service (S3)
@@ -929,9 +1041,13 @@ extra-links:
   - airflow.providers.amazon.aws.links.datasync.DataSyncTaskExecutionLink
   - airflow.providers.amazon.aws.links.ec2.EC2InstanceLink
   - airflow.providers.amazon.aws.links.ec2.EC2InstanceDashboardLink
+  - airflow.providers.amazon.aws.links.neptune_analytics.NeptuneGraphLink
+  - airflow.providers.amazon.aws.links.neptune_analytics.NeptuneImportTaskLink
+  - airflow.providers.amazon.aws.links.ec2.VpcEndpointLink
 
 connection-types:
   - hook-class-name: airflow.providers.amazon.aws.hooks.base_aws.AwsGenericHook
+    hook-name: "Amazon Web Services"
     connection-type: aws
     ui-field-behaviour:
       hidden-fields:
@@ -942,8 +1058,8 @@ connection-types:
         login: AWS Access Key ID
         password: AWS Secret Access Key
       placeholders:
-        login: AKIAIOSFODNN7EXAMPLE
-        password: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        login: YOUR_AWS_ACCESS_KEY_ID
+        password: YOUR_AWS_SECRET_ACCESS_KEY
         extra: |
           {
             "region_name": "us-east-1",
@@ -952,10 +1068,11 @@ connection-types:
             "role_arn": "arn:aws:iam::123456789098:role/role-name",
             "assume_role_method": "assume_role",
             "assume_role_kwargs": {"RoleSessionName": "airflow"},
-            "aws_session_token": "AQoDYXdzEJr...EXAMPLETOKEN",
+            "aws_session_token": "YOUR_AWS_SESSION_TOKEN",
             "endpoint_url": "http://localhost:4566"
           }
   - hook-class-name: airflow.providers.amazon.aws.hooks.chime.ChimeWebhookHook
+    hook-name: "Amazon Chime Webhook"
     connection-type: chime
     ui-field-behaviour:
       hidden-fields:
@@ -969,7 +1086,28 @@ connection-types:
         schema: https
         host: hooks.chime.aws/incomingwebhook/
         password: T00000000?token=XXXXXXXXXXXXXXXXXXXXXXXX
+  - hook-class-name: airflow.providers.amazon.aws.hooks.duckdb.AwsDuckDBHook
+    hook-name: "DuckDB on AWS"
+    connection-type: duckdb_aws
+    ui-field-behaviour:
+      hidden-fields:
+        - login
+        - password
+        - port
+        - schema
+      relabeling:
+        host: Database path
+      placeholders:
+        host: /tmp/analytics.duckdb (leave empty for an in-memory database)
+        extra: |
+          {
+            "credential_strategy": "credential_chain",
+            "region_name": "us-east-1",
+            "memory_limit": "2GB",
+            "threads": 4
+          }
   - hook-class-name: airflow.providers.amazon.aws.hooks.emr.EmrHook
+    hook-name: "Amazon Elastic MapReduce"
     connection-type: emr
     ui-field-behaviour:
       hidden-fields:
@@ -1000,12 +1138,14 @@ connection-types:
             "StepConcurrencyLevel": 2
           }
   - hook-class-name: airflow.providers.amazon.aws.hooks.redshift_sql.RedshiftSQLHook
+    hook-name: "Amazon Redshift"
     connection-type: redshift
     ui-field-behaviour:
       relabeling:
         login: User
         schema: Database
   - hook-class-name: airflow.providers.amazon.aws.hooks.athena_sql.AthenaSQLHook
+    hook-name: "Amazon Athena"
     connection-type: athena
     ui-field-behaviour:
       hidden-fields:
@@ -1015,8 +1155,8 @@ connection-types:
         login: AWS Access Key ID
         password: AWS Secret Access Key
       placeholders:
-        login: AKIAIOSFODNN7EXAMPLE
-        password: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        login: YOUR_AWS_ACCESS_KEY_ID
+        password: YOUR_AWS_SECRET_ACCESS_KEY
         extra: |
           {
             "aws_domain": "amazonaws.com",
@@ -1029,7 +1169,7 @@ connection-types:
             "role_arn": "arn:aws:iam::123456789098:role/role-name",
             "assume_role_method": "assume_role",
             "assume_role_kwargs": {"RoleSessionName": "airflow"},
-            "aws_session_token": "AQoDYXdzEJr...EXAMPLETOKEN",
+            "aws_session_token": "YOUR_AWS_SESSION_TOKEN",
             "endpoint_url": "http://localhost:4566"
           }
 
@@ -1043,9 +1183,18 @@ secrets-backends:
   - airflow.providers.amazon.aws.secrets.secrets_manager.SecretsManagerBackend
   - airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend
 
+email-backends:
+  - airflow.providers.amazon.aws.utils.emailer.send_email
+
 logging:
   - airflow.providers.amazon.aws.log.s3_task_handler.S3TaskHandler
   - airflow.providers.amazon.aws.log.cloudwatch_task_handler.CloudwatchTaskHandler
+
+remote-logging:
+  - classpath: airflow.providers.amazon.aws.log.cloudwatch_task_handler.CloudWatchRemoteLogIO
+    scheme: cloudwatch
+  - classpath: airflow.providers.amazon.aws.log.s3_task_handler.S3RemoteLogIO
+    scheme: s3
 
 config:
   aws:
@@ -1078,6 +1227,21 @@ config:
         version_added: 8.7.2
         example: airflow.providers.amazon.aws.log.cloudwatch_task_handler.json_serialize
         default: airflow.providers.amazon.aws.log.cloudwatch_task_handler.json_serialize_legacy
+      s3_task_handler_acl_policy:
+        description: |
+          The ACL applied to task log objects uploaded to S3 by the S3 remote log handler,
+          for example ``bucket-owner-full-control``.
+
+          This is primarily useful for cross-account remote logging: when Airflow runs under one AWS
+          account but writes logs to a bucket owned by another account, S3 makes the writing account
+          the object owner, so the bucket owner cannot read or manage the log objects. Setting
+          ``bucket-owner-full-control`` grants the bucket owner full control over the uploaded logs.
+
+          When unset, no ACL is sent and the bucket's default object ownership applies.
+        type: string
+        version_added: 9.34.0
+        example: bucket-owner-full-control
+        default: ~
   aws_batch_executor:
     description: |
       This section only applies if you are using the AwsBatchExecutor in
@@ -1349,6 +1513,15 @@ config:
         type: integer
         example: "3"
         default: "3"
+      run_task_concurrency:
+        description: |
+          The maximum number of ECS RunTask calls the ECS Executor makes in parallel. With 1, tasks are
+          launched one at a time and the scheduler loop waits for each call. With more, the calls run in
+          background threads and the scheduler loop does not wait for them.
+        version_added: "9.40.0"
+        type: integer
+        example: "16"
+        default: "1"
       run_task_kwargs:
         description: |
           A JSON string containing arguments to provide the ECS `run_task` API (see url above).
@@ -1363,6 +1536,46 @@ config:
         type: boolean
         example: "True"
         default: "True"
+  aws_eks_executor:
+    description: |
+      This section only applies if you are using the AwsEksExecutor in
+      Airflow's ``[core]`` configuration. It requires the ``cncf.kubernetes``
+      extra of this provider. The executor supplies the Kubernetes client for
+      the configured Amazon EKS cluster; all pod-level settings are still read
+      from the ``[kubernetes_executor]`` section.
+      For boto3 credential management, see
+      https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html
+    options:
+      conn_id:
+        description: |
+          The Airflow connection (i.e. credentials) used by the EKS executor to
+          make API calls to Amazon EKS.
+        version_added: 9.39.0
+        type: string
+        example: "aws_default"
+        default: "aws_default"
+      region_name:
+        description: |
+          The name of the AWS Region where the EKS cluster is located. If not
+          specified, falls back to the AWS connection's region, then boto3's.
+        version_added: 9.39.0
+        type: string
+        example: "us-east-1"
+        default: ~
+      check_health_on_startup:
+        description: |
+          Whether or not to check the EKS Executor health on startup.
+        version_added: 9.39.0
+        type: boolean
+        example: "True"
+        default: "True"
+      cluster_name:
+        description: |
+          The name of the Amazon EKS cluster to run Airflow tasks on. Required.
+        version_added: 9.39.0
+        type: string
+        example: "airflow-eks-cluster"
+        default: ~
   aws_auth_manager:
     description: |
       This section only applies if you are using the AwsAuthManager. In other words, if you set
@@ -1400,11 +1613,27 @@ config:
         type: string
         example: ~
         default: ~
+      allow_idp_initiated_login:
+        description: |
+          Whether to accept SAML assertions that no login started from Airflow asked for, such as
+          the ones produced by clicking the Airflow tile in the AWS Identity Center access portal
+          (IdP-initiated SSO).
+
+          When this is disabled, a SAML response is only accepted if it answers an AuthnRequest that
+          the same browser started. That binding is what stops an assertion obtained elsewhere from
+          being accepted in another user's browser, which would sign that user in as the assertion's
+          subject. Enable it only where the access portal flow is required and that trade-off is
+          accepted.
+        version_added: 9.37.0
+        type: boolean
+        example: "True"
+        default: "False"
 
 executors:
   - airflow.providers.amazon.aws.executors.aws_lambda.lambda_executor.AwsLambdaExecutor
   - airflow.providers.amazon.aws.executors.batch.batch_executor.AwsBatchExecutor
   - airflow.providers.amazon.aws.executors.ecs.ecs_executor.AwsEcsExecutor
+  - airflow.providers.amazon.aws.executors.eks.eks_executor.AwsEksExecutor
 
 auth-managers:
   - airflow.providers.amazon.aws.auth_manager.aws_auth_manager.AwsAuthManager
@@ -1413,4 +1642,5 @@ cli:
   - airflow.providers.amazon.aws.cli.definition.get_aws_cli_commands
 
 queues:
+  - airflow.providers.amazon.aws.queues.kinesis.KinesisMessageQueueProvider
   - airflow.providers.amazon.aws.queues.sqs.SqsMessageQueueProvider

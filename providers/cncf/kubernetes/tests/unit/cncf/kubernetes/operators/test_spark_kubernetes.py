@@ -38,8 +38,7 @@ from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKu
 from airflow.providers.cncf.kubernetes.pod_generator import MAX_LABEL_LEN
 from airflow.providers.cncf.kubernetes.triggers.pod import KubernetesPodTrigger
 from airflow.providers.cncf.kubernetes.utils.pod_manager import PodPhase
-from airflow.providers.common.compat.sdk import TaskDeferred
-from airflow.utils import timezone
+from airflow.providers.common.compat.sdk import TaskDeferred, timezone
 from airflow.utils.types import DagRunType
 
 from tests_common.test_utils.taskinstance import create_task_instance
@@ -122,50 +121,6 @@ def _get_expected_k8s_dict():
     }
 
 
-def _get_expected_application_dict_with_labels(task_name="default_yaml"):
-    """Create expected application dict with task context labels on-demand."""
-    task_context_labels = {
-        "dag_id": "dag",
-        "task_id": task_name,
-        "run_id": "manual__2016-01-01T0100000100-da4d1ce7b",
-        "spark_kubernetes_operator": "True",
-        "try_number": "0",
-        "version": "2.4.5",
-    }
-
-    return {
-        "apiVersion": "sparkoperator.k8s.io/v1beta2",
-        "kind": "SparkApplication",
-        "metadata": {"name": task_name, "namespace": "default"},
-        "spec": {
-            "type": "Scala",
-            "mode": "cluster",
-            "image": "gcr.io/spark-operator/spark:v2.4.5",
-            "imagePullPolicy": "Always",
-            "mainClass": "org.apache.spark.examples.SparkPi",
-            "mainApplicationFile": "local:///opt/spark/examples/jars/spark-examples_2.11-2.4.5.jar",
-            "sparkVersion": "2.4.5",
-            "restartPolicy": {"type": "Never"},
-            "volumes": [{"name": "test-volume", "hostPath": {"path": "/tmp", "type": "Directory"}}],
-            "driver": {
-                "cores": 1,
-                "coreLimit": "1200m",
-                "memory": "512m",
-                "labels": task_context_labels.copy(),
-                "serviceAccount": "spark",
-                "volumeMounts": [{"name": "test-volume", "mountPath": "/tmp"}],
-            },
-            "executor": {
-                "cores": 1,
-                "instances": 1,
-                "memory": "512m",
-                "labels": task_context_labels.copy(),
-                "volumeMounts": [{"name": "test-volume", "mountPath": "/tmp"}],
-            },
-        },
-    }
-
-
 def _get_expected_application_dict_without_task_context_labels(task_name="default_yaml", app_name=None):
     """Create expected application dict without task context labels (only original file labels)."""
     original_file_labels = {
@@ -223,7 +178,14 @@ def test_spark_kubernetes_operator(mock_kubernetes_hook, data_file):
     assert "hook" not in operator.__dict__  # Cached property has not been accessed as part of construction.
 
 
-def test_init_spark_kubernetes_operator(data_file):
+@pytest.mark.parametrize(
+    ("container_logs", "expected_container_logs"),
+    [
+        pytest.param(None, "spark-kubernetes-driver", id="default"),
+        pytest.param(["sidecar"], ["spark-kubernetes-driver"], id="requested"),
+    ],
+)
+def test_init_spark_kubernetes_operator(data_file, container_logs, expected_container_logs):
     operator = SparkKubernetesOperator(
         task_id="task_id",
         application_file=data_file("spark/application_test.yaml").as_posix(),
@@ -232,10 +194,11 @@ def test_init_spark_kubernetes_operator(data_file):
         cluster_context="cluster_context",
         config_file="config_file",
         base_container_name="base",
+        container_logs=container_logs,
         get_logs=True,
     )
     assert operator.base_container_name == "spark-kubernetes-driver"
-    assert operator.container_logs == ["spark-kubernetes-driver"]
+    assert operator.container_logs == expected_container_logs
 
 
 @patch("airflow.providers.cncf.kubernetes.operators.spark_kubernetes.KubernetesHook")
@@ -1242,6 +1205,68 @@ class TestSparkKubernetesOperator:
 
         assert returned_pod is valid_mock_pod
 
+    def test_execute_deferrable_does_not_call_super(
+        self,
+        mock_is_in_cluster,
+        mock_parent_execute,
+        mock_create_namespaced_crd,
+        mock_get_namespaced_custom_object_status,
+        mock_cleanup,
+        mock_create_job_name,
+        mock_get_kube_client,
+        mock_create_pod,
+        mock_await_pod_completion,
+        mock_fetch_requested_container_logs,
+        data_file,
+        mocker,
+    ):
+        job_spec = yaml.safe_load(data_file("spark/application_template.yaml").read_text())
+        mock_create_job_name.return_value = "test_deferrable"
+        op = SparkKubernetesOperator(
+            task_id="test_deferrable",
+            template_spec=job_spec,
+            kubernetes_conn_id="kubernetes_default_kube_config",
+            deferrable=True,
+            reattach_on_restart=False,
+        )
+        context = create_context(op)
+        mock_execute_async = mocker.patch.object(op, "execute_async")
+
+        result = op.execute(context)
+
+        mock_execute_async.assert_called_once_with(context)
+        mock_parent_execute.assert_not_called()
+        assert result is None
+
+    def test_execute_non_deferrable_calls_super(
+        self,
+        mock_is_in_cluster,
+        mock_parent_execute,
+        mock_create_namespaced_crd,
+        mock_get_namespaced_custom_object_status,
+        mock_cleanup,
+        mock_create_job_name,
+        mock_get_kube_client,
+        mock_create_pod,
+        mock_await_pod_completion,
+        mock_fetch_requested_container_logs,
+        data_file,
+    ):
+        job_spec = yaml.safe_load(data_file("spark/application_template.yaml").read_text())
+        mock_create_job_name.return_value = "test_non_deferrable"
+        op = SparkKubernetesOperator(
+            task_id="test_non_deferrable",
+            template_spec=job_spec,
+            kubernetes_conn_id="kubernetes_default_kube_config",
+            deferrable=False,
+            reattach_on_restart=False,
+        )
+        context = create_context(op)
+
+        op.execute(context)
+
+        mock_parent_execute.assert_called_once_with(context)
+
     @pytest.mark.asyncio
     def test_execute_deferrable(
         self,
@@ -1272,7 +1297,9 @@ class TestSparkKubernetesOperator:
         context = create_context(op)
 
         mock_file = mock_open(read_data='{"a": "b"}')
-        mocker.patch("builtins.open", mock_file)
+        # Patch only the module that reads the kube config: a builtins.open patch would also feed this
+        # data to any module first imported during execute(), such as the metrics registry.
+        mocker.patch("airflow.providers.cncf.kubernetes.operators.pod.open", mock_file, create=True)
 
         with pytest.raises(TaskDeferred) as exc:
             op.execute(context)

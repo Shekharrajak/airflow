@@ -17,7 +17,7 @@
 # under the License.
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from github import GithubException
@@ -39,6 +39,8 @@ class GithubSensor(BaseSensorOperator):
     :param result_processor: function that return boolean and act as a sensor response
     """
 
+    template_fields: Sequence[str] = ("github_conn_id",)
+
     def __init__(
         self,
         *,
@@ -54,7 +56,7 @@ class GithubSensor(BaseSensorOperator):
         if result_processor is not None:
             self.result_processor = result_processor
         self.method_name = method_name
-        self.method_params = method_params
+        self.method_params = method_params or {}
 
     def poke(self, context: Context) -> bool:
         hook = GithubHook(github_conn_id=self.github_conn_id)
@@ -104,7 +106,10 @@ class GithubTagSensor(BaseGithubRepositorySensor):
     :param repository_name: fully qualified name of the repository to be monitored, ex. "apache/airflow"
     """
 
-    template_fields = ("tag_name",)
+    template_fields: Sequence[str] = (
+        "tag_name",
+        "github_conn_id",
+    )
 
     def __init__(
         self,

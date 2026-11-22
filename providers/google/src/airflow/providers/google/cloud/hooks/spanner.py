@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from google.cloud.spanner_v1.transaction import Transaction
     from google.longrunning.operations_grpc_pb2 import Operation
 
-    from airflow.models.connection import Connection
+    from airflow.providers.common.compat.sdk import Connection
 
 
 class SpannerConnectionParams(NamedTuple):
@@ -86,7 +86,10 @@ class SpannerHook(GoogleBaseHook, DbApiHook):
         """
         if not self._client:
             self._client = Client(
-                project=project_id, credentials=self.get_credentials(), client_info=CLIENT_INFO
+                project=project_id,
+                credentials=self.get_credentials(),
+                client_info=CLIENT_INFO,
+                client_options=self.get_client_options(),
             )
         return self._client
 

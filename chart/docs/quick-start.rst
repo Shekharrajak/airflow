@@ -26,11 +26,14 @@ Run Airflow on Kind cluster
 Install kind and create a cluster
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-We recommend testing with Kubernetes 1.30+, example:
 
-.. code-block:: bash
+.. jinja:: global_ctx
 
-   kind create cluster --image kindest/node:v1.30.13
+   We recommend testing with Kubernetes {{ min_k8s_version }}+, example:
+
+   .. code-block:: bash
+
+      kind create cluster --image kindest/node:{{ min_k8s_version }}
 
 Confirm it's up:
 
@@ -224,5 +227,5 @@ Example below adds ``lxml`` PyPI package.
 Further extending and customizing the image
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-See `Building the image <https://airflow.apache.org/docs/docker-stack/build.html>`_ for more
+See `Building your image <https://airflow.apache.org/docs/docker-stack/build.html>`_ for more
 details on how you can extend and customize the Airflow image.

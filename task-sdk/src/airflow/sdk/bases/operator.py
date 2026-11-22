@@ -85,15 +85,16 @@ T = TypeVar("T", bound=FunctionType)
 
 if TYPE_CHECKING:
     from types import ClassMethodDescriptorType
+    from typing import Self
 
     import jinja2
-    from typing_extensions import Self
 
     from airflow.sdk.api.datamodels._generated import DagAttributeTypes
     from airflow.sdk.bases.operatorlink import BaseOperatorLink
     from airflow.sdk.definitions.context import Context
     from airflow.sdk.definitions.dag import DAG
     from airflow.sdk.definitions.operator_resources import Resources
+    from airflow.sdk.definitions.retry_policy import RetryPolicy
     from airflow.sdk.definitions.taskgroup import TaskGroup
     from airflow.sdk.definitions.xcom_arg import XComArg
     from airflow.sdk.types import WeightRuleParam
@@ -201,23 +202,28 @@ def coerce_resources(resources: dict[str, Any] | None) -> Resources | None:
 
 @contextlib.contextmanager
 def event_loop() -> Generator[AbstractEventLoop]:
-    new_event_loop = False
-    loop = None
+    """
+    Own an event loop for the duration of the block, to drive coroutines from synchronous code.
+
+    Unlike ``asyncio.run()``, which creates a loop for one coroutine and closes it, the loop yielded here
+    outlives any number of ``run_until_complete()`` calls: tasks created on it in one call are still there
+    for the next, which is what code that pauses and resumes a loop between batches of work needs.
+
+    This is :class:`asyncio.Runner`: the loop is set as the current loop of the thread while the block runs
+    and unset afterwards, leftover tasks are cancelled, async generators and the default executor are shut
+    down and the loop is closed. Nothing goes through ``asyncio.get_event_loop()``, which since
+    Python 3.12 warns and since 3.14 raises when no loop is set. Entering the block from a running loop is
+    refused: a loop cannot drive another loop on the same thread.
+    """
     try:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            new_event_loop = True
-        yield loop
-    finally:
-        if new_event_loop and loop is not None:
-            with contextlib.suppress(AttributeError):
-                loop.close()
-                asyncio.set_event_loop(None)
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("event_loop() cannot be used from a running event loop")
+
+    with asyncio.Runner() as runner:
+        yield runner.get_loop()
 
 
 class _PartialDescriptor:
@@ -261,11 +267,27 @@ OPERATOR_DEFAULTS: dict[str, Any] = {
     "retries": DEFAULT_RETRIES,
     "retry_delay": DEFAULT_RETRY_DELAY,
     "retry_exponential_backoff": 0,
+    "retry_policy": None,
     "trigger_rule": DEFAULT_TRIGGER_RULE,
     "wait_for_past_depends_before_skipping": DEFAULT_WAIT_FOR_PAST_DEPENDS_BEFORE_SKIPPING,
     "wait_for_downstream": False,
     "weight_rule": DEFAULT_WEIGHT_RULE,
 }
+
+
+def _get_operator_defaults(operator_class: type[BaseOperator]) -> dict[str, Any]:
+    """Get default values for an operator class's BaseOperator arguments."""
+    operator_defaults = OPERATOR_DEFAULTS.copy()
+    operator_classes = operator_class.mro()
+    for operator_base in reversed(operator_classes[: operator_classes.index(BaseOperator)]):
+        if (init := operator_base.__dict__.get("__init__")) is None:
+            continue
+        operator_defaults.update(
+            (name, parameter.default)
+            for name, parameter in inspect.signature(init).parameters.items()
+            if name in OPERATOR_DEFAULTS and parameter.default is not inspect.Parameter.empty
+        )
+    return operator_defaults
 
 
 # This is what handles the actual mapping.
@@ -370,7 +392,9 @@ else:
         )
 
         # Fill fields not provided by the user with default values.
-        partial_kwargs.update((k, v) for k, v in OPERATOR_DEFAULTS.items() if k not in partial_kwargs)
+        partial_kwargs.update(
+            (k, v) for k, v in _get_operator_defaults(operator_class).items() if k not in partial_kwargs
+        )
 
         # Post-process arguments. Should be kept in sync with _TaskDecorator.expand().
         if "task_concurrency" in kwargs:  # Reject deprecated option.
@@ -549,6 +573,11 @@ class BaseOperatorMeta(abc.ABCMeta):
 
             # Store the args passed to init -- we need them to support task.map serialization!
             self._BaseOperator__init_kwargs.update(kwargs)  # type: ignore
+
+            # Validate trigger kwargs.
+            # Make sure method exists as class can depend on metaclass without extending the BaseOperator.
+            if hasattr(self, "_validate_start_from_trigger_kwargs"):
+                self._validate_start_from_trigger_kwargs()
 
             # Set upstream task defined by XComArgs passed to template fields of the operator.
             # BUT: only do this _ONCE_, not once for each class in the hierarchy
@@ -846,6 +875,14 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         to render templates as native Python types. If False, a Jinja
         ``Environment`` is used to render templates as string values.
         If None (default), inherits from the DAG setting.
+    :param start_from_trigger: If True, the operator starts execution directly in the triggerer,
+        skipping the initial worker execution phase. In this mode, templated fields are rendered
+        inside the triggerer instead of the worker. This avoids an extra round trip to a worker,
+        but may increase load on the triggerer, since the DAG must be serialized in order to
+        render templated fields. Use with care for DAGs with many tasks or heavy templating.
+    :param start_trigger_args: Used together with ``start_from_trigger`` to explicitly specify
+        which operator fields should be passed to the trigger. This helps limit the amount of
+        data serialized and sent to the triggerer.
     """
 
     task_id: str
@@ -857,6 +894,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
     retry_delay: timedelta = DEFAULT_RETRY_DELAY
     retry_exponential_backoff: float = 0
     max_retry_delay: timedelta | float | None = None
+    retry_policy: RetryPolicy | None = None
     start_date: datetime | None = None
     end_date: datetime | None = None
     depends_on_past: bool = False
@@ -913,6 +951,13 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
 
     template_fields_renderers: ClassVar[dict[str, str]] = {}
 
+    # Names of constructor fields whose values may contain Pydantic model classes
+    # this operator can emit to XCom (e.g. ``("output_type",)``). The worker
+    # registers those classes in the deserialization allow-list before running
+    # tasks, so downstream consumers can deserialize the instances without an
+    # ``[core] allowed_deserialization_classes`` edit. Empty by default.
+    deserialization_allowed_class_fields: ClassVar[tuple[str, ...]] = ()
+
     operator_extra_links: Collection[BaseOperatorLink] = ()
 
     # Defines the color in the UI
@@ -950,6 +995,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         "has_on_success_callback",
         "has_on_retry_callback",
         "has_on_skipped_callback",
+        "has_retry_policy",
         "do_xcom_push",
         "multiple_outputs",
         "allow_nested_operators",
@@ -1014,6 +1060,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         retry_delay: timedelta | float = DEFAULT_RETRY_DELAY,
         retry_exponential_backoff: float = 0,
         max_retry_delay: timedelta | float | None = None,
+        retry_policy: RetryPolicy | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         depends_on_past: bool = False,
@@ -1162,6 +1209,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         self.retry_exponential_backoff = retry_exponential_backoff
         if max_retry_delay is not None:
             self.max_retry_delay = max_retry_delay
+        self.retry_policy = retry_policy
 
         self.resources = resources
 
@@ -1440,6 +1488,15 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
             return
         XComArg.apply_upstream_relationship(self, newvalue)
 
+    def _validate_start_from_trigger_kwargs(self):
+        if self.start_from_trigger and self.start_trigger_args and self.start_trigger_args.trigger_kwargs:
+            for name, val in self.start_trigger_args.trigger_kwargs.items():
+                if callable(val):
+                    raise ValueError(
+                        f"{self.__class__.__name__} with task_id '{self.task_id}' has a callable in trigger kwargs named "
+                        f"'{name}', which is not allowed when start_from_trigger is enabled."
+                    )
+
     def on_kill(self) -> None:
         """
         Override this method to clean up subprocesses when a task instance gets killed.
@@ -1516,6 +1573,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
                     "on_success_callback",
                     "on_retry_callback",
                     "on_skipped_callback",
+                    "retry_policy",
                 }
                 | {  # Class level defaults, or `@property` need to be added to this list
                     "start_date",
@@ -1540,6 +1598,8 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
                     "has_on_success_callback",
                     "has_on_retry_callback",
                     "has_on_skipped_callback",
+                    "has_retry_policy",
+                    "returns_dag_result",
                 }
             )
             DagContext.pop()
@@ -1700,6 +1760,11 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
     def has_on_skipped_callback(self) -> bool:
         """Return True if the task has skipped callbacks."""
         return bool(self.on_skipped_callback)
+
+    @property
+    def has_retry_policy(self) -> bool:
+        """Return True if the task has a retry policy configured."""
+        return bool(self.retry_policy)
 
 
 class BaseAsyncOperator(BaseOperator):

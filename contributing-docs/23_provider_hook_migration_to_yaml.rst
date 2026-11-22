@@ -1,19 +1,19 @@
-.. Licensed to the Apache Software Foundation (ASF) under one
-   or more contributor license agreements.  See the NOTICE file
-   distributed with this work for additional information
-   regarding copyright ownership.  The ASF licenses this file
-   to you under the Apache License, Version 2.0 (the
-   "License"); you may not use this file except in compliance
-   with the License.  You may obtain a copy of the License at
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
 
-..   http://www.apache.org/licenses/LICENSE-2.0
+ ..   http://www.apache.org/licenses/LICENSE-2.0
 
-.. Unless required by applicable law or agreed to in writing,
-   software distributed under the License is distributed on an
-   "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-   KIND, either express or implied.  See the License for the
-   specific language governing permissions and limitations
-   under the License.
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
 
 Provider hook to YAML Migration
 ===============================
@@ -59,6 +59,32 @@ Customizations for standard connection fields:
         login: Username
       placeholders:
         port: '5432'
+
+external-services
+~~~~~~~~~~~~~~~~~
+
+List of upstream provider or model-serving services that this connection type
+reaches over the network (e.g. ``OpenAI``, ``AWS Bedrock``, ``Ollama``). The registry
+renders this list as a table on the provider's version page, so someone browsing the
+registry can see at a glance which external services a given connection type talks
+to. Because some hooks resolve the destination from a caller-supplied model
+identifier (for example ``PydanticAIHook``), this list is representative, not
+exhaustive -- treat it as example services, not a compatibility matrix.
+
+This is unrelated to the top-level ``integrations`` key in ``provider.yaml``, which
+describes *framework* integrations (e.g. Kubernetes, Docker) and drives the
+provider's docs pages, logo, and tags. ``external-services`` only applies inside a
+``connection-types`` entry and only lists services reached over the network — it has
+no effect on docs generation, logos, or tags.
+
+.. code-block:: yaml
+
+    connection-types:
+      - hook-class-name: airflow.providers.common.ai.hooks.pydantic_ai.PydanticAIAzureHook
+        hook-name: "Pydantic AI (Azure OpenAI)"
+        connection-type: pydanticai_azure
+        external-services:
+          - Azure OpenAI
 
 conn-fields
 ~~~~~~~~~~~

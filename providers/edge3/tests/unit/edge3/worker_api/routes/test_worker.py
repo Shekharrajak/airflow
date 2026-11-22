@@ -17,27 +17,39 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
-from airflow.providers.common.compat.sdk import timezone
+from airflow import __version__ as airflow_version
+from airflow.api_fastapi.auth.tokens import JWTGenerator
+from airflow.providers.common.compat.sdk import Stats, conf, timezone
+from airflow.providers.edge3 import __version__ as edge_provider_version
 from airflow.providers.edge3.cli.worker import EdgeWorker
 from airflow.providers.edge3.models.edge_worker import (
     EdgeWorkerModel,
     EdgeWorkerState,
     set_worker_concurrency,
 )
+from airflow.providers.edge3.worker_api.auth import jwt_validator
 from airflow.providers.edge3.worker_api.datamodels import WorkerQueueUpdateBody, WorkerStateBody
 from airflow.providers.edge3.worker_api.routes.worker import (
     _assert_version,
+    _version,
     register,
     set_state,
     update_queues,
+    worker_router,
 )
+
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_3_PLUS
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -46,14 +58,89 @@ pytestmark = pytest.mark.db_test
 
 
 class TestWorkerApiRoutes:
+    MOCK_SYSINFO: dict[str, str | int | float | datetime] = {
+        "status": 20,
+        "airflow_version": airflow_version,
+        "edge_provider_version": edge_provider_version,
+        "python_version": "3.10.17 (main, Apr  9 2025, 04:03:39) [Clang 20.1.0 ]",
+        "worker_start_time": "2026-04-18T21:10:42.714344",
+        "concurrency": 8,
+        "free_concurrency": 8,
+    }
+
     @pytest.fixture
     def cli_worker(self, tmp_path: Path) -> EdgeWorker:
-        test_worker = EdgeWorker(str(tmp_path / "mock.pid"), "mock", None, 8, 5, 5)
+        test_worker = EdgeWorker(str(tmp_path / "mock.pid"), "mock", None, 8)
         return test_worker
 
     @pytest.fixture(autouse=True)
     def setup_test_cases(self, session: Session):
         session.execute(delete(EdgeWorkerModel))
+
+    def test_version(self):
+        assert _version("1.2.3") == (1, 2, 3)
+        assert _version("1.2.3rc1") == (1, 2, 3)
+        assert _version("1.2.3.dev0") == (1, 2, 3)
+        with pytest.raises(HTTPException, match="expected a string, got datetime") as exc_info:
+            _version(datetime(2026, 9, 15))
+        assert exc_info.value.status_code == 400
+
+    @conf_vars({("api_auth", "jwt_secret"): "edge-version-test-secret"})
+    @pytest.mark.parametrize(
+        ("field", "minimum_key"),
+        [
+            ("airflow_version", "minimum_acceptable_core_version_for_workers"),
+            ("edge_provider_version", "minimum_acceptable_edge_version_for_workers"),
+        ],
+    )
+    @pytest.mark.parametrize("method", ["POST", "PATCH"])
+    @pytest.mark.parametrize(
+        ("worker_version", "minimum", "expected_status"),
+        [
+            pytest.param("invalid-version", "0.0.0", 400, id="worker-invalid-string"),
+            pytest.param("2026-09-15T19:53:06", "0.0.0", 400, id="worker-datetime-string"),
+            pytest.param(3, "0.0.0", 400, id="worker-int"),
+            pytest.param(3.5, "0.0.0", 400, id="worker-float"),
+            pytest.param(True, "0.0.0", 400, id="worker-bool"),
+            pytest.param("0.0.0", "invalid-version", 500, id="server-invalid-minimum"),
+        ],
+    )
+    def test_invalid_version_http_status(
+        self,
+        session: Session,
+        field: str,
+        minimum_key: str,
+        method: str,
+        worker_version: str | int | float,
+        minimum: str,
+        expected_status: int,
+    ):
+        session.commit()
+        app = FastAPI()
+        app.include_router(worker_router, prefix="/edge_worker/v1")
+        path = "/edge_worker/v1/worker/version_test"
+        token = JWTGenerator(
+            secret_key=conf.get("api_auth", "jwt_secret"), valid_for=60, audience="api"
+        ).generate(extras={"method": "worker/version_test"})
+        sysinfo = dict(self.MOCK_SYSINFO)
+        body = {
+            "state": EdgeWorkerState.STARTING,
+            "jobs_active": 0,
+            "queues": ["default"],
+            "sysinfo": sysinfo,
+        }
+        jwt_validator.cache_clear()
+        try:
+            with TestClient(app, raise_server_exceptions=False, headers={"Authorization": token}) as client:
+                if method == "PATCH":
+                    assert client.post(path, json=body).status_code == 200
+                sysinfo[field] = worker_version
+                with conf_vars({("edge", minimum_key): minimum}):
+                    response = client.request(method=method, url=path, json=body)
+        finally:
+            jwt_validator.cache_clear()
+
+        assert response.status_code == expected_status
 
     def test_assert_version(self):
         from airflow import __version__ as airflow_version
@@ -74,6 +161,22 @@ class TestWorkerApiRoutes:
         with pytest.raises(HTTPException):
             _assert_version({"airflow_version": airflow_version, "edge_provider_version": "2023.10.07"})
 
+        with conf_vars({("edge", "minimum_acceptable_edge_version_for_workers"): "3.2.0"}):
+            with pytest.raises(HTTPException):
+                _assert_version({"airflow_version": airflow_version, "edge_provider_version": "3.1.0"})
+
+            _assert_version({"airflow_version": airflow_version, "edge_provider_version": "3.2.0"})
+            _assert_version({"airflow_version": airflow_version, "edge_provider_version": "3.2.1rc1"})
+            _assert_version({"airflow_version": airflow_version, "edge_provider_version": "4.1.1"})
+
+        with conf_vars({("edge", "minimum_acceptable_core_version_for_workers"): "3.1.0"}):
+            with pytest.raises(HTTPException):
+                _assert_version({"airflow_version": "3.0.0", "edge_provider_version": edge_provider_version})
+
+            _assert_version({"airflow_version": "3.1.0", "edge_provider_version": edge_provider_version})
+            _assert_version({"airflow_version": "3.2.0rc3", "edge_provider_version": edge_provider_version})
+            _assert_version({"airflow_version": "4.1.0", "edge_provider_version": edge_provider_version})
+
         _assert_version({"airflow_version": airflow_version, "edge_provider_version": edge_provider_version})
 
     @pytest.mark.parametrize(
@@ -88,7 +191,7 @@ class TestWorkerApiRoutes:
             state=EdgeWorkerState.STARTING,
             jobs_active=0,
             queues=input_queues,
-            sysinfo=cli_worker._get_sysinfo(),
+            sysinfo=self.MOCK_SYSINFO,
         )
         register("test_worker", body, session)
         session.commit()
@@ -96,10 +199,84 @@ class TestWorkerApiRoutes:
         worker: Sequence[EdgeWorkerModel] = session.scalars(select(EdgeWorkerModel)).all()
         assert len(worker) == 1
         assert worker[0].worker_name == "test_worker"
+        assert worker[0].team_name is None
         if input_queues:
             assert worker[0].queues == input_queues
         else:
             assert worker[0].queues is None
+
+    def test_register_with_team_name(self, session: Session, cli_worker: EdgeWorker):
+        body = WorkerStateBody(
+            state=EdgeWorkerState.STARTING,
+            jobs_active=0,
+            queues=["default"],
+            sysinfo=self.MOCK_SYSINFO,
+            team_name="team_a",
+        )
+        register("test_worker", body, session)
+        session.commit()
+
+        worker: Sequence[EdgeWorkerModel] = session.scalars(select(EdgeWorkerModel)).all()
+        assert len(worker) == 1
+        assert worker[0].worker_name == "test_worker"
+        assert worker[0].team_name == "team_a"
+
+    def test_register_same_name_different_team_rejects_when_active(
+        self, session: Session, cli_worker: EdgeWorker
+    ):
+        """A physical worker (hostname) can only have one identity. Registering the same
+        worker_name with a different team_name while the existing one is active should be rejected."""
+        existing_worker = EdgeWorkerModel(
+            worker_name="test_worker",
+            state=EdgeWorkerState.RUNNING,
+            queues=["default"],
+            first_online=timezone.utcnow(),
+            team_name="team_a",
+        )
+        session.add(existing_worker)
+        session.commit()
+
+        body = WorkerStateBody(
+            state=EdgeWorkerState.STARTING,
+            jobs_active=0,
+            queues=["default"],
+            sysinfo=self.MOCK_SYSINFO,
+            team_name="team_b",
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            register("test_worker", body, session)
+        assert exc_info.value.status_code == 409
+
+    def test_register_same_name_different_team_reuses_when_offline(
+        self, session: Session, cli_worker: EdgeWorker
+    ):
+        """When an existing worker with the same name is offline, re-registering with a
+        different team_name should succeed and update the team_name."""
+        existing_worker = EdgeWorkerModel(
+            worker_name="test_worker",
+            state=EdgeWorkerState.OFFLINE,
+            queues=["default"],
+            first_online=timezone.utcnow(),
+            team_name="team_a",
+        )
+        session.add(existing_worker)
+        session.commit()
+
+        body = WorkerStateBody(
+            state=EdgeWorkerState.STARTING,
+            jobs_active=0,
+            queues=["default"],
+            sysinfo=self.MOCK_SYSINFO,
+            team_name="team_b",
+        )
+        register("test_worker", body, session)
+        session.commit()
+
+        worker = session.execute(
+            select(EdgeWorkerModel).where(EdgeWorkerModel.worker_name == "test_worker")
+        ).scalar_one_or_none()
+        assert worker is not None
+        assert worker.team_name == "team_b"
 
     @pytest.mark.parametrize(
         ("existing_state", "should_raise"),
@@ -132,7 +309,7 @@ class TestWorkerApiRoutes:
             state=EdgeWorkerState.STARTING,
             jobs_active=0,
             queues=["default"],
-            sysinfo=cli_worker._get_sysinfo(),
+            sysinfo=self.MOCK_SYSINFO,
         )
 
         if should_raise:
@@ -241,7 +418,7 @@ class TestWorkerApiRoutes:
             state=EdgeWorkerState.RUNNING,
             jobs_active=1,
             queues=["default2"],
-            sysinfo=cli_worker._get_sysinfo(),
+            sysinfo=self.MOCK_SYSINFO,
         )
         return_queues = set_state("test2_worker", body, session).queues
 
@@ -251,6 +428,81 @@ class TestWorkerApiRoutes:
         assert worker[0].state == EdgeWorkerState.RUNNING
         assert worker[0].queues == queues
         assert return_queues == ["default", "default2"]
+
+    @pytest.mark.parametrize(
+        ("worker_team_name", "expected_worker_tags"),
+        [
+            pytest.param("team_a", {"worker_name": "test2_worker", "team_name": "team_a"}, id="team"),
+            pytest.param(None, {"worker_name": "test2_worker"}, id="global"),
+        ],
+    )
+    @patch(f"{Stats.__module__}.Stats.gauge")
+    @patch(f"{Stats.__module__}.Stats.incr")
+    def test_set_state_metrics_team_name_tags(
+        self,
+        mock_stats_incr,
+        mock_stats_gauge,
+        session: Session,
+        cli_worker: EdgeWorker,
+        worker_team_name: str | None,
+        expected_worker_tags: dict[str, str],
+    ):
+        queues = ["default", "default2"]
+        rwm = EdgeWorkerModel(
+            worker_name="test2_worker",
+            state=EdgeWorkerState.IDLE,
+            queues=queues,
+            first_online=timezone.utcnow(),
+            team_name=worker_team_name,
+        )
+        session.add(rwm)
+        session.commit()
+
+        body = WorkerStateBody(
+            state=EdgeWorkerState.RUNNING,
+            jobs_active=1,
+            queues=["default2"],
+            sysinfo={**self.MOCK_SYSINFO, "disk_usage": 42.5, "status_text": "ok"},
+        )
+        set_state("test2_worker", body, session)
+
+        mock_stats_incr.assert_called_once_with(
+            "edge_worker.heartbeat_count",
+            1,
+            1,
+            tags=expected_worker_tags,
+        )
+        mock_stats_gauge.assert_any_call(
+            "edge_worker.status",
+            self.MOCK_SYSINFO["status"],
+            tags=expected_worker_tags,
+        )
+        mock_stats_gauge.assert_any_call("edge_worker.connected", 1, tags=expected_worker_tags)
+        mock_stats_gauge.assert_any_call("edge_worker.maintenance", 0, tags=expected_worker_tags)
+        mock_stats_gauge.assert_any_call("edge_worker.jobs_active", 1, tags=expected_worker_tags)
+        mock_stats_gauge.assert_any_call("edge_worker.concurrency", 8, tags=expected_worker_tags)
+        mock_stats_gauge.assert_any_call("edge_worker.free_concurrency", 8, tags=expected_worker_tags)
+        mock_stats_gauge.assert_any_call(
+            "edge_worker.num_queues",
+            len(queues),
+            tags={**expected_worker_tags, "queues": ",".join(queues)},
+        )
+        mock_stats_gauge.assert_any_call("edge_worker.disk_usage", 42.5, tags=expected_worker_tags)
+        if AIRFLOW_V_3_3_PLUS:
+            assert mock_stats_gauge.call_count == 8
+        else:
+            mock_stats_gauge.assert_any_call(
+                "edge_worker.status.test2_worker",
+                self.MOCK_SYSINFO["status"],
+            )
+            mock_stats_gauge.assert_any_call("edge_worker.connected.test2_worker", 1)
+            mock_stats_gauge.assert_any_call("edge_worker.maintenance.test2_worker", 0)
+            mock_stats_gauge.assert_any_call("edge_worker.jobs_active.test2_worker", 1)
+            mock_stats_gauge.assert_any_call("edge_worker.concurrency.test2_worker", 8)
+            mock_stats_gauge.assert_any_call("edge_worker.free_concurrency.test2_worker", 8)
+            mock_stats_gauge.assert_any_call("edge_worker.num_queues.test2_worker", len(queues))
+            mock_stats_gauge.assert_any_call("edge_worker.disk_usage.test2_worker", 42.5)
+            assert mock_stats_gauge.call_count == 16
 
     def test_set_state_returns_concurrency(self, session: Session, cli_worker: EdgeWorker):
         """set_state includes the DB-stored concurrency override in its response."""
@@ -268,7 +520,7 @@ class TestWorkerApiRoutes:
             state=EdgeWorkerState.RUNNING,
             jobs_active=0,
             queues=["default"],
-            sysinfo=cli_worker._get_sysinfo(),
+            sysinfo=self.MOCK_SYSINFO,
         )
         result = set_state("test2_worker", body, session)
         assert result.concurrency == 16
@@ -290,7 +542,7 @@ class TestWorkerApiRoutes:
             state=EdgeWorkerState.RUNNING,
             jobs_active=0,
             queues=["default"],
-            sysinfo=cli_worker._get_sysinfo(),
+            sysinfo=self.MOCK_SYSINFO,
         )
         result = set_state("test2_worker", body, session)
         assert result.concurrency is None

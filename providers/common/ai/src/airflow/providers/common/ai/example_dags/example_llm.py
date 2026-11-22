@@ -19,15 +19,31 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 
 from pydantic import BaseModel
+from pydantic_ai.usage import UsageLimits
 
 from airflow.providers.common.ai.operators.llm import LLMOperator
+from airflow.providers.common.compat.notifier import BaseNotifier
 from airflow.providers.common.compat.sdk import dag, task
 
 
+# [START howto_operator_llm_structured_output_class]
+# Pydantic output classes must be defined at module scope so they survive
+# XCom serialization (their qualname is used to re-import them downstream).
+class Entities(BaseModel):
+    """Named entities extracted from a text."""
+
+    names: list[str]
+    locations: list[str]
+
+
+# [END howto_operator_llm_structured_output_class]
+
+
 # [START howto_operator_llm_basic]
-@dag
+@dag(tags=["example"])
 def example_llm_operator():
     LLMOperator(
         task_id="summarize",
@@ -43,12 +59,8 @@ example_llm_operator()
 
 
 # [START howto_operator_llm_structured]
-@dag
+@dag(tags=["example"])
 def example_llm_operator_structured():
-    class Entities(BaseModel):
-        names: list[str]
-        locations: list[str]
-
     LLMOperator(
         task_id="extract_entities",
         prompt="Extract all named entities from the article.",
@@ -63,29 +75,30 @@ def example_llm_operator_structured():
 example_llm_operator_structured()
 
 
-# [START howto_operator_llm_agent_params]
-@dag
-def example_llm_operator_agent_params():
+# [START howto_operator_llm_model_settings]
+@dag(tags=["example"])
+def example_llm_operator_model_settings():
     LLMOperator(
         task_id="creative_writing",
         prompt="Write a haiku about data pipelines.",
         llm_conn_id="pydanticai_default",
         system_prompt="You are a creative writer.",
-        agent_params={"model_settings": {"temperature": 0.9}, "retries": 3},
+        model_settings={"temperature": 0.9},
+        output_retries=3,
     )
 
 
-# [END howto_operator_llm_agent_params]
+# [END howto_operator_llm_model_settings]
 
-example_llm_operator_agent_params()
+example_llm_operator_model_settings()
 
 
 # [START howto_decorator_llm]
-@dag
+@dag(tags=["example"])
 def example_llm_decorator():
     @task.llm(llm_conn_id="pydanticai_default", system_prompt="Summarize concisely.")
     def summarize(text: str):
-        return f"Summarize this article: {text}"
+        return "Summarize this article: {{ text }}"
 
     summarize("Apache Airflow is a platform for programmatically authoring...")
 
@@ -96,19 +109,15 @@ example_llm_decorator()
 
 
 # [START howto_decorator_llm_structured]
-@dag
+@dag(tags=["example"])
 def example_llm_decorator_structured():
-    class Entities(BaseModel):
-        names: list[str]
-        locations: list[str]
-
     @task.llm(
         llm_conn_id="pydanticai_default",
         system_prompt="Extract named entities.",
         output_type=Entities,
     )
     def extract(text: str):
-        return f"Extract entities from: {text}"
+        return "Extract entities from: {{ text }}"
 
     extract("Alice visited Paris and met Bob in London.")
 
@@ -118,8 +127,73 @@ def example_llm_decorator_structured():
 example_llm_decorator_structured()
 
 
+# [START howto_operator_llm_usage_limits]
+@dag(tags=["example"])
+def example_llm_operator_usage_limits():
+    LLMOperator(
+        task_id="capped_summary",
+        prompt="Summarize the attached design doc in three bullet points.",
+        llm_conn_id="pydanticai_default",
+        system_prompt="You are a concise technical reviewer.",
+        # Fail the task if the run exceeds 5 model requests, 4_000 input
+        # tokens, or 1_000 output tokens.  Useful for guardrails on shared
+        # connections or untrusted prompts.
+        usage_limits=UsageLimits(
+            request_limit=5,
+            input_tokens_limit=4_000,
+            output_tokens_limit=1_000,
+            # Fail the task if the run's estimated USD cost exceeds $0.50.
+            # See docs/operators/llm.rst for caveats (not a hard guarantee;
+            # not enforced for models pydantic-ai can't price, which log a
+            # warning instead of failing the run).
+            cost_limit=Decimal("0.50"),
+        ),
+    )
+
+
+# [END howto_operator_llm_usage_limits]
+
+example_llm_operator_usage_limits()
+
+
+# [START howto_operator_llm_templated_usage_limits]
+@dag(tags=["example"])
+def example_llm_operator_templated_usage_limits():
+    LLMOperator(
+        task_id="capped_summary",
+        prompt="Summarize the trade-offs of a message queue vs. direct HTTP calls in three bullet points.",
+        llm_conn_id="pydanticai_default",
+        system_prompt="You are a concise technical reviewer.",
+        # A plain dict lets every UsageLimits field be templated -- e.g. driven by
+        # an Airflow Variable so the budget can change per environment without
+        # editing the Dag. This caps a single task run, not a day's total spend --
+        # each run gets the full budget again. Use var.value.get() with a default
+        # so the example doesn't fail outright if the Variable isn't set.
+        usage_limits={
+            "cost_limit": "{{ var.value.get('llm_cost_cap_per_task', '0.50') }}",
+            "request_limit": 5,
+        },
+    )
+
+
+# [END howto_operator_llm_templated_usage_limits]
+
+example_llm_operator_templated_usage_limits()
+
+
 # [START howto_operator_llm_approval]
-@dag
+class LogNotifier(BaseNotifier):
+    template_fields = ("message",)
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def notify(self, context) -> None:
+        self.log.info(self.message)
+
+
+@dag(tags=["example"])
 def example_llm_operator_approval():
 
     LLMOperator(
@@ -129,7 +203,9 @@ def example_llm_operator_approval():
         system_prompt="You are a financial analyst. Be concise and accurate.",
         require_approval=True,
         approval_timeout=timedelta(hours=24),
+        on_approval_timeout="approve",
         allow_modifications=True,
+        approval_notifiers=LogNotifier(message="{{ task.subject }}\n{{ task.body }}"),
     )
 
 

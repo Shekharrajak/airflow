@@ -16,21 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { IconButton, useDisclosure } from "@chakra-ui/react";
+import type { ButtonProps } from "@chakra-ui/react";
+import { useDisclosure } from "@chakra-ui/react";
 import { useTranslation } from "react-i18next";
 import { FiTrash2 } from "react-icons/fi";
 import { useLocation, useNavigate } from "react-router-dom";
 
+import { IconButton } from "src/system-components";
+
 import DeleteDialog from "src/components/DeleteDialog";
-import { Tooltip } from "src/components/ui";
+
 import { useDeleteDag } from "src/queries/useDeleteDag";
 
 type DeleteDagButtonProps = {
   readonly dagDisplayName: string;
   readonly dagId: string;
-};
+} & ButtonProps;
 
-export const DeleteDagButton = ({ dagDisplayName, dagId }: DeleteDagButtonProps) => {
+export const DeleteDagButton = ({ dagDisplayName, dagId, ...rest }: DeleteDagButtonProps) => {
   const { onClose, onOpen, open } = useDisclosure();
   const navigate = useNavigate();
   const location = useLocation();
@@ -48,19 +51,13 @@ export const DeleteDagButton = ({ dagDisplayName, dagId }: DeleteDagButtonProps)
     },
   });
 
+  const label = translate("dagActions.delete.button");
+
   return (
     <>
-      <Tooltip content={translate("dagActions.delete.button")}>
-        <IconButton
-          aria-label={translate("dagActions.delete.button")}
-          colorPalette="danger"
-          onClick={onOpen}
-          size="md"
-          variant="ghost"
-        >
-          <FiTrash2 />
-        </IconButton>
-      </Tooltip>
+      <IconButton {...rest} colorPalette="danger" label={label} onClick={onOpen}>
+        <FiTrash2 />
+      </IconButton>
 
       <DeleteDialog
         isDeleting={isPending}
@@ -68,7 +65,7 @@ export const DeleteDagButton = ({ dagDisplayName, dagId }: DeleteDagButtonProps)
         onDelete={() => deleteDag({ dagId })}
         open={open}
         resourceName={dagDisplayName}
-        title={translate("dagActions.delete.button")}
+        title={label}
         warningText={translate("dagActions.delete.warning")}
       />
     </>

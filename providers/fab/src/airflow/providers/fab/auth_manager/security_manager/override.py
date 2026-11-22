@@ -17,16 +17,20 @@
 # under the License.
 from __future__ import annotations
 
+import base64
 import copy
 import datetime
 import importlib
 import itertools
+import json
 import logging
+import re
+import urllib.parse
 import uuid
 from collections.abc import Collection, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
-import jwt
+import requests
 from flask import current_app, flash, g, has_app_context, has_request_context, session
 from flask_appbuilder import Model, const
 from flask_appbuilder.const import (
@@ -49,8 +53,6 @@ from flask_appbuilder.security.registerviews import (
     RegisterUserOAuthView,
 )
 from flask_appbuilder.security.views import (
-    AuthDBView,
-    AuthLDAPView,
     AuthRemoteUserView,
     AuthView,
     RegisterUserModelView,
@@ -68,7 +70,7 @@ from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm import joinedload
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from airflow.providers.common.compat.sdk import conf
+from airflow.providers.common.compat.sdk import AirflowConfigException, conf
 from airflow.providers.fab.auth_manager.models import (
     Action,
     Group,
@@ -77,10 +79,13 @@ from airflow.providers.fab.auth_manager.models import (
     Resource,
     Role,
     User,
+    assoc_group_role,
     assoc_permission_role,
+    assoc_user_role,
 )
 from airflow.providers.fab.auth_manager.models.anonymous_user import AnonymousUser
 from airflow.providers.fab.auth_manager.security_manager.constants import EXISTING_ROLES
+from airflow.providers.fab.auth_manager.views.auth_login import CustomAuthDBView, CustomAuthLDAPView
 from airflow.providers.fab.auth_manager.views.auth_oauth import CustomAuthOAuthView
 from airflow.providers.fab.auth_manager.views.permissions import (
     ActionModelView,
@@ -157,6 +162,29 @@ class FabException(Exception):
     """Custom exception for FAB security manager."""
 
 
+class DagAccessControlValidationError(FabException, ValueError):
+    """The Dag's access control names an invalid role, resource, or permission."""
+
+
+class AzureTenantResolutionError(FabException):
+    """Raised when an Azure AD tenant identifier cannot be resolved to a canonical GUID."""
+
+
+# Microsoft identity platform authority hosts. Each national cloud mints its own issuer and
+# serves its own signing keys, so the host a deployment is configured against decides which
+# issuer to pin and which key set to verify against. Azure AD B2C is deliberately absent: its
+# authority is per-tenant (``<tenant>.b2clogin.com``) and its metadata is addressed by policy,
+# which does not fit the tenant-only lookup below.
+AZURE_COMMERCIAL_AUTHORITY_HOST = "login.microsoftonline.com"
+AZURE_AUTHORITY_HOSTS = frozenset(
+    {
+        AZURE_COMMERCIAL_AUTHORITY_HOST,
+        "login.microsoftonline.us",  # Azure Government
+        "login.partner.microsoftonline.cn",  # Azure operated by 21Vianet (China)
+    }
+)
+
+
 class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
     """
     This security manager overrides the default AirflowSecurityManager security manager.
@@ -184,9 +212,9 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
     permission_model = Permission
 
     """ Views """
-    authdbview = AuthDBView
+    authdbview = CustomAuthDBView
     """ Override if you want your own Authentication DB view """
-    authldapview = AuthLDAPView
+    authldapview = CustomAuthLDAPView
     """ Override if you want your own Authentication LDAP view """
     authoauthview = CustomAuthOAuthView
     """ Custom Authentication OAuth view with session commit fix for #57981 """
@@ -291,6 +319,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
     # [START security_op_perms]
     OP_PERMISSIONS = [
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_ADMIN_MENU),
+        (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_DAG_BUNDLE),
+        (permissions.ACTION_CAN_READ, permissions.RESOURCE_DAG_BUNDLE),
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_CONFIG),
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_CONNECTION),
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_POOL),
@@ -317,6 +347,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         (permissions.ACTION_CAN_EDIT, permissions.RESOURCE_XCOM),
         (permissions.ACTION_CAN_DELETE, permissions.RESOURCE_XCOM),
         (permissions.ACTION_CAN_CREATE, RESOURCE_ASSET),
+        (permissions.ACTION_CAN_EDIT, RESOURCE_ASSET),
         (permissions.ACTION_CAN_DELETE, RESOURCE_ASSET),
         (permissions.ACTION_CAN_CREATE, permissions.RESOURCE_BACKFILL),
         (permissions.ACTION_CAN_EDIT, permissions.RESOURCE_BACKFILL),
@@ -328,6 +359,9 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
     ADMIN_PERMISSIONS = [
         (permissions.ACTION_CAN_READ, permissions.RESOURCE_AUDIT_LOG),
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_AUDIT_LOG),
+        (permissions.ACTION_CAN_READ, permissions.RESOURCE_AUDIT_LOG_ALL),
+        (permissions.ACTION_CAN_READ, permissions.RESOURCE_IMPORT_ERROR_ALL),
+        (permissions.ACTION_CAN_READ, permissions.RESOURCE_REPARSE_ALL),
         (permissions.ACTION_CAN_READ, permissions.RESOURCE_TASK_RESCHEDULE),
         (permissions.ACTION_CAN_ACCESS_MENU, permissions.RESOURCE_TASK_RESCHEDULE),
         (permissions.ACTION_CAN_READ, permissions.RESOURCE_TRIGGER),
@@ -376,6 +410,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         # done in super, but we need it before we can call super.
         self.appbuilder = appbuilder
 
+        self._azure_tenant_guid_cache: dict[str, str] = {}
+        self._azure_tenant_metadata_cache: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {}
         self._init_config()
         self._init_auth()
         self._init_data_model()
@@ -394,25 +430,21 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         self.create_jwt_manager()
 
     def _get_authentik_jwks(self, jwks_url) -> dict:
-        import requests
-
         resp = requests.get(jwks_url, timeout=30)
         if resp.status_code == 200:
             return resp.json()
         return {}
 
-    def _validate_jwt(self, id_token, jwks):
+    def _validate_jwt(self, id_token, jwks, claims_options=None):
         from authlib.jose import JsonWebKey, jwt as authlib_jwt
 
         keyset = JsonWebKey.import_key_set(jwks)
-        claims = authlib_jwt.decode(id_token, keyset)
+        claims = authlib_jwt.decode(id_token, keyset, claims_options=claims_options)
         claims.validate()
         log.info("JWT token is validated")
         return claims
 
     def _get_authentik_token_info(self, id_token):
-        me = jwt.decode(id_token, options={"verify_signature": False})
-
         verify_signature = self.oauth_remotes["authentik"].client_kwargs.get("verify_signature", True)
         if verify_signature:
             # Validate the token using authentik certificate
@@ -420,13 +452,42 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             if jwks_uri:
                 jwks = self._get_authentik_jwks(jwks_uri)
                 if jwks:
-                    return self._validate_jwt(id_token, jwks)
+                    # The issuer must be known before the token is trusted. Verifying only
+                    # the audience would still accept a token minted by an untrusted issuer
+                    # whenever the configured key set signs for more than one of them, so a
+                    # missing issuer fails closed rather than downgrading to an audience-only
+                    # check.
+                    issuer = self.oauth_remotes["authentik"].client_kwargs.get(
+                        "issuer"
+                    ) or self.oauth_remotes["authentik"].server_metadata.get("issuer")
+                    if not issuer:
+                        raise FabException(
+                            "Cannot verify the authentik id_token: no issuer is available. "
+                            "The OpenID metadata for the 'authentik' provider carries no "
+                            "'issuer', so the token's issuer cannot be pinned. Configure "
+                            "'server_metadata_url' so the issuer is discovered, or set "
+                            "'issuer' in the authentik provider's client_kwargs."
+                        )
+                    claims_options = {
+                        # The token must have been issued by the configured provider.
+                        "iss": {"essential": True, "value": issuer},
+                        # The token must have been minted for this application. One key set
+                        # signs for every application registered with the provider, so a valid
+                        # signature does not establish that the token was addressed to Airflow.
+                        "aud": {
+                            "essential": True,
+                            "value": self.oauth_remotes["authentik"].client_id,
+                        },
+                    }
+                    return self._validate_jwt(id_token, jwks, claims_options=claims_options)
             else:
                 log.error("jwks_uri not specified in OAuth Providers, could not verify token signature")
         else:
             # Return the token info without validating
             log.warning("JWT token is not validated!")
-            return me
+            _parts = id_token.split(".")
+            _payload = _parts[1] + "=" * (-len(_parts[1]) % 4)
+            return json.loads(base64.urlsafe_b64decode(_payload))
 
         raise FabException("OAuth signature verify failed")
 
@@ -549,6 +610,10 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         jwt_manager.init_app(current_app)
         jwt_manager.user_lookup_loader(self.load_user_jwt)
 
+    def _hash_password(self, password: str) -> str:
+        method = current_app.config.get("FAB_PASSWORD_HASH_METHOD", "scrypt")
+        return generate_password_hash(password, method=method)
+
     def reset_password(self, userid: int, password: str) -> bool:
         """
         Change/Reset a user's password for auth db.
@@ -561,7 +626,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         user = self.get_user_by_id(userid)
         if not user:
             return False
-        user.password = generate_password_hash(password)
+        user.password = self._hash_password(password)
         self.reset_user_sessions(user)
         return self.update_user(user)
 
@@ -587,7 +652,12 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             else:
                 for s in session.scalars(select(user_session_model)).all():
                     session_details = interface.serializer.decode(want_bytes(s.data))
-                    if session_details.get("_user_id") == user.id:
+                    session_user_id = session_details.get("_user_id")
+                    # Flask-Login stores whatever ``User.get_id()`` returns, which is a
+                    # string, while ``user.id`` is the integer column. Compare both sides
+                    # as strings so the two representations match; older sessions written
+                    # before ``get_id()`` returned a string are still handled.
+                    if session_user_id is not None and str(session_user_id) == str(user.id):
                         session.delete(s)
                 session.commit()
         else:
@@ -964,7 +1034,6 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         perms = self.get_all_permissions()
 
         for dag in _iter_dags():
-            print(dag)
             for resource_name, resource_values in self.RESOURCE_DETAILS_MAP.items():
                 dag_resource_name = permissions.resource_name(dag.dag_id, resource_name)
                 for action_name in resource_values["actions"]:
@@ -972,7 +1041,14 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
                         self._merge_perm(action_name, dag_resource_name)
 
             if dag.access_control is not None:
-                self.sync_perm_for_dag(dag.dag_id, dag.access_control)
+                try:
+                    self.sync_perm_for_dag(dag.dag_id, dag.access_control)
+                except FabException:
+                    self.log.exception(
+                        "Failed to sync permissions for Dag '%s'; skipping it and continuing with "
+                        "the remaining Dags. Fix its access_control configuration and re-run sync-perm.",
+                        dag.dag_id,
+                    )
 
     def sync_perm_for_dag(
         self,
@@ -1058,7 +1134,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         for rolename, resource_actions_raw in access_control.items():
             role = self.find_role(rolename)
             if not role:
-                raise FabException(
+                raise DagAccessControlValidationError(
                     f"The access_control mapping for DAG '{dag_id}' includes a role named "
                     f"'{rolename}', but that role does not exist"
                 )
@@ -1072,7 +1148,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
 
             for resource_name, actions in resource_actions.items():
                 if resource_name not in self.RESOURCE_DETAILS_MAP:
-                    raise FabException(
+                    raise DagAccessControlValidationError(
                         f"The access_control map for DAG '{dag_id}' includes the following invalid "
                         f"resource name: '{resource_name}'; "
                         f"The set of valid resource names is: {self.RESOURCE_DETAILS_MAP.keys()}"
@@ -1084,7 +1160,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
                 invalid_actions = set(actions) - self.RESOURCE_DETAILS_MAP[resource_name]["actions"]
 
                 if invalid_actions:
-                    raise FabException(
+                    raise DagAccessControlValidationError(
                         f"The access_control map for DAG '{dag_resource_name}' includes "
                         f"the following invalid permissions: {invalid_actions}; "
                         f"The set of valid permissions is: {self.RESOURCE_DETAILS_MAP[resource_name]['actions']}"
@@ -1178,10 +1254,109 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         # Sync the default roles (Admin, Viewer, User, Op, public) with related permissions
         self.bulk_sync_roles(self.ROLE_CONFIGS)
 
+        self.create_roles_from_config()
+
         self.add_homepage_access_to_custom_roles()
         # init existing roles, the rest role could be created through UI.
         self.update_admin_permission()
         self.clean_perms()
+
+    def _get_custom_roles_config(self) -> dict[str, list[tuple[str, str]]]:
+        config = conf.getjson("fab", "custom_roles", fallback={})
+        if not isinstance(config, dict):
+            raise AirflowConfigException("[fab] custom_roles must be a JSON object")
+
+        roles: dict[str, list[tuple[str, str]]] = {}
+        for name, items in config.items():
+            if not isinstance(name, str) or not name.strip() or len(name) > 64:
+                raise AirflowConfigException("[fab] custom_roles role names must contain 1 to 64 characters")
+            if not isinstance(items, list):
+                raise AirflowConfigException(f"[fab] custom_roles[{name!r}] must be a list")
+            perms: set[tuple[str, str]] = set()
+            for index, item in enumerate(items):
+                location = f"[fab] custom_roles[{name!r}][{index}]"
+                if not isinstance(item, dict) or item.keys() != {"action", "resource"}:
+                    raise AirflowConfigException(f"{location} must contain only 'action' and 'resource'")
+                for key, limit in (("action", 100), ("resource", 250)):
+                    value = item[key]
+                    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                        raise AirflowConfigException(
+                            f"{location}.{key} must be a non-empty string of at most {limit} characters"
+                        )
+                perms.add((item["action"], item["resource"]))
+            roles[name] = sorted(perms)
+        return roles
+
+    def create_roles_from_config(self) -> None:
+        """Create missing configured roles, preserving permissions on existing roles."""
+        roles = self._get_custom_roles_config()
+        for name, perms in roles.items():
+            for action_name, resource_name in perms:
+                self._get_configured_action_and_resource(name, action_name, resource_name)
+        for name, perms in roles.items():
+            if name in EXISTING_ROLES:
+                log.warning("Skipping built-in role '%s' in [fab] custom_roles", name)
+                continue
+            self._create_role_from_config(name, perms)
+
+    def _get_configured_action_and_resource(
+        self, role_name: str, action_name: str, resource_name: str
+    ) -> tuple[Action, Resource]:
+        action = self.get_action(action_name)
+        if action is None:
+            raise AirflowConfigException(
+                f"Unknown action {action_name!r} in [fab] custom_roles[{role_name!r}]"
+            )
+        resource = self.get_resource(resource_name)
+        if resource is None:
+            raise AirflowConfigException(
+                f"Unknown resource {resource_name!r} in [fab] custom_roles[{role_name!r}]"
+            )
+        return action, resource
+
+    def _create_role_from_config(self, name: str, perms: list[tuple[str, str]]) -> None:
+        # FAB's public creation helpers commit individually; a configured role must
+        # become visible only after all its declared permissions have been attached.
+        for attempt in range(3):
+            conflict: tuple[str, str] | None = None
+            try:
+                if self.find_role(name) is not None:
+                    return
+                role = self.role_model()
+                role.name = name
+                role.permissions = []
+                self.session.add(role)
+                self.session.flush()
+
+                for action_name, resource_name in perms:
+                    perm = self.get_permission(action_name, resource_name)
+                    if perm is None:
+                        action, resource = self._get_configured_action_and_resource(
+                            name, action_name, resource_name
+                        )
+                        conflict = (action_name, resource_name)
+                        perm = self.permission_model()
+                        perm.action = action
+                        perm.resource = resource
+                        self.session.add(perm)
+                        self.session.flush()
+                    conflict = None
+                    if perm not in role.permissions:
+                        role.permissions.append(perm)
+
+                self.session.commit()
+                return
+            except IntegrityError:
+                self.session.rollback()
+                if self.find_role(name) is not None:
+                    return
+                if conflict is None or attempt == 2:
+                    raise
+                if self.get_permission(*conflict) is None:
+                    raise
+            except Exception:
+                self.session.rollback()
+                raise
 
     def create_perm_vm_for_all_dag(self) -> None:
         """Create perm-vm if not exist and insert into FAB security model for all-dags."""
@@ -1327,12 +1502,21 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         """
         Delete the given Role.
 
+        Cleans up association table rows (permission-role, user-role, group-role) before
+        deleting the role itself, so that databases whose FK constraints lack CASCADE
+        (e.g. databases migrated from older Airflow versions) do not raise IntegrityError.
+
         :param role_name: the name of a role in the ab_role table
         """
-        role = self.session.scalars(select(Role).where(Role.name == role_name)).first()
+        role = self.session.scalars(select(self.role_model).where(self.role_model.name == role_name)).first()
         if role:
             log.info("Deleting role '%s'", role_name)
-            self.session.execute(delete(Role).where(Role.name == role_name))
+            self.session.execute(
+                delete(assoc_permission_role).where(assoc_permission_role.c.role_id == role.id)
+            )
+            self.session.execute(delete(assoc_user_role).where(assoc_user_role.c.role_id == role.id))
+            self.session.execute(delete(assoc_group_role).where(assoc_group_role.c.role_id == role.id))
+            self.session.execute(delete(self.role_model).where(self.role_model.id == role.id))
             self.session.commit()
         else:
             raise FabException(f"Role named '{role_name}' does not exist")
@@ -1385,8 +1569,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         password: str = "",
         hashed_password: str = "",
         groups: list[Group] | None = None,
-    ) -> User:
-        """Create a user."""
+    ) -> User | None:
+        """Create a user; return ``None`` if it cannot be saved."""
         roles: list[Role] = []
         if role:
             roles = role if isinstance(role, list) else [role]
@@ -1404,7 +1588,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             if hashed_password:
                 user.password = hashed_password
             else:
-                user.password = generate_password_hash(password)
+                user.password = self._hash_password(password)
             self.session.commit()
             log.info(const.LOGMSG_INF_SEC_ADD_USER, username)
 
@@ -1412,7 +1596,32 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         except Exception as e:
             log.error(const.LOGMSG_ERR_SEC_ADD_USER, e)
             self.session.rollback()
-            raise FabException(const.LOGMSG_ERR_SEC_ADD_USER) from e
+            return None
+
+    def _register_user_on_login(
+        self,
+        username: str,
+        first_name: str,
+        last_name: str,
+        email: str,
+        role: list[Role] | Role | None,
+    ) -> User | None:
+        """
+        Create a user on first login; return ``None`` if no active user can be used.
+
+        A parallel first login for the same username can win the insert, so the
+        user it created is used instead of denying this login.
+        """
+        user = self.add_user(
+            username=username, first_name=first_name, last_name=last_name, email=email, role=role
+        )
+        if user is None:
+            user = self.find_user(username=username)
+            if user is not None:
+                log.info("User %s was registered by a parallel login, using that user", username)
+        if user is None or not user.is_active:
+            return None
+        return user
 
     def load_user(self, pk: int) -> User | None:
         try:
@@ -1448,8 +1657,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         if hashed_password:
             register_user.password = hashed_password
         else:
-            register_user.password = generate_password_hash(password)
-        register_user.registration_hash = str(uuid.uuid1())
+            register_user.password = self._hash_password(password)
+        register_user.registration_hash = str(uuid.uuid4())
         try:
             self.session.add(register_user)
             self.session.commit()
@@ -1494,15 +1703,21 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
                 new_role_ids = {r.id for r in user.roles}
                 new_group_ids = {grp.id for grp in user.groups}
                 if existing_role_ids != new_role_ids or existing_group_ids != new_group_ids:
-                    user.changed_on = datetime.datetime.now(tz=datetime.timezone.utc)
-            self.session.merge(user)
+                    user.changed_on = datetime.datetime.now(tz=datetime.UTC)
+            merged_user = self.session.merge(user)
             self.session.commit()
+            self._reset_user_permissions_cache(merged_user)
             log.info(const.LOGMSG_INF_SEC_UPD_USER, user)
         except Exception as e:
             log.error(const.LOGMSG_ERR_SEC_UPD_USER, e)
             self.session.rollback()
             return False
         return True
+
+    @staticmethod
+    def _reset_user_permissions_cache(user: User) -> None:
+        """Invalidate cached permissions to avoid stale auth checks after role updates."""
+        user._perms = None
 
     def del_register_user(self, register_user) -> bool:
         """
@@ -1521,6 +1736,36 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
 
     def get_all_users(self) -> list[User]:
         return self.session.scalars(select(self.user_model)).all()
+
+    def on_user_login(self, user) -> None:
+        """
+        Run after a successful user login.
+
+        Override to add custom logic (e.g. audit logging). Mirrors
+        ``BaseSecurityManager.on_user_login`` from FAB 5.2.1+.
+
+        :param user: The authenticated user model.
+        """
+
+    def on_user_login_failed(self, user) -> None:
+        """
+        Run after a failed user login attempt.
+
+        Override to add custom logic (e.g. audit logging). Mirrors
+        ``BaseSecurityManager.on_user_login_failed`` from FAB 5.2.1+.
+
+        :param user: The identified (but not authenticated) user model.
+        """
+
+    def on_user_logout(self, user) -> None:
+        """
+        Run when a user logs out.
+
+        Override to add custom logic (e.g. audit logging). Mirrors
+        ``BaseSecurityManager.on_user_logout`` from FAB 5.2.1+.
+
+        :param user: The user model that is logging out.
+        """
 
     def update_user_auth_stat(self, user, success=True) -> None:
         """
@@ -1547,6 +1792,13 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         else:
             user.fail_login_count += 1
         self.update_user(user)
+        # Fire the auth event hooks added in FAB 5.2.1 (PR #2450) so subclasses
+        # can plug in audit logging / custom side effects without having to
+        # override update_user_auth_stat itself.
+        if success:
+            self.on_user_login(user)
+        else:
+            self.on_user_login_failed(user)
 
     """
     -------------
@@ -1870,6 +2122,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         # Ensure python-ldap is installed
         try:
             import ldap
+            import ldap.filter
         except ImportError:
             log.error("python-ldap library is not installed")
             return None
@@ -1986,11 +2239,12 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             # Sync the user's roles
             if user and user_attributes and self.auth_roles_sync_at_login:
                 user.roles = self._ldap_calculate_user_roles(user_attributes)
+                self._reset_user_permissions_cache(user)
                 log.debug("Calculated new roles for user=%r as: %s", user_dn, user.roles)
 
             # If the user is new, register them
             if (not user) and user_attributes and self.auth_user_registration:
-                user = self.add_user(
+                user = self._register_user_on_login(
                     username=username,
                     first_name=self.ldap_extract(user_attributes, self.auth_ldap_firstname_field, ""),
                     last_name=self.ldap_extract(user_attributes, self.auth_ldap_lastname_field, ""),
@@ -2013,6 +2267,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
                 if rotate_session_id:
                     self._rotate_session_id()
                 self.update_user_auth_stat(user)
+                self.session.expire(user, ["roles", "groups"])
+                self._reset_user_permissions_cache(user)
                 return user
             return None
 
@@ -2147,7 +2403,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
 
         # If the user is new, register them
         if (not user) and self.auth_user_registration:
-            user = self.add_user(
+            user = self._register_user_on_login(
                 username=username,
                 first_name=userinfo.get("first_name", ""),
                 last_name=userinfo.get("last_name", ""),
@@ -2319,7 +2575,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
 
         # User does not exist, create one if auto user registration.
         if user is None and self.auth_user_registration:
-            user = self.add_user(
+            user = self._register_user_on_login(
                 # All we have is REMOTE_USER, so we set
                 # the other fields to blank.
                 username=username,
@@ -2330,8 +2586,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             )
 
         # If user does not exist on the DB and not auto user registration,
-        # or user is inactive, go away.
-        elif user is None or (not user.is_active):
+        # registration failed, or user is inactive, go away.
+        if user is None or (not user.is_active):
             log.info(LOGMSG_WAR_SEC_LOGIN_FAILED, username)
             return None
 
@@ -2355,22 +2611,307 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         if conf.get("fab", "SESSION_BACKEND") == "database":
             session.sid = str(uuid.uuid4())  # type: ignore
 
-    def _get_microsoft_jwks(self) -> list[dict[str, Any]]:
-        import requests
+    def _get_microsoft_jwks(self, jwks_uri: str | None = None) -> list[dict[str, Any]]:
+        """
+        Fetch the Microsoft signing key set.
 
-        return requests.get(MICROSOFT_KEY_SET_URL, timeout=30).json()
+        ``jwks_uri`` is supplied for national clouds, which serve their own keys; the
+        commercial cloud keeps using the key set URL from Flask-AppBuilder so existing
+        deployments and overrides of this method are unaffected.
+        """
+        return requests.get(jwks_uri or MICROSOFT_KEY_SET_URL, timeout=30).json()
+
+    def _get_azure_authority_host(self) -> str:
+        """
+        Return the Microsoft identity platform host the deployment is configured against.
+
+        Falls back to the commercial cloud, which is what Flask-AppBuilder's Azure defaults
+        point at when no endpoint is configured explicitly.
+        """
+        azure = self.oauth_remotes["azure"]
+        for url in (
+            getattr(azure, "api_base_url", None),
+            getattr(azure, "access_token_url", None),
+            getattr(azure, "authorize_url", None),
+        ):
+            if not isinstance(url, str):
+                continue
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme.lower() != "https":
+                continue
+            host = (parsed.hostname or "").lower()
+            if host in AZURE_AUTHORITY_HOSTS:
+                return host
+        return AZURE_COMMERCIAL_AUTHORITY_HOST
+
+    def _get_azure_tenant_identifier(self) -> str | None:
+        """
+        Extract the configured Azure AD tenant identifier.
+
+        Prefers an explicit ``tenant_id`` in ``client_kwargs``; otherwise derives it from
+        the tenant path segment of configured Azure HTTPS endpoints on any Microsoft identity
+        platform authority host (see ``AZURE_AUTHORITY_HOSTS``).
+
+        Returns ``None`` when an explicit ``tenant_id`` is tenant-agnostic or when no
+        tenant-specific identifier can be derived from the configured endpoints. Tenant-agnostic
+        authorities (``common``, ``organizations``, ``consumers``) are skipped while searching.
+        """
+        azure = self.oauth_remotes["azure"]
+        tenant_agnostic_authorities = ("common", "organizations", "consumers")
+
+        tenant_id = azure.client_kwargs.get("tenant_id")
+        if tenant_id and isinstance(tenant_id, str) and tenant_id.strip():
+            tenant_identifier = tenant_id.strip()
+        else:
+            tenant_identifier = None
+            for url in (
+                getattr(azure, "api_base_url", None),
+                getattr(azure, "access_token_url", None),
+                getattr(azure, "authorize_url", None),
+            ):
+                if not isinstance(url, str):
+                    continue
+                parsed = urllib.parse.urlsplit(url)
+                if parsed.scheme.lower() != "https":
+                    continue
+                if (parsed.hostname or "").lower() not in AZURE_AUTHORITY_HOSTS:
+                    continue
+                path_parts = [segment for segment in parsed.path.split("/") if segment]
+                if path_parts:
+                    tenant_candidate = path_parts[0]
+                    if tenant_candidate.lower() in tenant_agnostic_authorities:
+                        continue
+                    tenant_identifier = tenant_candidate
+                    break
+
+        if not tenant_identifier or tenant_identifier.lower() in tenant_agnostic_authorities:
+            return None
+        return tenant_identifier
+
+    def _resolve_azure_tenant_guid(self, tenant_identifier: str) -> str:
+        """
+        Resolve an Azure tenant identifier (GUID or domain) to a canonical tenant GUID.
+
+        If the identifier is a valid UUID, it is normalized to lowercase hyphenated format
+        without calling any network endpoint. If the identifier is a domain, its OpenID
+        discovery metadata is queried from login.microsoftonline.com to extract the canonical
+        tenant GUID from the issuer claim. Successful resolutions are cached.
+        """
+        try:
+            return str(uuid.UUID(tenant_identifier))
+        except (ValueError, AttributeError):
+            pass
+
+        if tenant_identifier in self._azure_tenant_guid_cache:
+            return self._azure_tenant_guid_cache[tenant_identifier]
+
+        encoded_tenant = urllib.parse.quote(tenant_identifier, safe="")
+        discovery_url = (
+            f"https://login.microsoftonline.com/{encoded_tenant}/v2.0/.well-known/openid-configuration"
+        )
+        try:
+            resp = requests.get(discovery_url, timeout=5, allow_redirects=False)
+        except requests.exceptions.RequestException as ex:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}' via OpenID discovery."
+            ) from ex
+
+        if resp.status_code != 200:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"OpenID discovery endpoint returned HTTP {resp.status_code}."
+            )
+
+        try:
+            data = resp.json()
+        except ValueError as ex:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}' via OpenID discovery."
+            ) from ex
+
+        if not isinstance(data, dict):
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                "OpenID discovery response is not a JSON object."
+            )
+
+        issuer = data.get("issuer")
+        if not isinstance(issuer, str):
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                "OpenID discovery response missing 'issuer' claim."
+            )
+
+        match = re.fullmatch(r"https://login\.microsoftonline\.com/([^/]+)/v2\.0", issuer, re.IGNORECASE)
+        if not match:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"OpenID discovery returned unexpected issuer '{issuer}'."
+            )
+
+        try:
+            canonical_guid = str(uuid.UUID(match.group(1)))
+        except (ValueError, AttributeError) as ex:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"issuer '{issuer}' does not contain a valid tenant GUID."
+            ) from ex
+
+        self._azure_tenant_guid_cache[tenant_identifier] = canonical_guid
+        return canonical_guid
+
+    def _fetch_azure_openid_configuration(self, discovery_url: str, tenant_identifier: str) -> dict[str, Any]:
+        """Fetch and sanity-check an OpenID discovery document, failing closed on any problem."""
+        try:
+            resp = requests.get(discovery_url, timeout=5, allow_redirects=False)
+        except requests.exceptions.RequestException as ex:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}' via OpenID discovery."
+            ) from ex
+
+        if resp.status_code != 200:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"OpenID discovery endpoint returned HTTP {resp.status_code}."
+            )
+
+        try:
+            data = resp.json()
+        except ValueError as ex:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}' via OpenID discovery."
+            ) from ex
+
+        if not isinstance(data, dict):
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                "OpenID discovery response is not a JSON object."
+            )
+        return data
+
+    def _resolve_azure_tenant_metadata(
+        self, tenant_identifier: str, authority_host: str
+    ) -> tuple[tuple[str, ...], str]:
+        """
+        Resolve the acceptable issuers and the signing key set URL for a national cloud tenant.
+
+        National clouds mint their own issuers and serve their own keys, and the values are not
+        derivable from the commercial ones, so they are read from the tenant's own OpenID
+        discovery metadata rather than assembled from a template. Both the v2.0 and v1.0
+        documents are consulted because either issuer form may appear depending on which
+        endpoints the deployment uses.
+
+        The issuer and ``jwks_uri`` are required to live on Microsoft-operated hosts for the
+        configured cloud, so a tampered metadata document cannot redirect verification
+        elsewhere. Results are cached per (authority host, tenant); failures are not cached.
+        """
+        cache_key = (authority_host, tenant_identifier)
+        if cache_key in self._azure_tenant_metadata_cache:
+            return self._azure_tenant_metadata_cache[cache_key]
+
+        encoded_tenant = urllib.parse.quote(tenant_identifier, safe="")
+        base = f"https://{authority_host}/{encoded_tenant}"
+
+        v2 = self._fetch_azure_openid_configuration(
+            f"{base}/v2.0/.well-known/openid-configuration", tenant_identifier
+        )
+        issuer = v2.get("issuer")
+        jwks_uri = v2.get("jwks_uri")
+        if not isinstance(issuer, str) or not isinstance(jwks_uri, str):
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                "OpenID discovery response missing 'issuer' or 'jwks_uri'."
+            )
+        if (urllib.parse.urlsplit(issuer).hostname or "").lower() != authority_host:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"OpenID discovery returned issuer '{issuer}' outside the configured authority "
+                f"'{authority_host}'."
+            )
+        jwks_host = (urllib.parse.urlsplit(jwks_uri).hostname or "").lower()
+        if urllib.parse.urlsplit(jwks_uri).scheme.lower() != "https" or jwks_host != authority_host:
+            raise AzureTenantResolutionError(
+                f"Failed to resolve Azure tenant identifier '{tenant_identifier}': "
+                f"OpenID discovery returned jwks_uri '{jwks_uri}' outside the configured authority "
+                f"'{authority_host}'."
+            )
+
+        issuers = [issuer]
+
+        # The v1.0 document carries the sts.* style issuer. It is fetched separately because a
+        # deployment configured against v1.0 endpoints receives tokens with that issuer. If it
+        # cannot be read, the v1.0 form is simply not accepted -- that denies a login rather
+        # than widening what is trusted.
+        try:
+            v1 = self._fetch_azure_openid_configuration(
+                f"{base}/.well-known/openid-configuration", tenant_identifier
+            )
+        except AzureTenantResolutionError:
+            log.warning(
+                "Could not read the v1.0 OpenID metadata for Azure tenant %s on %s; "
+                "only the v2.0 issuer will be accepted.",
+                tenant_identifier,
+                authority_host,
+            )
+        else:
+            v1_issuer = v1.get("issuer")
+            if isinstance(v1_issuer, str) and v1_issuer not in issuers:
+                issuers.append(v1_issuer)
+
+        resolved = (tuple(issuers), jwks_uri)
+        self._azure_tenant_metadata_cache[cache_key] = resolved
+        return resolved
 
     def _decode_and_validate_azure_jwt(self, id_token: str) -> dict[str, str]:
-        verify_signature = self.oauth_remotes["azure"].client_kwargs.get("verify_signature", False)
+        verify_signature = self.oauth_remotes["azure"].client_kwargs.get("verify_signature", True)
         if verify_signature:
             from authlib.jose import JsonWebKey, jwt as authlib_jwt
 
-            keyset = JsonWebKey.import_key_set(self._get_microsoft_jwks())  # type: ignore
-            claims = authlib_jwt.decode(id_token, keyset)
+            tenant_identifier = self._get_azure_tenant_identifier()
+            if not tenant_identifier:
+                raise AzureTenantResolutionError(
+                    "Azure AD tenant could not be determined from the OAuth configuration. "
+                    "The Microsoft key set used to verify id_token signatures serves keys for "
+                    "every tenant, so without a tenant the issuer of the token cannot be "
+                    "checked. Configure the tenant-specific endpoints "
+                    "(https://login.microsoftonline.com/<tenant-id>/...) or set 'tenant_id' "
+                    "in the azure provider's client_kwargs."
+                )
+
+            authority_host = self._get_azure_authority_host()
+            jwks_uri: str | None = None
+            if authority_host == AZURE_COMMERCIAL_AUTHORITY_HOST:
+                # The commercial cloud's issuer forms are stable and documented, so they are
+                # assembled from the tenant GUID. A GUID resolves without any network call,
+                # which keeps the common deployment off the discovery endpoint at login time.
+                tenant_guid = self._resolve_azure_tenant_guid(tenant_identifier)
+                issuers: tuple[str, ...] = (
+                    f"https://login.microsoftonline.com/{tenant_guid}/v2.0",
+                    f"https://sts.windows.net/{tenant_guid}/",
+                )
+            else:
+                # National clouds use different issuer hosts and serve their own signing keys,
+                # so both are read from the tenant's own metadata instead of being guessed.
+                issuers, jwks_uri = self._resolve_azure_tenant_metadata(tenant_identifier, authority_host)
+
+            claims_options = {
+                # The token must have been issued by the configured tenant. Both the v1.0 and
+                # v2.0 issuer forms are accepted because either may be returned depending on
+                # which endpoints the deployment is configured against.
+                "iss": {"essential": True, "values": list(issuers)},
+                # The token must have been minted for this application.
+                "aud": {"essential": True, "value": self.oauth_remotes["azure"].client_id},
+            }
+
+            keyset = JsonWebKey.import_key_set(self._get_microsoft_jwks(jwks_uri))  # type: ignore
+            claims = authlib_jwt.decode(id_token, keyset, claims_options=claims_options)
             claims.validate()
             return claims
 
-        return jwt.decode(id_token, options={"verify_signature": False})
+        log.warning("JWT token is not validated!")
+        _parts = id_token.split(".")
+        _payload = _parts[1] + "=" * (-len(_parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(_payload))
 
     def _ldap_bind_indirect(self, ldap, con) -> None:
         """
@@ -2405,10 +2946,20 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             raise ValueError("AUTH_LDAP_SEARCH must be set")
 
         # build the filter string for the LDAP search
+        # escape username to prevent LDAP filter injection
+        escaped_username = ldap.filter.escape_filter_chars(username)
         if self.auth_ldap_search_filter:
-            filter_str = f"(&{self.auth_ldap_search_filter}({self.auth_ldap_uid_field}={username}))"
+            # validate the search filter has balanced parentheses
+            _sf = self.auth_ldap_search_filter
+            if not (_sf.startswith("(") and _sf.endswith(")") and _sf.count("(") == _sf.count(")")):
+                raise ValueError(
+                    f"AUTH_LDAP_SEARCH_FILTER must be a valid LDAP filter with balanced parentheses, "
+                    f"starting with '(' and ending with ')'. Example: '(objectClass=person)'. "
+                    f"Got: {repr(_sf)[:100]}"
+                )
+            filter_str = f"(&{self.auth_ldap_search_filter}({self.auth_ldap_uid_field}={escaped_username}))"
         else:
-            filter_str = f"({self.auth_ldap_uid_field}={username})"
+            filter_str = f"({self.auth_ldap_uid_field}={escaped_username})"
 
         # build what fields to request in the LDAP search
         request_fields = [
@@ -2478,7 +3029,11 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         """
         log.debug("Nested groups for LDAP enabled.")
         # filter for microsoft active directory only
-        nested_groups_filter_str = f"(&(objectCategory=Group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
+        # escape user_dn to prevent LDAP injection attacks
+        escaped_user_dn = ldap.filter.escape_filter_chars(user_dn)
+        nested_groups_filter_str = (
+            "(&(objectCategory=Group)(member:1.2.840.113556.1.4.1941:=" + escaped_user_dn + "))"
+        )
         nested_groups_request_fields = ["cn"]
 
         nested_groups_search_result = con.search_s(

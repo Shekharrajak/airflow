@@ -21,30 +21,36 @@ import fcntl
 import json
 import logging
 import os
-import random
+import secrets
 from collections import namedtuple
 from enum import Enum
 from json import JSONDecodeError
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from termcolor import colored
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
-from airflow.api_fastapi.auth.managers.models.resource_details import TeamDetails
+from airflow.api_fastapi.auth.managers.models.resource_details import AccessView, TeamDetails
 from airflow.api_fastapi.auth.managers.simple.user import SimpleAuthManagerUser
 from airflow.api_fastapi.common.types import MenuItem
 from airflow.configuration import AIRFLOW_HOME, conf
+from airflow.models.asset import AssetModel
+from airflow.utils.session import NEW_SESSION, provide_session
 
 if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+    from starlette.middleware import _MiddlewareFactory
+
     from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
     from airflow.api_fastapi.auth.managers.models.resource_details import (
-        AccessView,
         AssetAliasDetails,
         AssetDetails,
         ConfigurationDetails,
@@ -70,7 +76,7 @@ class SimpleAuthManagerRole(namedtuple("SimpleAuthManagerRole", "name order"), E
     # VIEWER role gives all read-only permissions
     VIEWER = "VIEWER", 0
 
-    # USER role gives viewer role permissions + access to DAGs
+    # USER role gives viewer role permissions + access to Dags
     USER = "USER", 1
 
     # OP role gives user role permissions + access to connections, config, pools, variables
@@ -117,11 +123,68 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
         with open(password_file, "r+") as file:
             return SimpleAuthManager._get_passwords(file)
 
+    @staticmethod
+    def _looks_like_production(
+        *,
+        sql_conn: str | None = None,
+        api_host: str | None = None,
+        executor: str | None = None,
+    ) -> bool:
+        """
+        Best-effort heuristic for whether the Airflow deployment looks production-shaped.
+
+        Returns True if any of the following hold:
+
+        - The SQL backend is not sqlite (i.e. Postgres or MySQL is configured).
+        - The API host is bound to a non-local address.
+        - The configured executor is not Local-/Sequential-/Debug-/InProcessExecutor.
+
+        None of these are *definitive* — a developer can pick any combination locally
+        — but the cumulative signal is strong enough to justify a loud warning that
+        SimpleAuthManager (which is dev-only by design) is being used in a setup
+        that resembles production.
+
+        Each axis can be passed in directly (kwargs) so unit tests can probe the
+        decision logic without touching the global ``conf`` state. ``None`` (the
+        default) reads the value from ``conf``.
+        """
+        if sql_conn is None:
+            sql_conn = conf.get("database", "sql_alchemy_conn", fallback="")
+        if api_host is None:
+            api_host = conf.get("api", "host", fallback="localhost")
+        if executor is None:
+            executor = conf.get("core", "executor", fallback="LocalExecutor")
+
+        if sql_conn and not sql_conn.startswith("sqlite:"):
+            return True
+        if api_host.strip() not in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+            return True
+        # Split on '.' to get the class name only (handles fully-qualified executor paths).
+        local_executors = {"LocalExecutor", "SequentialExecutor", "DebugExecutor", "InProcessExecutor"}
+        if executor.split(".")[-1] not in local_executors:
+            return True
+        return False
+
     def init(self) -> None:
         super().init()
         is_simple_auth_manager_all_admins = conf.getboolean("core", "simple_auth_manager_all_admins")
         if is_simple_auth_manager_all_admins:
             return
+
+        # SimpleAuthManager is dev-only by design — it stores passwords in plaintext,
+        # prints generated passwords to stdout/logs on first init, and provides no
+        # rotation mechanism. Emit a loud warning when the deployment shape suggests
+        # production so it shows up in startup logs of misconfigured deployments.
+        if self._looks_like_production():
+            log.warning(
+                "SimpleAuthManager is active but the deployment shape looks like production "
+                "(non-sqlite backend, non-local API host, or a distributed executor). "
+                "SimpleAuthManager stores passwords in plaintext at %s and prints generated "
+                "passwords to stdout/logs on first init. Use a real auth manager "
+                "(e.g. FAB or Keycloak) for production deployments.",
+                self.get_generated_password_file(),
+            )
+
         users = self.get_users()
         password_file = self.get_generated_password_file()
 
@@ -156,11 +219,17 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
 
     def get_url_login(self, **kwargs) -> str:
         """Return the login page url."""
+        next_url = kwargs.get("next_url")
         is_simple_auth_manager_all_admins = conf.getboolean("core", "simple_auth_manager_all_admins")
         if is_simple_auth_manager_all_admins:
-            return AUTH_MANAGER_FASTAPI_APP_PREFIX + "/token/login"
+            login_url = AUTH_MANAGER_FASTAPI_APP_PREFIX + "/token/login"
+        else:
+            login_url = AUTH_MANAGER_FASTAPI_APP_PREFIX + "/login"
 
-        return AUTH_MANAGER_FASTAPI_APP_PREFIX + "/login"
+        if next_url:
+            return f"{login_url}?{urlencode({'next': next_url})}"
+
+        return login_url
 
     def deserialize_user(self, token: dict[str, Any]) -> SimpleAuthManagerUser:
         return SimpleAuthManagerUser(
@@ -244,6 +313,32 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
             user=user,
         )
 
+    @provide_session
+    def get_authorized_assets(
+        self,
+        *,
+        user: SimpleAuthManagerUser,
+        method: ResourceMethod = "GET",
+        session: Session = NEW_SESSION,
+    ) -> set[int]:
+        """
+        Get the ids of the assets the user has access to.
+
+        Simple auth manager authorizes assets at the role level: ``is_authorized_asset`` ignores the
+        asset details, so one check decides the whole listing. The default per-asset loop would
+        re-evaluate that same decision once per row.
+
+        This relies on ``is_authorized_asset`` not reading ``details``. If it starts to, or a subclass
+        overrides ``filter_authorized_assets``, remove or adjust this override.
+
+        :param user: the user
+        :param method: the method to filter on
+        :param session: the session
+        """
+        if not self.is_authorized_asset(method=method, user=user):
+            return set()
+        return set(session.scalars(select(AssetModel.id)))
+
     def is_authorized_pool(
         self,
         *,
@@ -286,8 +381,21 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
             team_name=details.team_name if details else None,
         )
 
-    def is_authorized_view(self, *, access_view: AccessView, user: SimpleAuthManagerUser) -> bool:
-        return self._is_authorized(method="GET", allow_role=SimpleAuthManagerRole.VIEWER, user=user)
+    def is_authorized_view(
+        self, *, access_view: AccessView, user: SimpleAuthManagerUser, team_name: str | None = None
+    ) -> bool:
+        # Views covering records that have no per-Dag key to authorize on are admin-only --
+        # import errors for files with no registered Dag, audit log rows not tied to a Dag, and
+        # reparsing a file with no registered Dag. Dag bundles show every file deployed, whatever
+        # Dags the caller may read, so they are left to operators. Every other view stays
+        # readable by viewers.
+        if access_view in (AccessView.IMPORT_ERRORS_ALL, AccessView.AUDIT_LOGS_ALL, AccessView.REPARSE_ALL):
+            allow_role = SimpleAuthManagerRole.ADMIN
+        elif access_view is AccessView.DAG_BUNDLES:
+            allow_role = SimpleAuthManagerRole.OP
+        else:
+            allow_role = SimpleAuthManagerRole.VIEWER
+        return self._is_authorized(method="GET", allow_role=allow_role, user=user, team_name=team_name)
 
     def is_authorized_custom_view(
         self, *, method: ResourceMethod, resource_name: str, user: SimpleAuthManagerUser
@@ -312,12 +420,16 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
             # In all-admin mode, everyone is allowed
             return True
 
-        # If no assigned_users specified, allow access
-        if not assigned_users:
-            return True
-
         # Delegate to parent class for the actual authorization check
         return super().is_authorized_hitl_task(assigned_users=assigned_users, user=user)
+
+    def get_fastapi_middlewares(self) -> list[tuple[_MiddlewareFactory[Any], dict[str, Any]]]:
+        """Register the all-admins middleware when ``[core] simple_auth_manager_all_admins`` is set."""
+        if not conf.getboolean("core", "simple_auth_manager_all_admins"):
+            return []
+        from airflow.api_fastapi.auth.managers.simple.middleware import SimpleAllAdminMiddleware
+
+        return [(SimpleAllAdminMiddleware, {})]
 
     def get_fastapi_app(self) -> FastAPI | None:
         """
@@ -354,8 +466,9 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
         @app.get("/{rest_of_path:path}", response_class=HTMLResponse, include_in_schema=False)
         def webapp(request: Request, rest_of_path: str):
             return templates.TemplateResponse(
+                request,
                 "/index.html",
-                {"request": request, "backend_server_base_url": request.base_url.path},
+                {"backend_server_base_url": request.base_url.path},
                 media_type="text/html",
             )
 
@@ -429,7 +542,8 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
 
     @staticmethod
     def _generate_password() -> str:
-        return "".join(random.choices("abcdefghkmnpqrstuvwxyzABCDEFGHKMNPQRSTUVWXYZ23456789", k=16))
+        alphabet = "abcdefghkmnpqrstuvwxyzABCDEFGHKMNPQRSTUVWXYZ23456789"
+        return "".join(secrets.choice(alphabet) for _ in range(16))
 
     @staticmethod
     def _print_output(output: str):

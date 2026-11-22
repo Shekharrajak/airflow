@@ -44,7 +44,7 @@ class GoogleCampaignManagerReportSensor(BaseSensorOperator):
     :param profile_id: The DFA user profile ID.
     :param report_id: The ID of the report.
     :param file_id: The ID of the report file.
-    :param api_version: The version of the api that will be requested, for example 'v4'.
+    :param api_version: The version of the api that will be requested, for example 'v5'.
     :param gcp_conn_id: The connection ID to use when fetching connection info.
     :param impersonation_chain: Optional service account to impersonate using short-term
         credentials, or chained list of accounts required to get the access_token
@@ -61,6 +61,7 @@ class GoogleCampaignManagerReportSensor(BaseSensorOperator):
         "report_id",
         "file_id",
         "impersonation_chain",
+        "gcp_conn_id",
     )
 
     def poke(self, context: Context) -> bool:
@@ -79,7 +80,7 @@ class GoogleCampaignManagerReportSensor(BaseSensorOperator):
         profile_id: str,
         report_id: str,
         file_id: str,
-        api_version: str = "v4",
+        api_version: str = "v5",
         gcp_conn_id: str = "google_cloud_default",
         mode: str = "reschedule",
         poke_interval: int = 60 * 5,

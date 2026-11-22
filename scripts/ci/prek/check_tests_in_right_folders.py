@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "rich>=13.6.0",
 # ]
@@ -65,6 +65,7 @@ POSSIBLE_TEST_FOLDERS = [
     "observability",
     "operators",
     "otel",
+    "performance",
     "plugins",
     "providers",
     "partition_mappers",
@@ -72,6 +73,7 @@ POSSIBLE_TEST_FOLDERS = [
     "security",
     "sensors",
     "serialization",
+    "state",
     "task",
     "template",
     "test_utils",

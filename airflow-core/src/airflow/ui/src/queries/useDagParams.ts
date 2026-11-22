@@ -19,21 +19,24 @@
 import { useTranslation } from "react-i18next";
 
 import { useDagServiceGetDagDetails } from "openapi/queries";
-import { toaster } from "src/components/ui";
+
+import { toaster } from "src/system-components";
 
 export type ParamsSpec = Record<string, ParamSpec>;
+
+export type ParamValue = Array<ParamValue> | boolean | number | string | { [key: string]: ParamValue } | null;
 
 export type ParamSpec = {
   description: string | null;
   schema: ParamSchema;
-  value: unknown;
+  value: ParamValue;
 };
 
 export type ParamSchema = {
   // TODO define the structure on API as generated code
   const: string | undefined;
   description_md: string | undefined;
-  enum: Array<boolean | number | string | null> | undefined;
+  enum: Array<ParamValue> | undefined;
   examples: Array<string> | undefined;
   format: string | undefined;
   items: Record<string, unknown> | undefined;

@@ -19,7 +19,6 @@ from __future__ import annotations
 from datetime import datetime
 
 import boto3
-from pendulum import duration
 
 from airflow.providers.amazon.aws.hooks.eks import ClusterStates, NodegroupStates
 from airflow.providers.amazon.aws.operators.eks import (
@@ -149,9 +148,6 @@ with DAG(
         task_id="delete_nodegroup_and_cluster",
         cluster_name=cluster_name,
         force_delete_compute=True,
-        retries=4,
-        retry_delay=duration(seconds=30),
-        retry_exponential_backoff=True,
     )
     # [END howto_operator_eks_force_delete_cluster]
     delete_nodegroup_and_cluster.trigger_rule = TriggerRule.ALL_DONE
@@ -189,5 +185,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

@@ -475,7 +475,13 @@ with DAG(
             return connection_id
 
         @task_group(group_id=f"create_connections_{database_type}")
-        def create_connections(instance: str, db_type: str, ip_address: str, port: str):
+        def create_connections(
+            instance: str,
+            db_type: str,
+            ip_address: str,
+            port: str,
+            database_type: str = database_type,
+        ):
             for conn in CONNECTIONS:
                 conn_id = f"{conn.id}_{database_type}"
                 create_connection(
@@ -555,5 +561,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

@@ -16,42 +16,57 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Box } from "@chakra-ui/react";
+import type { MouseEvent } from "react";
+
+import { Box, type BoxProps } from "@chakra-ui/react";
 import type { VirtualItem } from "@tanstack/react-virtual";
 import { useParams } from "react-router-dom";
 
 import type { GridRunsResponse, GridTISummaries } from "openapi/requests";
 import type { LightGridTaskInstanceSummary } from "openapi/requests/types.gen";
+
 import { VersionIndicatorOptions } from "src/constants/showVersionIndicatorOptions";
-import { useHover } from "src/context/hover";
+import type { GridCell } from "src/context/gridSelection";
 
 import { GridTI } from "./GridTI";
 import { DagVersionIndicator } from "./VersionIndicator";
+import { ROW_HEIGHT } from "./constants";
+import { getCellKey } from "./useGridSelection";
 import type { GridTask } from "./utils";
 
 type Props = {
   readonly nodes: Array<GridTask>;
-  readonly onCellClick?: () => void;
+  readonly onCellClick?: (event: MouseEvent<HTMLAnchorElement>, cell: GridCell) => void;
   readonly run: GridRunsResponse;
+  // Keys of the selected cells and of the cells inside the selected groups.
+  readonly selectedCellKeys?: ReadonlySet<string>;
   readonly showVersionIndicatorMode?: VersionIndicatorOptions;
   readonly tiSummaries?: GridTISummaries;
   readonly virtualItems?: Array<VirtualItem>;
 };
 
-const ROW_HEIGHT = 20;
+type CellBorderProps = Pick<BoxProps, "borderBottomWidth" | "borderColor" | "borderTopWidth">;
+
+const taskInstanceCellBorderProps = (hideRowBorders: boolean, rowIndex: number): CellBorderProps =>
+  hideRowBorders
+    ? { borderBottomWidth: 0, borderTopWidth: 0 }
+    : {
+        borderBottomWidth: 1,
+        borderColor: "border",
+        borderTopWidth: rowIndex === 0 ? 1 : 0,
+      };
 
 export const TaskInstancesColumn = ({
   nodes,
   onCellClick,
   run,
+  selectedCellKeys,
   showVersionIndicatorMode,
   tiSummaries,
   virtualItems,
 }: Props) => {
   const { dagId = "", runId } = useParams();
   const isSelected = runId === run.run_id;
-
-  const { hoveredRunId, setHoveredRunId } = useHover();
 
   const itemsToRender =
     virtualItems ?? nodes.map((_, index) => ({ index, size: ROW_HEIGHT, start: index * ROW_HEIGHT }));
@@ -68,16 +83,13 @@ export const TaskInstancesColumn = ({
   );
   const hasMixedVersions = versionNumbers.size > 1;
 
-  const isHovered = hoveredRunId === run.run_id;
-
-  const handleMouseEnter = () => setHoveredRunId(run.run_id);
-  const handleMouseLeave = () => setHoveredRunId(undefined);
+  const hideRowBorders = isSelected;
 
   return (
     <Box
-      bg={isSelected ? "brand.emphasized" : isHovered ? "brand.muted" : undefined}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
+      bg={isSelected ? "brand.emphasized" : undefined}
+      data-run-id={run.run_id}
+      data-selected={isSelected}
       position="relative"
       transition="background-color 0.2s"
       width="18px"
@@ -94,6 +106,7 @@ export const TaskInstancesColumn = ({
         if (!taskInstance) {
           return (
             <Box
+              {...taskInstanceCellBorderProps(hideRowBorders, virtualItem.index)}
               height={`${ROW_HEIGHT}px`}
               key={`${node.id}-${run.run_id}`}
               left={0}
@@ -124,6 +137,8 @@ export const TaskInstancesColumn = ({
 
         return (
           <Box
+            {...taskInstanceCellBorderProps(hideRowBorders, virtualItem.index)}
+            height={`${ROW_HEIGHT}px`}
             key={node.id}
             left={0}
             position="absolute"
@@ -138,11 +153,18 @@ export const TaskInstancesColumn = ({
             )}
             <GridTI
               dagId={dagId}
+              hasNote={taskInstance.has_note ?? false}
               instance={taskInstance}
               isGroup={node.isGroup}
               isMapped={node.is_mapped}
+              isMultiSelected={
+                selectedCellKeys === undefined || selectedCellKeys.size === 0
+                  ? undefined
+                  : selectedCellKeys.has(getCellKey(run.run_id, node.id))
+              }
               label={node.label}
-              onClick={onCellClick}
+              loopMaxIterations={node.loop_max_iterations}
+              onClick={(event) => onCellClick?.(event, { runId: run.run_id, taskId: node.id })}
               runId={run.run_id}
               taskId={node.id}
             />

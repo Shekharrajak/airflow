@@ -16,7 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
+
+import { DATA_ROWS } from "tests/e2e/utils/ui/selectors";
 
 import { BasePage } from "./BasePage";
 
@@ -32,17 +35,27 @@ export class ConfigurationPage extends BasePage {
       name: /config/i,
     });
     this.table = page.getByTestId("table-list");
-    this.rows = this.table.locator("tbody tr").filter({
+    this.rows = this.table.locator(DATA_ROWS).filter({
       has: page.locator("td"),
     });
   }
 
+  public getRowByKey(key: string): Locator {
+    return this.rows.filter({
+      has: this.page.getByTestId("table-cell-key").filter({ hasText: new RegExp(`^${key}$`) }),
+    });
+  }
+
   public async navigate(): Promise<void> {
-    await this.navigateTo("/configs");
+    await expect(async () => {
+      await this.navigateTo("/configs");
+      await this.page.waitForURL(/.*configs/, { timeout: 10_000 });
+      await this.waitForLoad();
+    }).toPass({ intervals: [2000], timeout: 60_000 });
   }
 
   public async waitForLoad(): Promise<void> {
-    await this.table.waitFor({ state: "visible", timeout: 30_000 });
-    await this.rows.first().waitFor({ state: "visible", timeout: 30_000 });
+    await expect(this.table).toBeVisible();
+    await expect(this.rows.first()).toBeVisible();
   }
 }

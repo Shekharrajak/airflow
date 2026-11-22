@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "rich>=13.6.0",
 # ]
@@ -40,7 +40,7 @@ errors: list[str] = []
 for pyproject_path in sorted(AIRFLOW_ROOT_PATH.rglob("pyproject.toml")):
     relative = pyproject_path.relative_to(AIRFLOW_ROOT_PATH)
     # Skip directories that are not part of the source tree
-    if any(part.startswith(".") or part in ("out", "node_modules") for part in relative.parts):
+    if any(part.startswith(".") or part in ("out", "node_modules", "files") for part in relative.parts):
         continue
     dist_dir = pyproject_path.parent
     gitignore_path = dist_dir / ".gitignore"

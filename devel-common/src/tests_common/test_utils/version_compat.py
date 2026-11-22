@@ -38,7 +38,12 @@ AIRFLOW_V_3_0_3_PLUS = get_base_airflow_version_tuple() >= (3, 0, 3)
 AIRFLOW_V_3_1_PLUS = get_base_airflow_version_tuple() >= (3, 1, 0)
 AIRFLOW_V_3_1_3_PLUS = get_base_airflow_version_tuple() >= (3, 1, 3)
 AIRFLOW_V_3_1_7_PLUS = get_base_airflow_version_tuple() >= (3, 1, 7)
+AIRFLOW_V_3_1_9_PLUS = get_base_airflow_version_tuple() >= (3, 1, 9)
 AIRFLOW_V_3_2_PLUS = get_base_airflow_version_tuple() >= (3, 2, 0)
+AIRFLOW_V_3_2_2_PLUS = get_base_airflow_version_tuple() >= (3, 2, 2)
+AIRFLOW_V_3_3_PLUS = get_base_airflow_version_tuple() >= (3, 3, 0)
+AIRFLOW_V_3_3_2_PLUS = get_base_airflow_version_tuple() >= (3, 3, 2)
+AIRFLOW_V_3_4_PLUS = get_base_airflow_version_tuple() >= (3, 4, 0)
 
 if AIRFLOW_V_3_1_PLUS:
     from airflow.sdk import PokeReturnValue, timezone
@@ -49,7 +54,7 @@ if AIRFLOW_V_3_1_PLUS:
     XCOM_RETURN_KEY = BaseXCom.XCOM_RETURN_KEY
 else:
     from airflow.sensors.base import PokeReturnValue  # type: ignore[no-redef]
-    from airflow.utils import timezone  # type: ignore[attr-defined,no-redef]
+    from airflow.utils import timezone  # type: ignore[attr-defined,no-redef] # noqa: TID251
     from airflow.utils.decorators import remove_task_decorator  # type: ignore[no-redef]
     from airflow.utils.types import NOTSET, ArgNotSet  # type: ignore[attr-defined,no-redef]
     from airflow.utils.xcom import XCOM_RETURN_KEY  # type: ignore[no-redef]
@@ -60,6 +65,9 @@ __all__ = [
     "AIRFLOW_V_3_0_1",
     "AIRFLOW_V_3_1_PLUS",
     "AIRFLOW_V_3_2_PLUS",
+    "AIRFLOW_V_3_3_PLUS",
+    "AIRFLOW_V_3_3_2_PLUS",
+    "AIRFLOW_V_3_4_PLUS",
     "NOTSET",
     "XCOM_RETURN_KEY",
     "ArgNotSet",

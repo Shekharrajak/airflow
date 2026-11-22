@@ -36,15 +36,18 @@ configuring an Airflow environment.
     notifications
     sla-to-deadlines
     deadline-alerts
+    dag-level-retry-via-callback
     set-config
     set-up-database
     operator/index
     timetable
     custom-view-plugin
+    custom-action-plugin
     listener-plugin
     customize-ui
     custom-operator
     create-custom-decorator
+    static-type-checking
     export-more-env-vars
     connection
     variable

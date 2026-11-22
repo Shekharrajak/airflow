@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -31,18 +31,13 @@ class TestRemoteLogging:
     retry_interval_in_seconds = 5
     max_retries = 12
 
-    def test_dag_unpause(self):
-        self.airflow_client.un_pause_dag(
-            TestRemoteLogging.dag_id,
-        )
-
     def test_remote_logging_s3(self):
         """Test that a DAG using remote logging to S3 completes successfully."""
 
         self.airflow_client.un_pause_dag(TestRemoteLogging.dag_id)
 
         resp = self.airflow_client.trigger_dag(
-            TestRemoteLogging.dag_id, json={"logical_date": datetime.now(timezone.utc).isoformat()}
+            TestRemoteLogging.dag_id, json={"logical_date": datetime.now(UTC).isoformat()}
         )
         state = self.airflow_client.wait_for_dag_run(
             dag_id=TestRemoteLogging.dag_id,
@@ -81,9 +76,7 @@ class TestRemoteLogging:
             run_id=resp["dag_run_id"],
         )
 
-        task_log_sources = [
-            source for content in task_logs.get("content", [{}]) for source in content.get("sources", [])
-        ]
+        task_log_sources = [content.get("event", []) for content in task_logs.get("content", [{}])]
         response = s3_client.list_objects_v2(Bucket=bucket_name)
 
         if "Contents" not in response:

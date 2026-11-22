@@ -21,25 +21,26 @@ import { paramPlaceholder, useParamStore } from "src/queries/useParamStore";
 
 import type { FlexibleFormElementProps } from ".";
 import { FieldAdvancedArray } from "./FieldAdvancedArray";
+import { FieldArray } from "./FieldArray";
 import { FieldBool } from "./FieldBool";
 import { FieldDateTime } from "./FieldDateTime";
 import { FieldDropdown } from "./FieldDropdown";
+import { FieldDuration } from "./FieldDuration";
 import { FieldMultiSelect } from "./FieldMultiSelect";
+import { FieldMultiType } from "./FieldMultiType";
 import { FieldMultilineText } from "./FieldMultilineText";
 import { FieldNumber } from "./FieldNumber";
 import { FieldObject } from "./FieldObject";
+import { FieldPassword } from "./FieldPassword";
 import { FieldString } from "./FieldString";
-import { FieldStringArray } from "./FieldStringArray";
 
 const inferType = (param: ParamSpec) => {
   if (Boolean(param.schema.type)) {
     // If there are multiple types, we assume that the first one is the correct one that is not "null".
     // "null" is only used to signal the value is optional.
-    if (Array.isArray(param.schema.type)) {
-      return param.schema.type.find((type) => type !== "null") ?? "string";
-    }
-
-    return param.schema.type ?? "string";
+    return Array.isArray(param.schema.type)
+      ? (param.schema.type.find((type) => type !== "null") ?? "string")
+      : (param.schema.type ?? "string");
   }
 
   // If the type is not defined, we infer it from the value.
@@ -48,15 +49,17 @@ const inferType = (param: ParamSpec) => {
   }
 
   // Missing value, return 'null' as typeof(null) = 'dict'
-  if (param.value === null) {
-    return "null";
-  }
-
-  return typeof param.value;
+  return param.value === null ? "null" : typeof param.value;
 };
 
+const simpleArrayItemTypes: Array<unknown> = ["string", "number", "integer", "boolean"];
+
+const isFieldArray = (fieldType: string, fieldSchema: ParamSchema) =>
+  fieldType === "array" &&
+  (fieldSchema.items?.type === undefined || simpleArrayItemTypes.includes(fieldSchema.items.type));
+
 const isFieldAdvancedArray = (fieldType: string, fieldSchema: ParamSchema) =>
-  fieldType === "array" && fieldSchema.items?.type !== "string";
+  fieldType === "array" && !isFieldArray(fieldType, fieldSchema);
 
 const isFieldBool = (fieldType: string) => fieldType === "boolean";
 
@@ -66,7 +69,10 @@ const isFieldDate = (fieldType: string, fieldSchema: ParamSchema) =>
 const isFieldDateTime = (fieldType: string, fieldSchema: ParamSchema) =>
   fieldType === "string" && fieldSchema.format === "date-time";
 
-const enumTypes = ["null", "string", "number", "integer"];
+const isFieldDuration = (fieldType: string, fieldSchema: ParamSchema) =>
+  fieldType === "string" && fieldSchema.format === "duration";
+
+const enumTypes = ["null", "string", "number", "integer", "object"];
 
 const isFieldDropdown = (fieldType: string, fieldSchema: ParamSchema) =>
   enumTypes.includes(fieldType) && Array.isArray(fieldSchema.enum);
@@ -85,8 +91,14 @@ const isFieldNumber = (fieldType: string) => {
 
 const isFieldObject = (fieldType: string) => fieldType === "object";
 
-const isFieldStringArray = (fieldType: string, fieldSchema: ParamSchema) =>
-  fieldType === "array" && (fieldSchema.items?.type === undefined || fieldSchema.items.type === "string");
+const isFieldPassword = (fieldType: string, fieldSchema: ParamSchema) =>
+  fieldType === "string" && fieldSchema.format === "password";
+
+const isFieldMultiType = (fieldSchema: ParamSchema) =>
+  Array.isArray(fieldSchema.type) &&
+  fieldSchema.type.filter((type) => type !== "null").length > 1 &&
+  !Array.isArray(fieldSchema.enum) &&
+  !Array.isArray(fieldSchema.examples);
 
 const isFieldTime = (fieldType: string, fieldSchema: ParamSchema) =>
   fieldType === "string" && fieldSchema.format === "time";
@@ -105,6 +117,12 @@ export const FieldSelector = ({ name, namespace = "default", onUpdate }: Flexibl
     value: currentParam?.value ?? initialParam.value,
   };
 
+  // Check for multiple non-null types before inferring a single type —
+  // inferType picks only the first, discarding the others.
+  if (isFieldMultiType(param.schema)) {
+    return <FieldMultiType name={name} namespace={namespace} onUpdate={onUpdate} />;
+  }
+
   const fieldType = inferType(param);
 
   if (isFieldBool(fieldType)) {
@@ -119,16 +137,20 @@ export const FieldSelector = ({ name, namespace = "default", onUpdate }: Flexibl
     return <FieldDropdown name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else if (isFieldMultiSelect(fieldType, param.schema)) {
     return <FieldMultiSelect name={name} namespace={namespace} onUpdate={onUpdate} />;
-  } else if (isFieldStringArray(fieldType, param.schema)) {
-    return <FieldStringArray name={name} namespace={namespace} onUpdate={onUpdate} />;
+  } else if (isFieldArray(fieldType, param.schema)) {
+    return <FieldArray name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else if (isFieldAdvancedArray(fieldType, param.schema)) {
     return <FieldAdvancedArray name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else if (isFieldObject(fieldType)) {
     return <FieldObject name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else if (isFieldNumber(fieldType)) {
     return <FieldNumber name={name} namespace={namespace} onUpdate={onUpdate} />;
+  } else if (isFieldDuration(fieldType, param.schema)) {
+    return <FieldDuration name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else if (isFieldMultilineText(fieldType, param.schema)) {
     return <FieldMultilineText name={name} namespace={namespace} onUpdate={onUpdate} />;
+  } else if (isFieldPassword(fieldType, param.schema)) {
+    return <FieldPassword name={name} namespace={namespace} onUpdate={onUpdate} />;
   } else {
     return <FieldString name={name} namespace={namespace} onUpdate={onUpdate} />;
   }

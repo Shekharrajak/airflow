@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import os
-import textwrap
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING
 
@@ -37,6 +36,7 @@ from airflow.utils.process_utils import execute_interactive
 from airflow.utils.providers_configuration_loader import providers_configuration_loaded
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine.url import URL
     from tenacity import RetryCallState
 
 log = structlog.get_logger(__name__)
@@ -174,10 +174,18 @@ def run_db_downgrade_command(args, command, revision_heads_map: dict[str, str]):
     if args.from_revision:
         from_revision = args.from_revision
     elif args.from_version:
+        try:
+            parse_version(args.from_version)
+        except InvalidVersion:
+            raise SystemExit(f"Invalid version {args.from_version!r} supplied as `--from-version`.")
         from_revision = _get_version_revision(args.from_version, revision_heads_map=revision_heads_map)
         if not from_revision:
             raise SystemExit(f"Unknown version {args.from_version!r} supplied as `--from-version`.")
     if args.to_version:
+        try:
+            parse_version(args.to_version)
+        except InvalidVersion:
+            raise SystemExit(f"Invalid version {args.to_version!r} supplied as `--to-version`.")
         to_revision = _get_version_revision(args.to_version, revision_heads_map=revision_heads_map)
         if not to_revision:
             raise SystemExit(f"Downgrading to version {args.to_version} is not supported.")
@@ -240,6 +248,65 @@ def _quote_mysql_password_for_cnf(password: str | None) -> str:
     return f'"{val}"'
 
 
+# SQLAlchemy MySQL URL query params that are safe to forward into the my.cnf
+# ``[client]`` section written by ``airflow db shell``. Keys differ between the
+# URL (underscore) and the mysql client option file (hyphen), so we translate.
+#
+# Without this, cert-based authentication (e.g. MySQL users created with
+# ``CREATE USER ... REQUIRE X509`` or fronted by a proxy that maps cert SANs
+# to MySQL users) cannot be used by ``airflow db shell`` even when the rest
+# of Airflow connects successfully with the same ``sql_alchemy_conn``.
+_MYSQL_URL_QUERY_TO_CNF: dict[str, str] = {
+    "ssl_ca": "ssl-ca",
+    "ssl_cert": "ssl-cert",
+    "ssl_key": "ssl-key",
+    "ssl_cipher": "ssl-cipher",
+    "ssl_mode": "ssl-mode",
+    "charset": "default-character-set",
+}
+
+
+def _strip_newlines(value: str | tuple[str, ...]) -> str:
+    """
+    Strip CR/LF from a my.cnf option value to prevent option injection.
+
+    SQLAlchemy's URL parser percent-decodes query values, so a malicious
+    ``sql_alchemy_conn`` containing ``%0A`` (or ``%0D``) could otherwise
+    inject extra lines into the ``[client]`` section we render below. The
+    parser also returns a tuple when the same key appears multiple times;
+    collapse to the last value (mirroring command-line override semantics)
+    so the rendered ``[client]`` is one line per option.
+    """
+    if isinstance(value, tuple):
+        value = value[-1] if value else ""
+    return value.replace("\n", "").replace("\r", "")
+
+
+def _build_mysql_cnf(url: URL) -> bytes:
+    """
+    Render the ``[client]`` section of a mysql option file from a SQLAlchemy URL.
+
+    Produces the bytes that ``airflow db shell`` writes to the temporary file
+    passed to ``mysql --defaults-extra-file=…``. Beyond the core connection
+    fields, any query-string keys listed in :data:`_MYSQL_URL_QUERY_TO_CNF`
+    are forwarded so that cert-based authentication flows work end-to-end.
+    """
+    lines: list[str] = [
+        "[client]",
+        f"host     = {url.host or ''}",
+        f"user     = {url.username or ''}",
+        f"password = {_quote_mysql_password_for_cnf(url.password)}",
+        f"port     = {url.port or '3306'}",
+        f"database = {url.database or ''}",
+    ]
+    lines.extend(
+        f"{cnf_key} = {_strip_newlines(url.query[url_key])}"
+        for url_key, cnf_key in _MYSQL_URL_QUERY_TO_CNF.items()
+        if url_key in url.query
+    )
+    return "\n".join(lines).encode()
+
+
 @cli_utils.action_cli(check_db=False)
 @providers_configuration_loaded
 def shell(args):
@@ -247,19 +314,15 @@ def shell(args):
     url = settings.get_engine().url
     print(f"DB: {url!r}")
 
+    if not url.database:
+        raise ValueError(
+            "The metadata database name is missing from the connection URI. "
+            "Please check your AIRFLOW__DATABASE__SQL_ALCHEMY_CONN configuration."
+        )
+
     if url.get_backend_name() == "mysql":
         with NamedTemporaryFile(suffix="my.cnf") as f:
-            content = textwrap.dedent(
-                f"""
-                [client]
-                host     = {(url.host or "")}
-                user     = {(url.username or "")}
-                password = {_quote_mysql_password_for_cnf(url.password)}
-                port     = {url.port or "3306"}
-                database = {(url.database or "")}
-                """
-            ).strip()
-            f.write(content.encode())
+            f.write(_build_mysql_cnf(url))
             f.flush()
             execute_interactive(["mysql", f"--defaults-extra-file={f.name}"])
     elif url.get_backend_name() == "sqlite":
@@ -285,7 +348,7 @@ def check(args):
     retry_delay: int = args.retry_delay
 
     def _warn_remaining_retries(retrystate: RetryCallState):
-        remain = retries - retrystate.attempt_number
+        remain = retries - retrystate.attempt_number + 1
         log.warning("%d retries remain. Will retry in %d seconds", remain, retry_delay)
 
     for attempt in Retrying(
@@ -316,6 +379,8 @@ def cleanup_tables(args):
         batch_size=args.batch_size,
         dag_ids=args.dag_ids,
         exclude_dag_ids=args.exclude_dag_ids,
+        asset_ids=args.asset_ids,
+        error_on_cleanup_failure=args.error_on_cleanup_failure,
     )
 
 

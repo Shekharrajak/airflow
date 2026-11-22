@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # /// script
-# requires-python = ">=3.10,<3.11"
+# requires-python = ">=3.11,<3.12"
 # dependencies = [
 #   "rich>=13.6.0",
 # ]
@@ -28,11 +28,10 @@ Check that all airflowctl CLI commands have integration test coverage by compari
 
 from __future__ import annotations
 
-import ast
 import re
 import sys
 
-from common_prek_utils import AIRFLOW_ROOT_PATH, console
+from common_prek_utils import AIRFLOW_ROOT_PATH, console, parse_operations
 
 OPERATIONS_FILE = AIRFLOW_ROOT_PATH / "airflow-ctl" / "src" / "airflowctl" / "api" / "operations.py"
 CTL_TESTS_FILE = (
@@ -54,15 +53,14 @@ EXCLUDED_COMMANDS = {
     "assets delete-dag-queued-events",
     "assets delete-queued-event",
     "assets delete-queued-events",
-    "assets get-by-alias",
+    "assets get-alias",
     "assets get-dag-queued-event",
     "assets get-dag-queued-events",
     "assets get-queued-events",
-    "assets list-by-alias",
+    "assets list-aliases",
     "assets materialize",
     "backfill cancel",
     "backfill create",
-    "backfill create-dry-run",
     "backfill get",
     "backfill pause",
     "backfill unpause",
@@ -73,30 +71,11 @@ EXCLUDED_COMMANDS = {
     "dags get-tags",
 }
 
-
-def parse_operations() -> dict[str, list[str]]:
-    commands: dict[str, list[str]] = {}
-
-    with open(OPERATIONS_FILE) as f:
-        tree = ast.parse(f.read(), filename=str(OPERATIONS_FILE))
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name.endswith("Operations"):
-            if node.name in EXCLUDED_OPERATION_CLASSES:
-                continue
-
-            group_name = node.name.replace("Operations", "").lower()
-            commands[group_name] = []
-
-            for child in node.body:
-                if isinstance(child, ast.FunctionDef):
-                    method_name = child.name
-                    if method_name in EXCLUDED_METHODS or method_name.startswith("_"):
-                        continue
-                    subcommand = method_name.replace("_", "-")
-                    commands[group_name].append(subcommand)
-
-    return commands
+SUBGROUPS = {
+    "assets": {"state-store"},
+    "taskinstances": {"state-store"},
+}
+NESTED_PREFIXES = {f"{group} {subgroup}" for group, subgroups in SUBGROUPS.items() for subgroup in subgroups}
 
 
 def parse_tested_commands() -> set[str]:
@@ -107,23 +86,38 @@ def parse_tested_commands() -> set[str]:
 
     # Match command patterns like "assets list", "dags list-import-errors", etc.
     # Also handles f-strings like f"dagrun get..." or f'dagrun get...'
-    pattern = r'f?["\']([a-z]+(?:-[a-z]+)*\s+[a-z]+(?:-[a-z]+)*)'
+    # The third token is only kept for nested subgroups (NESTED_PREFIXES).
+    pattern = r'f?["\']([a-z]+(?:-[a-z]+)*(?:\s+[a-z]+(?:-[a-z]+)*){1,2})'
     for match in re.findall(pattern, content):
         parts = match.split()
-        if len(parts) >= 2:
-            tested.add(f"{parts[0]} {parts[1]}")
+        if len(parts) < 2:
+            continue
+        two = f"{parts[0]} {parts[1]}"
+        if two in NESTED_PREFIXES and len(parts) >= 3:
+            tested.add(f"{two} {parts[2]}")
+        else:
+            tested.add(two)
 
     return tested
 
 
 def main():
-    available = parse_operations()
+    available = parse_operations(
+        operations_file=OPERATIONS_FILE,
+        exclude_operation_classes=EXCLUDED_OPERATION_CLASSES,
+        exclude_methods=EXCLUDED_METHODS,
+    )
     tested = parse_tested_commands()
 
     missing = []
     for group, subcommands in sorted(available.items()):
         for subcommand in sorted(subcommands):
-            cmd = f"{group} {subcommand}"
+            subgroup = next((sg for sg in SUBGROUPS.get(group, ()) if subcommand.endswith(f"-{sg}")), None)
+            cmd = (
+                f"{group} {subgroup} {subcommand.removesuffix(f'-{subgroup}')}"
+                if subgroup is not None
+                else f"{group} {subcommand}"
+            )
             if cmd not in tested and cmd not in EXCLUDED_COMMANDS:
                 missing.append(cmd)
 

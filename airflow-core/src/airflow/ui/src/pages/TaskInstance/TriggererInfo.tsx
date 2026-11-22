@@ -20,6 +20,9 @@ import { Box, Table, Heading } from "@chakra-ui/react";
 import { useTranslation } from "react-i18next";
 
 import type { TaskInstanceResponse } from "openapi/requests/types.gen";
+
+import { RouterLink } from "src/system-components";
+
 import Time from "src/components/Time";
 
 export const TriggererInfo = ({ taskInstance }: { readonly taskInstance: TaskInstanceResponse }) => {
@@ -38,7 +41,11 @@ export const TriggererInfo = ({ taskInstance }: { readonly taskInstance: TaskIns
           </Table.Row>
           <Table.Row>
             <Table.Cell>{translate("taskInstance.triggerer.id")}</Table.Cell>
-            <Table.Cell>{taskInstance.trigger?.id}</Table.Cell>
+            <Table.Cell>
+              {taskInstance.trigger ? (
+                <RouterLink to={`/triggers/${taskInstance.trigger.id}`}>{taskInstance.trigger.id}</RouterLink>
+              ) : undefined}
+            </Table.Cell>
           </Table.Row>
           <Table.Row>
             <Table.Cell>{translate("taskInstance.triggerer.createdAt")}</Table.Cell>

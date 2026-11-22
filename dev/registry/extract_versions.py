@@ -42,12 +42,13 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import tomllib
 from registry_contract_models import validate_provider_version_metadata
+from registry_tools.uri_schemes import collect_uri_schemes
 
 try:
     import yaml
@@ -56,12 +57,46 @@ except ImportError:
     sys.exit(1)
 
 from extract_metadata import fetch_provider_inventory, read_connection_urls, resolve_connection_docs_url
-from registry_tools.types import MODULE_LEVEL_SECTIONS, TYPE_SUFFIXES
+from registry_tools.docs_guides import attach_guide_urls, collect_guide_anchors, is_guide_page
+from registry_tools.types import (
+    CLASS_LEVEL_CATEGORY_OVERRIDES,
+    CLASS_LEVEL_SECTIONS,
+    DICT_SHAPED_CLASS_LEVEL_SECTIONS,
+    MODULE_LEVEL_SECTIONS,
+    TYPE_SUFFIXES,
+)
 
+SCRIPT_DIR = Path(__file__).parent
 AIRFLOW_ROOT = Path(__file__).parent.parent.parent
 PROVIDERS_DIR = AIRFLOW_ROOT / "providers"
 REGISTRY_DIR = AIRFLOW_ROOT / "registry"
 OUTPUT_DIR = REGISTRY_DIR / "src" / "_data" / "versions"
+
+# Same candidate order as extract_parameters.py and extract_metadata.py: the
+# `Download existing providers.json` workflow step writes to dev/registry/
+# (= SCRIPT_DIR), so prefer that. Fall back to the eleventy data dir when
+# running locally after a full extract pass has populated it.
+PROVIDERS_JSON_CANDIDATES = [
+    SCRIPT_DIR / "providers.json",
+    REGISTRY_DIR / "src" / "_data" / "providers.json",
+]
+
+# Description suffix for class-level (FQCN) sections, keyed by module type id.
+# Kept local to this file (unlike category, which is shared via
+# CLASS_LEVEL_CATEGORY_OVERRIDES) because extract_parameters.py has a real
+# docstring to use instead and doesn't need a description suffix at all.
+FQCN_DESC_SUFFIXES: dict[str, str] = {
+    "notifier": "notifier",
+    "secret": "secrets backend",
+    "logging": "log handler",
+    "executor": "executor",
+    "extra_link": "extra link",
+    "queue": "queue",
+    "auth_manager": "auth manager",
+    "db_manager": "db manager",
+    "plugin": "plugin",
+    "dialect": "dialect",
+}
 
 
 def build_provider_id_to_path_map() -> dict[str, str]:
@@ -91,6 +126,62 @@ def git_show(tag: str, path: str) -> str | None:
         return result.stdout
     except subprocess.CalledProcessError:
         return None
+
+
+def git_ls_tree(tag: str, prefix: str) -> list[str]:
+    """List the file paths under a prefix at a specific git tag."""
+    try:
+        result = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", tag, "--", prefix],
+            capture_output=True,
+            cwd=AIRFLOW_ROOT,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return []
+    return [line for line in result.stdout.decode("utf-8").splitlines() if line]
+
+
+def git_cat_file_batch(tag: str, paths: list[str]) -> dict[str, str]:
+    """Read multiple files at a specific git tag in one `git cat-file --batch` call.
+
+    Returns a mapping of path -> content for paths that exist at the tag; a path
+    git reports as missing is simply absent from the result, matching git_show's
+    "return None for a missing path" semantics.
+
+    Decode failures are left unguarded on purpose: .rst files are Sphinx
+    convention UTF-8, an explicit "utf-8" decode is more predictable than
+    following the process locale, and a UnicodeDecodeError should surface loudly
+    rather than being swallowed. A failing ``git cat-file`` call also raises
+    (``check=True``); only git_show turns CalledProcessError into ``None``.
+    """
+    if not paths:
+        return {}
+
+    stdin = ("\n".join(f"{tag}:{p}" for p in paths) + "\n").encode("utf-8")
+    result = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        input=stdin,
+        capture_output=True,
+        cwd=AIRFLOW_ROOT,
+        check=True,
+    )
+
+    output = result.stdout
+    pos = 0
+    contents: dict[str, str] = {}
+    for path in paths:
+        newline_idx = output.index(b"\n", pos)
+        header = output[pos:newline_idx].decode("utf-8")
+        pos = newline_idx + 1
+        if header.endswith(" missing"):
+            continue
+        _sha1, _obj_type, size_str = header.split(" ")
+        size = int(size_str)
+        content_bytes = output[pos : pos + size]
+        pos += size + 1  # skip the protocol's trailing LF, which isn't counted in size
+        contents[path] = content_bytes.decode("utf-8")
+    return contents
 
 
 def git_tag_exists(tag: str) -> bool:
@@ -143,6 +234,32 @@ def get_source_file_path(layout: str, dir_path: str, module_path: str) -> str:
     if layout == "new":
         return f"providers/{dir_path}/src/{rel_file}"
     return f"providers/src/{rel_file}"
+
+
+def read_guide_docs(tag: str, layout: str, dir_path: str) -> dict[str, str]:
+    """Read a provider's authored reST docs at a tag, keyed by path relative to its docs dir.
+
+    Only the per-provider layout keeps docs beside the provider; under the old flat
+    layout they lived in a top-level ``docs/`` tree, so those tags get no guide
+    links rather than links guessed from a path that moved.
+    """
+    if layout != "new":
+        return {}
+
+    docs_prefix = f"providers/{dir_path}/docs/"
+    survivors: list[tuple[str, str]] = []
+    for path in git_ls_tree(tag, docs_prefix):
+        if not path.endswith(".rst"):
+            continue
+        relative = path[len(docs_prefix) :]
+        if not is_guide_page(relative):
+            continue
+        survivors.append((relative, path))
+
+    batch_result = git_cat_file_batch(tag, [full_path for _relative, full_path in survivors])
+    return {
+        relative: batch_result[full_path] for relative, full_path in survivors if batch_result.get(full_path)
+    }
 
 
 def parse_pyproject_toml_content(content: str, layout: str) -> dict[str, Any]:
@@ -287,15 +404,13 @@ def extract_modules_from_yaml(
         if mp:
             process_module(mp, "transfer", source, get_category(source))
 
-    # Class-level sections (full class paths, no source file parsing needed)
-    FQCN_SECTIONS: dict[str, tuple[str, str, str]] = {
-        # yaml_key: (module_type, category, description_suffix)
-        "notifications": ("notifier", "notifications", "notifier"),
-        "secrets-backends": ("secret", "secrets", "secrets backend"),
-        "logging": ("logging", "logging", "log handler"),
-        "executors": ("executor", "executors", "executor"),
-    }
-    for yaml_key, (mod_type, category, desc_suffix) in FQCN_SECTIONS.items():
+    # Class-level sections (full class paths, no source file parsing needed).
+    # Iterating CLASS_LEVEL_SECTIONS keeps this in sync with the single
+    # source of truth in types.py; a section added there without a matching
+    # FQCN_DESC_SUFFIXES entry raises KeyError instead of silently skipping.
+    for yaml_key, mod_type in CLASS_LEVEL_SECTIONS.items():
+        category = CLASS_LEVEL_CATEGORY_OVERRIDES.get(yaml_key, yaml_key)
+        desc_suffix = FQCN_DESC_SUFFIXES[mod_type]
         for class_path in provider_yaml.get(yaml_key, []):
             if not class_path:
                 continue
@@ -315,6 +430,40 @@ def extract_modules_from_yaml(
                     "category": category,
                 }
             )
+
+    # Dict-shaped class-level sections (each entry is a dict carrying the
+    # class path under a section-specific field name, see types.py).
+    for yaml_key, (
+        mod_type,
+        class_path_field,
+        _integration_field,
+    ) in DICT_SHAPED_CLASS_LEVEL_SECTIONS.items():
+        category = CLASS_LEVEL_CATEGORY_OVERRIDES.get(yaml_key, yaml_key)
+        desc_suffix = FQCN_DESC_SUFFIXES[mod_type]
+        for entry in provider_yaml.get(yaml_key, []):
+            if not isinstance(entry, dict):
+                continue
+            class_path = entry.get(class_path_field, "")
+            if not class_path:
+                continue
+            parts = class_path.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            mod_path, class_name = parts
+            api_ref = mod_path.replace(".", "/")
+            modules.append(
+                {
+                    "name": class_name,
+                    "type": mod_type,
+                    "import_path": class_path,
+                    "short_description": f"{class_name} {desc_suffix}",
+                    "docs_url": f"{base_docs_url}/_api/{api_ref}/index.html#{class_path}",
+                    "source_url": f"{base_source_url}/{api_ref}.py",
+                    "category": category,
+                }
+            )
+
+    attach_guide_urls(modules, collect_guide_anchors(read_guide_docs(tag, layout, dir_path)), base_docs_url)
 
     return modules
 
@@ -383,8 +532,13 @@ def extract_version_data(
                 "conn_type": conn_type,
                 "hook_class": ct.get("hook-class-name", ""),
                 "docs_url": resolve_connection_docs_url(conn_type, conn_url_map, base_docs_url),
+                "external_services": ct.get("external-services", []),
             }
         )
+
+    uri_schemes = collect_uri_schemes(
+        provider_yaml, lambda module_path: git_show(tag, get_source_file_path(layout, dir_path, module_path))
+    )
 
     # Extract modules from source files
     modules = extract_modules_from_yaml(provider_yaml, tag, layout, dir_path, provider_id, version)
@@ -394,11 +548,12 @@ def extract_version_data(
         {
             "provider_id": provider_id,
             "version": version,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "requires_python": pyproject_data["requires_python"],
             "dependencies": pyproject_data["dependencies"],
             "optional_extras": pyproject_data["optional_extras"],
             "connection_types": connection_types,
+            "uri_schemes": uri_schemes,
             "module_counts": module_counts,
             "modules": modules,
         }
@@ -434,10 +589,16 @@ def main():
     parser.add_argument("--all-versions", action="store_true", help="Extract all versions")
     args = parser.parse_args()
 
-    # Load providers.json
-    providers_path = REGISTRY_DIR / "src" / "_data" / "providers.json"
-    if not providers_path.exists():
-        print(f"ERROR: {providers_path} not found. Run extract_metadata.py first.")
+    # Load providers.json from the first candidate path that exists.
+    providers_path = next((p for p in PROVIDERS_JSON_CANDIDATES if p.exists()), None)
+    if providers_path is None:
+        candidates = "\n  ".join(str(p) for p in PROVIDERS_JSON_CANDIDATES)
+        print(
+            "ERROR: providers.json not found in any of:\n  "
+            f"{candidates}\n"
+            "Run extract_metadata.py first, or download from the registry S3 bucket "
+            "to dev/registry/providers.json."
+        )
         sys.exit(1)
 
     with open(providers_path) as f:
@@ -479,8 +640,21 @@ def main():
             elif args.version == latest_version:
                 print(f"  {args.version} is the latest version (already in providers.json), skipping")
                 continue
+            elif git_tag_exists(f"providers-{pid}/{args.version}"):
+                # The cached providers.json predates this version (typical
+                # backfill scenario: the version was released after the last
+                # full registry build, so it's missing from `versions:` in
+                # the cached snapshot). Trust the git tag and proceed.
+                print(
+                    f"  {args.version} not in cached providers.json {all_versions} "
+                    f"but providers-{pid}/{args.version} tag exists; extracting."
+                )
+                versions_to_extract = [args.version]
             else:
-                print(f"  {args.version} not found in {pid} versions: {all_versions}")
+                print(
+                    f"  {args.version} not found in {pid} versions: {all_versions} "
+                    f"and providers-{pid}/{args.version} tag does not exist"
+                )
                 total_skipped += 1
                 continue
         elif args.all_versions:
@@ -497,6 +671,12 @@ def main():
 
     if not extraction_tasks:
         print(f"\nDone: {total_extracted} versions extracted, {total_skipped} skipped")
+        # Explicit `--version` with nothing extracted is a hard failure -- the
+        # caller asked for a specific version that we couldn't produce. Failing
+        # loud here surfaces the issue at extract time rather than later when
+        # `aws s3 sync` errors on a missing source path.
+        if args.version and total_skipped > 0:
+            sys.exit(1)
         return
 
     max_workers = min(8, len(extraction_tasks))

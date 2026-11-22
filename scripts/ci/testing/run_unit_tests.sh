@@ -30,6 +30,21 @@ fi
 TEST_GROUP=${1}
 TEST_SCOPE=${2}
 
+# The whole job - not only this step - has to fit in JOB_TIMEOUT_MINUTES, so the tests get whatever
+# is left of that budget rather than a fixed value.
+if [[ -n "${JOB_START_EPOCH:-}" && -n "${JOB_TIMEOUT_MINUTES:-}" ]]; then
+    TOTAL_TEST_TIMEOUT=$(python "$(dirname "${BASH_SOURCE[0]}")/compute_remaining_test_timeout.py" \
+        --job-timeout-minutes "${JOB_TIMEOUT_MINUTES}" --job-start-epoch "${JOB_START_EPOCH}") || exit 1
+    export TOTAL_TEST_TIMEOUT
+    TIMEOUT_DISPLAY="$((TOTAL_TEST_TIMEOUT / 60))m$((TOTAL_TEST_TIMEOUT % 60))s"
+    echo "${COLOR_BLUE}Tests get ${TIMEOUT_DISPLAY} of the ${JOB_TIMEOUT_MINUTES}m job budget${COLOR_RESET}"
+elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    # Letting breeze fall back to its own default here would restore the timeout that cannot
+    # fire, and nothing would say so - the job would stay green until something hung.
+    echo "${COLOR_RED}JOB_START_EPOCH and JOB_TIMEOUT_MINUTES must both be set in CI${COLOR_RESET}"
+    exit 1
+fi
+
 function core_tests() {
     echo "${COLOR_BLUE}Running core tests${COLOR_RESET}"
     set +e
@@ -50,6 +65,8 @@ function core_tests() {
         set +x
     elif [[ "${TEST_SCOPE}" == "Quarantined" ]]; then
         set -x
+        # The `|| true` is deliberate — quarantined tests are known-flaky and we do not want a
+        # failing run here to fail the whole CI job; they are reported separately. Do not remove.
         breeze testing core-tests --test-type "All-Quarantined" || true
         RESULT=$?
         set +x
@@ -93,6 +110,8 @@ function providers_tests() {
         set +x
     elif [[ "${TEST_SCOPE}" == "Quarantined" ]]; then
         set -x
+        # The `|| true` is deliberate — quarantined tests are known-flaky and we do not want a
+        # failing run here to fail the whole CI job; they are reported separately. Do not remove.
         breeze testing providers-tests --test-type "All-Quarantined" || true
         RESULT=$?
         set +x
@@ -124,7 +143,7 @@ function go_sdk_tests() {
     echo "${COLOR_BLUE}Running Go SDK tests${COLOR_RESET}"
     set -x
     cd go-sdk
-    go test -v ./...
+    go test -v -race ./...
     set +x
     echo "${COLOR_BLUE}Go SDK tests completed${COLOR_RESET}"
 }

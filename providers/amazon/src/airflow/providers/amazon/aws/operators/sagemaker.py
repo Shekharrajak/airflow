@@ -38,13 +38,22 @@ from airflow.providers.amazon.aws.triggers.sagemaker import (
     SageMakerTrigger,
 )
 from airflow.providers.amazon.aws.utils import trim_none_values, validate_execute_complete_event
+from airflow.providers.amazon.aws.utils.deferral import should_defer
 from airflow.providers.amazon.aws.utils.mixins import aws_template_fields
 from airflow.providers.amazon.aws.utils.sagemaker import ApprovalStatus
 from airflow.providers.amazon.aws.utils.tags import format_tags
-from airflow.providers.common.compat.sdk import AirflowException, conf
+from airflow.providers.common.compat.sdk import (
+    AirflowException,
+    AirflowFailException,
+    BaseBranchOperator,
+    ResumableJobMixin,
+    conf,
+)
 from airflow.utils.helpers import prune_dict
 
 if TYPE_CHECKING:
+    from pydantic import JsonValue
+
     from airflow.providers.common.compat.openlineage.facet import Dataset
     from airflow.providers.openlineage.extractors.base import OperatorLineage
     from airflow.sdk import Context
@@ -253,8 +262,31 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
         (default) and "fail".
     :param deferrable: Run operator in the deferrable mode. This is only effective if wait_for_completion is
         set to True.
-    :return Dict: Returns The ARN of the processing job created in Amazon SageMaker.
+    :param output_files_to_xcom: Read small JSON output files from S3 after the job completes and push
+        their parsed contents to XCom useful for feeding metrics into downstream tasks. Each entry is a dict with:
+        ``output_name`` (matches an output you declared in ``ProcessingOutputConfig.Outputs`` - the
+        operator uses it to locate that output's S3 URI), ``file_name`` (the file your processing script
+        wrote inside that output, and ``result_name`` (a label
+        you choose for the parsed contents in the returned ``OutputFiles`` dict). Intended for small JSON
+        summary files (metrics, evaluation reports), not large datasets. Optional; if omitted, no post-job
+        S3 reading occurs. Example::
+
+            output_files_to_xcom=[
+                {"output_name": "evaluation", "file_name": "metrics.json", "result_name": "EvaluationReport"}
+            ]
+            # Downstream: ti.xcom_pull("this_task")["OutputFiles"]["EvaluationReport"]["mse"]
+    :param cancel_on_kill: If True, the processing job is stopped when the task is killed.
+        Without it the job keeps running, and billing, after the task is gone. A deferred task is
+        stopped from the Triggerer, which needs Airflow 3.3 or later; below that the flag only
+        applies while the task holds a worker slot. It does not cover a deferral that expires on
+        its own ``timeout``: the Triggerer kills the trigger without calling ``on_kill``, and no
+        event reaches the task, so nothing runs to stop the job.
+    :return: Dict with a ``Processing`` key (the job description) and, when ``output_files_to_xcom``
+        is configured, an ``OutputFiles`` key containing the parsed JSON contents of the configured
+        output files (keyed by their ``result_name``).
     """
+
+    template_fields: Sequence[str] = (*SageMakerBaseOperator.template_fields, "output_files_to_xcom")
 
     def __init__(
         self,
@@ -267,9 +299,12 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
         max_ingestion_time: int | None = None,
         action_if_job_exists: str = "timestamp",
         deferrable: bool = conf.getboolean("operators", "default_deferrable", fallback=False),
+        output_files_to_xcom: list[dict] | None = None,
+        cancel_on_kill: bool = False,
         **kwargs,
     ):
         super().__init__(config=config, **kwargs)
+        self.output_files_to_xcom = output_files_to_xcom
         if action_if_job_exists not in ("fail", "timestamp"):
             raise AirflowException(
                 f"Argument action_if_job_exists accepts only 'timestamp' and 'fail'. \
@@ -282,7 +317,9 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
         self.max_attempts = max_attempts or 60
         self.max_ingestion_time = max_ingestion_time
         self.deferrable = deferrable
+        self.cancel_on_kill = cancel_on_kill
         self.serialized_job: dict
+        self._processing_job_name: str | None = None
 
     def _create_integer_fields(self) -> None:
         """Set fields which should be cast to integers."""
@@ -300,6 +337,11 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
             self.config["RoleArn"] = hook.expand_role(self.config["RoleArn"])
 
     def execute(self, context: Context) -> dict:
+        if self.output_files_to_xcom and not self.wait_for_completion:
+            raise ValueError(
+                "output_files_to_xcom requires wait_for_completion=True. "
+                "Output files cannot be read before the job completes."
+            )
         self.preprocess_config()
 
         self.config["ProcessingJobName"] = self._get_unique_job_name(
@@ -307,6 +349,9 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
             self.action_if_job_exists == "fail",
             self.hook.describe_processing_job,
         )
+
+        # Recorded before the submit call so a kill in that window still has a name to stop.
+        self._processing_job_name = self.config["ProcessingJobName"]
 
         if self.deferrable and not self.wait_for_completion:
             self.log.warning(
@@ -330,11 +375,13 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
         if self.deferrable and self.wait_for_completion:
             response = self.hook.describe_processing_job(self.config["ProcessingJobName"])
             status = response["ProcessingJobStatus"]
-            if status in self.hook.failed_states:
+            if status in self.hook.processing_job_failed_states:
                 raise AirflowException(f"SageMaker job failed because {response['FailureReason']}")
             if status == "Completed":
                 self.log.info("%s completed successfully.", self.task_id)
-                return {"Processing": serialize(response)}
+                result = {"Processing": serialize(response)}
+                result.update(self._read_output_files())
+                return result
 
             timeout = self.execution_timeout
             if self.max_ingestion_time:
@@ -345,26 +392,107 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
                 trigger=SageMakerTrigger(
                     job_name=self.config["ProcessingJobName"],
                     job_type="Processing",
-                    poke_interval=self.check_interval,
-                    max_attempts=self.max_attempts,
+                    waiter_delay=self.check_interval,
+                    waiter_max_attempts=self.max_attempts,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
+                    cancel_on_kill=self.cancel_on_kill,
                 ),
                 method_name="execute_complete",
             )
 
         self.serialized_job = serialize(self.hook.describe_processing_job(self.config["ProcessingJobName"]))
-        return {"Processing": self.serialized_job}
+        result = {"Processing": self.serialized_job}
+        result.update(self._read_output_files())
+        return result
 
     def execute_complete(self, context: Context, event: dict[str, Any] | None = None) -> dict[str, dict]:
         validated_event = validate_execute_complete_event(event)
 
         if validated_event["status"] != "success":
+            # A "timeout" event means the waiter gave up while the job was still running; "failed"
+            # and "stopped" are already terminal.
+            if self.cancel_on_kill and validated_event["status"] == "timeout":
+                self.log.info("Stopping SageMaker processing job %s.", validated_event["job_name"])
+                self.hook.stop_processing_job(validated_event["job_name"])
             raise AirflowException(f"Error while running job: {validated_event}")
 
-        self.log.info(validated_event["message"])
+        self.log.info("SageMaker job %s completed.", validated_event["job_name"])
         self.serialized_job = serialize(self.hook.describe_processing_job(validated_event["job_name"]))
         self.log.info("%s completed successfully.", self.task_id)
-        return {"Processing": self.serialized_job}
+        result = {"Processing": self.serialized_job}
+        result.update(self._read_output_files())
+        return result
+
+    def on_kill(self) -> None:
+        """Stop the SageMaker processing job if ``cancel_on_kill`` is set."""
+        if self.cancel_on_kill and self._processing_job_name:
+            self.log.info("Stopping SageMaker processing job %s.", self._processing_job_name)
+            self.hook.stop_processing_job(self._processing_job_name)
+
+    def _read_output_files(self) -> dict:
+        """Read configured output files from S3 after job completion and return them for XCom."""
+        if not self.output_files_to_xcom:
+            return {}
+
+        s3_client = self.hook.get_session().client("s3")
+        processing_outputs = self.config.get("ProcessingOutputConfig", {}).get("Outputs", [])
+        output_files_data: dict = {}
+
+        for output_file in self.output_files_to_xcom:
+            missing_keys = {"result_name", "output_name", "file_name"} - output_file.keys()
+            if missing_keys:
+                raise ValueError(
+                    f"output_files_to_xcom entry missing required keys: {missing_keys}. "
+                    f"Each entry requires 'result_name', 'output_name', and 'file_name'."
+                )
+            result_name = output_file["result_name"]
+            output_name = output_file["output_name"]
+            file_name = output_file["file_name"]
+
+            matching_output = next(
+                (output for output in processing_outputs if output["OutputName"] == output_name),
+                None,
+            )
+            if not matching_output:
+                self.log.warning(
+                    "output_files_to_xcom '%s': no matching output '%s' found.",
+                    result_name,
+                    output_name,
+                )
+                continue
+
+            s3_output_uri = matching_output["S3Output"]["S3Uri"].rstrip("/")
+            s3_full_path = f"{s3_output_uri}/{file_name}"
+            bucket_name, object_key = s3_full_path.replace("s3://", "").split("/", 1)
+            self.log.debug("Attempting to read output file: s3://%s/%s", bucket_name, object_key)
+
+            try:
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                file_content = s3_response["Body"].read().decode("utf-8")
+                output_files_data[result_name] = json.loads(file_content)
+                self.log.info("Output file '%s' loaded from %s", result_name, s3_full_path)
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") == "NoSuchKey":
+                    self.log.warning("Output file '%s' not found at %s", result_name, s3_full_path)
+                    output_files_data[result_name] = {"_error": f"File not found: {s3_full_path}"}
+                else:
+                    self.log.exception("Failed to read output file '%s' from %s", result_name, s3_full_path)
+                    output_files_data[result_name] = {"_error": f"Failed to read from {s3_full_path}"}
+            except json.JSONDecodeError as error:
+                self.log.exception(
+                    "Output file '%s' at %s is not valid JSON: %s", result_name, s3_full_path, error
+                )
+                output_files_data[result_name] = {"_error": f"Invalid JSON at {s3_full_path}"}
+            except Exception:
+                self.log.exception("Failed to read output file '%s' from %s", result_name, s3_full_path)
+                output_files_data[result_name] = {"_error": f"Failed to read from {s3_full_path}"}
+
+        if output_files_data:
+            return {"OutputFiles": output_files_data}
+        return {}
 
     def get_openlineage_facets_on_complete(self, task_instance) -> OperatorLineage:
         """Return OpenLineage data gathered from SageMaker's API response saved by processing job."""
@@ -500,7 +628,9 @@ class SageMakerEndpointOperator(SageMakerBaseOperator):
     :param region_name: AWS region_name. If not specified then the default boto3 behaviour is used.
     :param verify: Whether or not to verify SSL certificates. See:
         https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html
-    :param deferrable:  Will wait asynchronously for completion.
+    :param deferrable: Will wait asynchronously for completion.
+        Deferring when ``wait_for_completion`` is False is deprecated; from the next major release
+        this has no effect when ``wait_for_completion`` is False.
     :return Dict: Returns The ARN of the endpoint created in Amazon SageMaker.
     """
 
@@ -592,13 +722,16 @@ class SageMakerEndpointOperator(SageMakerBaseOperator):
         if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
             raise AirflowException(f"Sagemaker endpoint creation failed: {response}")
 
-        if self.deferrable:
+        if should_defer(deferrable=self.deferrable, wait_for_completion=self.wait_for_completion):
             self.defer(
                 trigger=SageMakerTrigger(
                     job_name=endpoint_info["EndpointName"],
                     job_type="endpoint",
-                    poke_interval=self.check_interval,
+                    waiter_delay=self.check_interval,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
                 ),
                 method_name="execute_complete",
                 timeout=datetime.timedelta(seconds=self.max_ingestion_time),
@@ -824,9 +957,12 @@ class SageMakerTransformOperator(SageMakerBaseOperator):
                 trigger=SageMakerTrigger(
                     job_name=transform_config["TransformJobName"],
                     job_type="Transform",
-                    poke_interval=self.check_interval,
-                    max_attempts=self.max_attempts,
+                    waiter_delay=self.check_interval,
+                    waiter_max_attempts=self.max_attempts,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
                 ),
                 method_name="execute_complete",
             )
@@ -847,7 +983,10 @@ class SageMakerTransformOperator(SageMakerBaseOperator):
     def execute_complete(self, context: Context, event: dict[str, Any] | None = None) -> dict[str, dict]:
         validated_event = validate_execute_complete_event(event)
 
-        self.log.info(validated_event["message"])
+        if validated_event["status"] != "success":
+            raise RuntimeError(f"Error while running transform job: {validated_event}")
+
+        self.log.info("SageMaker job %s completed.", validated_event["job_name"])
         return self.serialize_result(validated_event["job_name"])
 
     def serialize_result(self, job_name: str) -> dict[str, dict]:
@@ -941,6 +1080,8 @@ class SageMakerTuningOperator(SageMakerBaseOperator):
         if the tuning job doesn't finish within max_ingestion_time seconds. If you
         set this parameter to None, the operation does not timeout.
     :param deferrable: Will wait asynchronously for completion.
+        Deferring when ``wait_for_completion`` is False is deprecated; from the next major release
+        this has no effect when ``wait_for_completion`` is False.
     :return Dict: Returns The ARN of the tuning job created in Amazon SageMaker.
     """
 
@@ -993,13 +1134,16 @@ class SageMakerTuningOperator(SageMakerBaseOperator):
         if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
             raise AirflowException(f"Sagemaker Tuning Job creation failed: {response}")
         description: dict = {}
-        if self.deferrable:
+        if should_defer(deferrable=self.deferrable, wait_for_completion=self.wait_for_completion):
             self.defer(
                 trigger=SageMakerTrigger(
                     job_name=self.config["HyperParameterTuningJobName"],
                     job_type="tuning",
-                    poke_interval=self.check_interval,
+                    waiter_delay=self.check_interval,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
                 ),
                 method_name="execute_complete",
                 timeout=(
@@ -1067,7 +1211,7 @@ class SageMakerModelOperator(SageMakerBaseOperator):
         return {"Model": serialize(self.hook.describe_model(self.config["ModelName"]))}
 
 
-class SageMakerTrainingOperator(SageMakerBaseOperator):
+class SageMakerTrainingOperator(ResumableJobMixin, SageMakerBaseOperator):
     """
     Starts a model training job.
 
@@ -1106,8 +1250,18 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
         This is only relevant if check_if_job_exists is True.
     :param deferrable: Run operator in the deferrable mode. This is only effective if wait_for_completion is
         set to True.
+    :param durable: If True (the default), the training job name is persisted to the task state store
+        before polling, and a retry reconnects to that job instead of submitting a new one. Only applies
+        to the synchronous path; a deferrable run is unaffected. Needs Airflow 3.3 or later, below it the
+        operator behaves as with ``durable=False``.
+    :param cancel_on_kill: If True, the training job is stopped when the task is killed.
+        Without it the job keeps running, and billing, after the task is gone. A deferred task is
+        stopped from the Triggerer, which needs Airflow 3.3 or later; below that the flag only
+        applies while the task holds a worker slot.
     :return Dict: Returns The ARN of the training job created in Amazon SageMaker.
     """
+
+    external_id_key = "sagemaker_training_job_name"
 
     def __init__(
         self,
@@ -1121,8 +1275,13 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
         check_if_job_exists: bool = True,
         action_if_job_exists: str = "timestamp",
         deferrable: bool = conf.getboolean("operators", "default_deferrable", fallback=False),
+        cancel_on_kill: bool = False,
+        durable: bool | None = None,
         **kwargs,
     ):
+        # Named here (not left to **kwargs) so default_args and partial() reach it below 3.3 too.
+        if durable is not None:
+            kwargs["durable"] = durable
         super().__init__(config=config, **kwargs)
         self.wait_for_completion = wait_for_completion
         self.print_log = print_log
@@ -1138,7 +1297,10 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
                 Provided value: '{action_if_job_exists}'."
             )
         self.deferrable = deferrable
+        self.cancel_on_kill = cancel_on_kill
         self.serialized_training_data: dict
+        self._result: dict[str, dict] | None = None
+        self._training_job_name: str | None = None
 
     def expand_role(self) -> None:
         """Expand an IAM role name into an ARN."""
@@ -1155,6 +1317,20 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
         ]
 
     def execute(self, context: Context) -> dict:
+        if self.deferrable and not self.wait_for_completion:
+            self.log.warning(
+                "Setting deferrable to True does not have effect when wait_for_completion is set to False."
+            )
+
+        if self.deferrable and self.wait_for_completion:
+            return self._execute_deferrable(context)
+
+        self.execute_resumable(context)
+        return self.get_job_result(self._training_job_name, context)
+
+    def submit_job(self, context: Context) -> str:
+        # Not in execute(): on a reconnecting retry the S3Operations uploads would raise on the
+        # existing key, or overwrite the inputs of the job still running.
         self.preprocess_config()
 
         if self.check_if_job_exists:
@@ -1164,79 +1340,112 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
                 self.hook.describe_training_job,
             )
 
-        self.log.info("Creating SageMaker training job %s.", self.config["TrainingJobName"])
-
-        if self.deferrable and not self.wait_for_completion:
-            self.log.warning(
-                "Setting deferrable to True does not have effect when wait_for_completion is set to False."
-            )
-
-        wait_for_completion = self.wait_for_completion
-        if self.deferrable and self.wait_for_completion:
-            # Set wait_for_completion to False so that it waits for the status in the deferred task.
-            wait_for_completion = False
+        # Recorded before the submit call so a kill in that window still has a name to stop.
+        job_name = self._training_job_name = self.config["TrainingJobName"]
+        self.log.info("Creating SageMaker training job %s.", job_name)
 
         response = self.hook.create_training_job(
             self.config,
-            wait_for_completion=wait_for_completion,
-            print_log=self.print_log,
+            wait_for_completion=False,
+            print_log=False,
             check_interval=self.check_interval,
             max_ingestion_time=self.max_ingestion_time,
         )
         if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
             raise AirflowException(f"Sagemaker Training Job creation failed: {response}")
 
-        if self.deferrable and self.wait_for_completion:
-            description = self.hook.describe_training_job(self.config["TrainingJobName"])
-            status = description["TrainingJobStatus"]
+        return job_name
 
-            if self.print_log:
-                instance_count = description["ResourceConfig"]["InstanceCount"]
-                last_describe_job_call = time.monotonic()
-                job_already_completed = status not in self.hook.non_terminal_states
-                _, description, last_describe_job_call = self.hook.describe_training_job_with_log(
-                    self.config["TrainingJobName"],
-                    {},
-                    [],
-                    instance_count,
-                    LogState.COMPLETE if job_already_completed else LogState.TAILING,
-                    description,
-                    last_describe_job_call,
-                )
-                self.log.info(secondary_training_status_message(description, None))
+    def get_job_status(self, external_id: JsonValue, context: Context) -> str:
+        """Query the raw job status; a job name SageMaker no longer knows degrades to NOT_FOUND."""
+        try:
+            return self.hook.describe_training_job(str(external_id))["TrainingJobStatus"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("ValidationException", "ResourceNotFound"):
+                return "NOT_FOUND"
+            raise
 
-            if status in self.hook.failed_states:
-                reason = description.get("FailureReason", "(No reason provided)")
-                raise AirflowException(f"SageMaker job failed because {reason}")
-            if status == "Completed":
-                log_message = f"{self.task_id} completed successfully."
-                if self.print_log:
-                    billable_seconds = SageMakerHook.count_billable_seconds(
-                        training_start_time=description["TrainingStartTime"],
-                        training_end_time=description["TrainingEndTime"],
-                        instance_count=instance_count,
-                    )
-                    log_message = f"Billable seconds: {billable_seconds}\n{log_message}"
-                self.log.info(log_message)
-                return {"Training": serialize(description)}
+    def is_job_active(self, status: str) -> bool:
+        # Narrower than non_terminal_states on purpose: wait_for_training_job accepts the "Stopped" a
+        # "Stopping" job ends in as done when print_log is off, so reconnecting would report success.
+        return status == "InProgress"
 
-            timeout = self.execution_timeout
-            if self.max_ingestion_time:
-                timeout = datetime.timedelta(seconds=self.max_ingestion_time)
+    def is_job_succeeded(self, status: str) -> bool:
+        return status == "Completed"
 
-            self.defer(
-                timeout=timeout,
-                trigger=SageMakerTrigger(
-                    job_name=self.config["TrainingJobName"],
-                    job_type="Training",
-                    poke_interval=self.check_interval,
-                    max_attempts=self.max_attempts,
-                    aws_conn_id=self.aws_conn_id,
-                ),
-                method_name="execute_complete",
+    def poll_until_complete(self, external_id: JsonValue, context: Context) -> None:
+        # A reconnecting retry never calls submit_job, so the name is recorded here too.
+        job_name = self._training_job_name = str(external_id)
+
+        self.hook.wait_for_training_job(
+            job_name,
+            wait_for_completion=self.wait_for_completion,
+            print_log=self.print_log,
+            check_interval=self.check_interval,
+            max_ingestion_time=self.max_ingestion_time,
+        )
+
+        self._result = self.serialize_result(job_name)
+
+    def get_job_result(self, external_id: JsonValue, context: Context) -> dict[str, dict]:
+        if self._result is None:
+            self._result = self.serialize_result(str(external_id))
+        return self._result
+
+    def _execute_deferrable(self, context: Context) -> dict:
+        job_name = self.submit_job(context)
+        description = self.hook.describe_training_job(job_name)
+        status = description["TrainingJobStatus"]
+
+        if self.print_log:
+            instance_count = description["ResourceConfig"]["InstanceCount"]
+            last_describe_job_call = time.monotonic()
+            job_already_completed = status not in self.hook.non_terminal_states
+            _, description, last_describe_job_call = self.hook.describe_training_job_with_log(
+                job_name,
+                {},
+                [],
+                instance_count,
+                LogState.COMPLETE if job_already_completed else LogState.TAILING,
+                description,
+                last_describe_job_call,
             )
+            self.log.info(secondary_training_status_message(description, None))
 
-        return self.serialize_result(self.config["TrainingJobName"])
+        if status in self.hook.failed_states:
+            reason = description.get("FailureReason", "(No reason provided)")
+            raise AirflowException(f"SageMaker job failed because {reason}")
+        if status == "Completed":
+            log_message = f"{self.task_id} completed successfully."
+            if self.print_log:
+                billable_seconds = SageMakerHook.count_billable_seconds(
+                    training_start_time=description["TrainingStartTime"],
+                    training_end_time=description["TrainingEndTime"],
+                    instance_count=instance_count,
+                )
+                log_message = f"Billable seconds: {billable_seconds}\n{log_message}"
+            self.log.info(log_message)
+            return {"Training": serialize(description)}
+
+        timeout = self.execution_timeout
+        if self.max_ingestion_time:
+            timeout = datetime.timedelta(seconds=self.max_ingestion_time)
+
+        self.defer(
+            timeout=timeout,
+            trigger=SageMakerTrigger(
+                job_name=job_name,
+                job_type="Training",
+                waiter_delay=self.check_interval,
+                waiter_max_attempts=self.max_attempts,
+                aws_conn_id=self.aws_conn_id,
+                region_name=self.region_name,
+                verify=self.verify,
+                botocore_config=self.botocore_config,
+                cancel_on_kill=self.cancel_on_kill,
+            ),
+            method_name="execute_complete",
+        )
 
     def execute_complete(self, context: Context, event: dict[str, Any] | None = None) -> dict[str, dict]:
         validated_event = validate_execute_complete_event(event)
@@ -1244,12 +1453,18 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
         if validated_event["status"] != "success":
             raise AirflowException(f"Error while running job: {validated_event}")
 
-        self.log.info(validated_event["message"])
+        self.log.info("SageMaker job %s completed.", validated_event["job_name"])
         return self.serialize_result(validated_event["job_name"])
 
     def serialize_result(self, job_name: str) -> dict[str, dict]:
         self.serialized_training_data = serialize(self.hook.describe_training_job(job_name))
         return {"Training": self.serialized_training_data}
+
+    def on_kill(self) -> None:
+        """Stop the SageMaker training job if ``cancel_on_kill`` is set."""
+        if self.cancel_on_kill and self._training_job_name:
+            self.log.info("Stopping SageMaker training job %s.", self._training_job_name)
+            self.hook.stop_training_job(self._training_job_name)
 
     def get_openlineage_facets_on_complete(self, task_instance) -> OperatorLineage:
         """Return OpenLineage data gathered from SageMaker's API response saved by training job."""
@@ -1328,6 +1543,8 @@ class SageMakerStartPipelineOperator(SageMakerBaseOperator):
     :param verbose: Whether to print steps details when waiting for completion.
         Defaults to true, consider turning off for pipelines that have thousands of steps.
     :param deferrable: Run operator in the deferrable mode.
+        Deferring when ``wait_for_completion`` is False is deprecated; from the next major release
+        this has no effect when ``wait_for_completion`` is False.
 
     :return str: Returns The ARN of the pipeline execution created in Amazon SageMaker.
     """
@@ -1370,7 +1587,7 @@ class SageMakerStartPipelineOperator(SageMakerBaseOperator):
         self.log.info(
             "Starting a new execution for pipeline %s, running with ARN %s", self.pipeline_name, arn
         )
-        if self.deferrable:
+        if should_defer(deferrable=self.deferrable, wait_for_completion=self.wait_for_completion):
             self.defer(
                 trigger=SageMakerPipelineTrigger(
                     waiter_type=SageMakerPipelineTrigger.Type.COMPLETE,
@@ -1378,6 +1595,9 @@ class SageMakerStartPipelineOperator(SageMakerBaseOperator):
                     waiter_delay=self.check_interval,
                     waiter_max_attempts=self.waiter_max_attempts,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
                 ),
                 method_name="execute_complete",
             )
@@ -1424,6 +1644,8 @@ class SageMakerStopPipelineOperator(SageMakerBaseOperator):
         Defaults to true, consider turning off for pipelines that have thousands of steps.
     :param fail_if_not_running: raises an exception if the pipeline stopped or succeeded before this was run
     :param deferrable: Run operator in the deferrable mode.
+        Deferring when ``wait_for_completion`` is False is deprecated; from the next major release
+        this has no effect when ``wait_for_completion`` is False.
 
     :return str: Returns the status of the pipeline execution after the operation has been done.
     """
@@ -1469,7 +1691,7 @@ class SageMakerStopPipelineOperator(SageMakerBaseOperator):
             return status
 
         # else, eventually wait for completion
-        if self.deferrable:
+        if should_defer(deferrable=self.deferrable, wait_for_completion=self.wait_for_completion):
             self.defer(
                 trigger=SageMakerPipelineTrigger(
                     waiter_type=SageMakerPipelineTrigger.Type.STOPPED,
@@ -1477,6 +1699,9 @@ class SageMakerStopPipelineOperator(SageMakerBaseOperator):
                     waiter_delay=self.check_interval,
                     waiter_max_attempts=self.waiter_max_attempts,
                     aws_conn_id=self.aws_conn_id,
+                    region_name=self.region_name,
+                    verify=self.verify,
+                    botocore_config=self.botocore_config,
                 ),
                 method_name="execute_complete",
             )
@@ -1826,9 +2051,6 @@ class SageMakerCreateNotebookOperator(AwsBaseOperator[SageMakerHook]):
         self.wait_for_completion = wait_for_completion
         self.create_instance_kwargs = create_instance_kwargs or {}
 
-        if self.create_instance_kwargs.get("tags") is not None:
-            self.create_instance_kwargs["tags"] = format_tags(self.create_instance_kwargs["tags"])
-
     def execute(self, context: Context):
         create_notebook_instance_kwargs = {
             "NotebookInstanceName": self.instance_name,
@@ -1841,7 +2063,10 @@ class SageMakerCreateNotebookOperator(AwsBaseOperator[SageMakerHook]):
             "RootAccess": self.root_access,
         }
         if self.create_instance_kwargs:
-            create_notebook_instance_kwargs.update(self.create_instance_kwargs)
+            create_instance_kwargs = dict(self.create_instance_kwargs)
+            if create_instance_kwargs.get("tags") is not None:
+                create_instance_kwargs["tags"] = format_tags(create_instance_kwargs["tags"])
+            create_notebook_instance_kwargs.update(create_instance_kwargs)
 
         self.log.info("Creating SageMaker notebook %s.", self.instance_name)
         response = self.hook.conn.create_notebook_instance(**prune_dict(create_notebook_instance_kwargs))
@@ -1991,3 +2216,262 @@ class SageMakerStartNoteBookOperator(AwsBaseOperator[SageMakerHook]):
             self.hook.conn.get_waiter("notebook_instance_in_service").wait(
                 NotebookInstanceName=self.instance_name
             )
+
+
+class SageMakerConditionOperator(BaseBranchOperator):
+    """
+    Evaluates a single condition or a list of conditions, and routes tasks based on the result.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:SageMakerConditionOperator`
+
+    :param condition_type: Condition type for the simple (flat) interface.
+        Valid types: ``Equals``, ``GreaterThan``, ``GreaterThanOrEqualTo``,
+        ``LessThan``, ``LessThanOrEqualTo``, ``In``.
+        Mutually exclusive with ``conditions``.
+    :param left_value: Left operand for the flat interface. For ``In`` conditions
+        this is the value to check membership of.
+    :param right_value: Right operand for the flat interface. For ``In`` conditions
+        this is the list of allowed values.
+    :param conditions: List of condition dicts to evaluate (AND-ed together).
+        Each dict must have a ``type`` key. Must not be empty.
+        Mutually exclusive with ``condition_type``/``left_value``/``right_value``.
+    :param if_task_ids: Task ID(s) to execute when all conditions are True.
+    :param else_task_ids: Task ID(s) to execute when any condition is False.
+        If omitted, the task fails with ``AirflowFailException`` when conditions are not met.
+    """
+
+    _VALID_FLAT_TYPES: ClassVar[set[str]] = {
+        "Equals",
+        "GreaterThan",
+        "GreaterThanOrEqualTo",
+        "LessThan",
+        "LessThanOrEqualTo",
+        "In",
+    }
+
+    template_fields: Sequence[str] = (
+        "condition_type",
+        "left_value",
+        "right_value",
+        "conditions",
+        "if_task_ids",
+        "else_task_ids",
+    )
+
+    def __init__(
+        self,
+        *,
+        condition_type: str | None = None,
+        left_value: Any = None,
+        right_value: Any = None,
+        conditions: list[dict] | None = None,
+        if_task_ids: str | list[str],
+        else_task_ids: str | list[str] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        has_flat = condition_type is not None
+        has_list = conditions is not None
+
+        if has_flat and has_list:
+            raise ValueError(
+                "Cannot use 'condition_type' and 'conditions' together. "
+                "Use 'condition_type' with 'left_value'/'right_value' for a single condition, "
+                "or 'conditions' for multiple/nested conditions."
+            )
+        if not has_flat and not has_list:
+            raise ValueError(
+                "Missing condition: provide 'condition_type' with 'left_value'/'right_value' "
+                "for a single condition, or 'conditions' for multiple/nested conditions."
+            )
+
+        if has_flat:
+            if condition_type not in self._VALID_FLAT_TYPES:
+                raise ValueError(
+                    f"Unknown condition_type '{condition_type}'. "
+                    f"Expected one of: {', '.join(sorted(self._VALID_FLAT_TYPES))}."
+                )
+            self.condition_type: str | None = condition_type
+            self.left_value = left_value
+            self.right_value = right_value
+            if condition_type == "In":
+                self.conditions: list[dict[str, Any]] = [
+                    {"type": "In", "value": left_value, "in_values": right_value}
+                ]
+            else:
+                self.conditions = [
+                    {"type": condition_type, "left_value": left_value, "right_value": right_value}
+                ]
+        else:
+            self.condition_type = None
+            self.left_value = None
+            self.right_value = None
+            self.conditions = conditions  # type: ignore[assignment]
+
+        if not self.conditions:
+            raise ValueError("At least 1 condition is required, but got an empty list.")
+        self.if_task_ids = [if_task_ids] if isinstance(if_task_ids, str) else if_task_ids
+        self.else_task_ids = [else_task_ids] if isinstance(else_task_ids, str) else (else_task_ids or [])
+
+    @staticmethod
+    def _cast(value: Any) -> Any:
+        """
+        Cast Jinja-rendered string values to appropriate Python types.
+
+        This is a compatibility shim for environments where
+        ``render_template_as_native_obj=True`` is not available at the Dag or
+        task level (e.g., YAML Dags). Once task-level native rendering
+        is widely supported, this method can be removed in favor of letting
+        Airflow handle the casting natively.
+
+        - Numeric strings become int or float.
+        - ``"true"``/``"false"`` become booleans.
+        - ``"None"`` becomes ``None`` (common when ``xcom_pull`` returns nothing).
+        - Other strings are returned unchanged.
+        - Non-string types pass through as-is.
+        """
+        if not isinstance(value, str):
+            return value
+        if value == "None":
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            pass
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            pass
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        return value
+
+    _COMPARISON_OPERATORS: ClassVar[dict[str, Callable[[Any, Any], bool]]] = {
+        "Equals": lambda left, right: left == right,
+        "GreaterThan": lambda left, right: left > right,
+        "GreaterThanOrEqualTo": lambda left, right: left >= right,
+        "LessThan": lambda left, right: left < right,
+        "LessThanOrEqualTo": lambda left, right: left <= right,
+    }
+
+    def _evaluate(self, condition: dict, depth: int = 0) -> bool:
+        """
+        Recursively evaluate a single condition dict.
+
+        :param condition: A condition dictionary with a ``type`` key.
+        :param depth: Current nesting depth (used for log indentation only).
+        :returns: Boolean result of the condition evaluation.
+        """
+        log_indent = "  " * depth
+        try:
+            condition_type = condition["type"]
+        except KeyError:
+            raise ValueError("Condition dict is missing required key 'type'.")
+
+        if condition_type in self._COMPARISON_OPERATORS:
+            try:
+                left = self._cast(condition["left_value"])
+                right = self._cast(condition["right_value"])
+            except KeyError as e:
+                raise ValueError(f"Condition '{condition_type}' missing required key {e}.") from None
+
+            # None check — likely an XCom that was not pushed
+            if left is None or right is None:
+                raise TypeError(
+                    f"Condition '{condition_type}' received None: left={left!r}, right={right!r}. "
+                    "This usually means the upstream task did not run or did not push a value to XCom."
+                )
+
+            # Type compatibility check
+            left_type = type(left)
+            right_type = type(right)
+            numeric_types = (int, float)
+            left_is_numeric = isinstance(left, numeric_types) and not isinstance(left, bool)
+            right_is_numeric = isinstance(right, numeric_types) and not isinstance(right, bool)
+
+            if not (left_is_numeric and right_is_numeric) and left_type is not right_type:
+                raise TypeError(
+                    f"Cannot compare {left_type.__name__} ({left!r}) with {right_type.__name__} ({right!r}) "
+                    f"in condition '{condition_type}'. Both values must be the same type."
+                )
+
+            comparison_result = self._COMPARISON_OPERATORS[condition_type](left, right)
+            self.log.info(
+                "%s%s: %r %s %r -> %s",
+                log_indent,
+                condition_type,
+                left,
+                condition_type,
+                right,
+                comparison_result,
+            )
+            return comparison_result
+
+        if condition_type == "In":
+            try:
+                query_value = self._cast(condition["value"])
+                allowed_values = [self._cast(val) for val in condition["in_values"]]
+            except KeyError as e:
+                raise ValueError(f"Condition '{condition_type}' missing required key {e}.") from None
+            membership_result = query_value in allowed_values
+            self.log.info("%sIn: %r in %r -> %s", log_indent, query_value, allowed_values, membership_result)
+            return membership_result
+
+        if condition_type == "Not":
+            try:
+                inner_condition = condition["condition"]
+            except KeyError as e:
+                raise ValueError(f"Condition '{condition_type}' missing required key {e}.") from None
+            inner_result = self._evaluate(inner_condition, depth + 1)
+            negated_result = not inner_result
+            self.log.info("%sNot: not %s -> %s", log_indent, inner_result, negated_result)
+            return negated_result
+
+        if condition_type == "Or":
+            try:
+                inner_conditions = condition["conditions"]
+            except KeyError as e:
+                raise ValueError(f"Condition '{condition_type}' missing required key {e}.") from None
+            inner_results = [self._evaluate(inner_cond, depth + 1) for inner_cond in inner_conditions]
+            or_result = any(inner_results)
+            self.log.info("%sOr: any(%r) -> %s", log_indent, inner_results, or_result)
+            return or_result
+
+        raise ValueError(f"Unknown condition type '{condition_type}'.")
+
+    def choose_branch(self, context: Context) -> list[str]:
+        """
+        Evaluate all conditions and return the appropriate branch task IDs.
+
+        :param context: Airflow context dictionary.
+        :returns: ``if_task_ids`` when all conditions are True, ``else_task_ids`` otherwise.
+        """
+        condition_count = len(self.conditions)
+        self.log.info("Evaluating %d condition(s).", condition_count)
+
+        evaluation_results = [self._evaluate(condition) for condition in self.conditions]
+        all_conditions_met = all(evaluation_results)
+
+        if all_conditions_met:
+            self.log.info(
+                "All %d condition(s) evaluated to True. Routing to if_task_ids=%r.",
+                condition_count,
+                self.if_task_ids,
+            )
+            return self.if_task_ids
+
+        if not self.else_task_ids:
+            raise AirflowFailException(
+                f"Condition check failed in task '{self.task_id}': results={evaluation_results}"
+            )
+
+        self.log.info(
+            "Not all conditions are True (results=%r). Routing to else_task_ids=%r.",
+            evaluation_results,
+            self.else_task_ids,
+        )
+        return self.else_task_ids

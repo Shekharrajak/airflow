@@ -16,53 +16,26 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { expect, test } from "@playwright/test";
-
-import { PluginsPage } from "../pages/PluginsPage";
+import { expect, test } from "tests/e2e/fixtures";
 
 test.describe("Plugins Page", () => {
-  let pluginsPage: PluginsPage;
-
-  test.beforeEach(async ({ page }) => {
-    pluginsPage = new PluginsPage(page);
+  test.beforeEach(async ({ pluginsPage }) => {
     await pluginsPage.navigate();
-    await pluginsPage.waitForLoad();
   });
 
-  test("verify plugins page heading is visible", async () => {
-    await expect(pluginsPage.heading).toBeVisible();
-  });
-
-  test("verify plugins table is visible", async () => {
-    await expect(pluginsPage.table).toBeVisible();
-  });
-
-  test("verify plugins list has at least one entry", async () => {
+  test("verify plugins list displays each plugin with a name and source", async ({ pluginsPage }) => {
+    await expect.soft(pluginsPage.heading).toBeVisible();
+    await expect.soft(pluginsPage.table).toBeVisible();
     await expect(pluginsPage.rows).not.toHaveCount(0);
-  });
 
-  test("verify each plugin has a name", async () => {
-    await expect(pluginsPage.rows).not.toHaveCount(0);
     const count = await pluginsPage.rows.count();
 
-    for (let i = 0; i < count; i++) {
-      await expect(pluginsPage.nameColumn.nth(i)).not.toBeEmpty();
-    }
-  });
-
-  test("verify each plugin has a source", async () => {
-    await expect(pluginsPage.rows).not.toHaveCount(0);
-    const count = await pluginsPage.rows.count();
+    await expect.soft(pluginsPage.nameColumn).toHaveCount(count);
+    await expect.soft(pluginsPage.sourceColumn).toHaveCount(count);
 
     for (let i = 0; i < count; i++) {
-      await expect(pluginsPage.sourceColumn.nth(i)).not.toBeEmpty();
+      await expect.soft(pluginsPage.nameColumn.nth(i)).not.toBeEmpty();
+      await expect.soft(pluginsPage.sourceColumn.nth(i)).not.toBeEmpty();
     }
-  });
-
-  test("verify plugin names and sources have matching counts", async () => {
-    const rowCount = await pluginsPage.rows.count();
-
-    await expect(pluginsPage.nameColumn).toHaveCount(rowCount);
-    await expect(pluginsPage.sourceColumn).toHaveCount(rowCount);
   });
 });

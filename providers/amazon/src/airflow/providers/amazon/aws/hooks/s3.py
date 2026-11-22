@@ -58,7 +58,7 @@ from boto3.s3.transfer import S3Transfer, TransferConfig
 from botocore.exceptions import ClientError
 
 from airflow.exceptions import AirflowProviderDeprecationWarning
-from airflow.providers.amazon.aws.exceptions import S3HookUriParseFailure
+from airflow.providers.amazon.aws.exceptions import S3HookPathTraversalError, S3HookUriParseFailure
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.providers.amazon.aws.utils.tags import format_tags
 from airflow.providers.common.compat.lineage.hook import get_hook_lineage_collector
@@ -101,7 +101,6 @@ def provide_bucket_name(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             bound_args = await maybe_add_bucket_name(*args, **kwargs)
-            print(f"invoking async function {func=}")
             return await func(*bound_args.args, **bound_args.kwargs)
 
     elif inspect.isasyncgenfunction(func):
@@ -168,7 +167,8 @@ class S3Hook(AwsBaseHook):
     Provide thick wrapper around :external+boto3:py:class:`boto3.client("s3") <S3.Client>`
     and :external+boto3:py:class:`boto3.resource("s3") <S3.ServiceResource>`.
 
-    :param transfer_config_args: Configuration object for managed S3 transfers.
+    :param transfer_config_args: Default Configuration object for managed S3 transfers.
+        Can also be set in the service_config.
     :param extra_args: Extra arguments that may be passed to the download/upload operations.
 
     .. seealso::
@@ -198,13 +198,20 @@ class S3Hook(AwsBaseHook):
 
         if transfer_config_args and not isinstance(transfer_config_args, dict):
             raise TypeError(f"transfer_config_args expected dict, got {type(transfer_config_args).__name__}.")
-        self.transfer_config = TransferConfig(**transfer_config_args or {})
+        self._transfer_config_args = transfer_config_args or {}
 
         if extra_args and not isinstance(extra_args, dict):
             raise TypeError(f"extra_args expected dict, got {type(extra_args).__name__}.")
         self._extra_args = extra_args or {}
 
         super().__init__(*args, **kwargs)
+
+    @property
+    def transfer_config(self):
+        if not hasattr(self, "_transfer_config"):
+            self._transfer_config_args.update(self.service_config.get("transfer_config_args", {}))
+            self._transfer_config = TransferConfig(**self._transfer_config_args)
+        return self._transfer_config
 
     @cached_property
     def resource(self):
@@ -823,7 +830,7 @@ class S3Hook(AwsBaseHook):
             if current_num_objects >= min_objects:
                 success_message = (
                     f"SUCCESS: Sensor found {current_num_objects} objects at {path}. "
-                    "Waited at least {inactivity_period} seconds, with no new objects uploaded."
+                    f"Waited at least {inactivity_period} seconds, with no new objects uploaded."
                 )
                 self.log.info(success_message)
                 return {
@@ -1327,6 +1334,58 @@ class S3Hook(AwsBaseHook):
 
     @unify_bucket_name_and_key
     @provide_bucket_name
+    async def aload_bytes(
+        self,
+        bytes_data: bytes,
+        key: str,
+        bucket_name: str | None = None,
+        replace: bool = False,
+        encrypt: bool = False,
+        acl_policy: str | None = None,
+    ) -> None:
+        """
+        Load bytes to S3 asynchronously.
+
+        The async counterpart of :meth:`load_bytes`, on the aiobotocore client of
+        :meth:`get_async_conn`, so an async task or trigger can upload without blocking its
+        event loop. It sends the object in a single ``PutObject`` request: there is no
+        multipart transfer and ``transfer_config`` is not used, so it is meant for objects
+        below the 5 GB limit of a single upload.
+
+        .. seealso::
+            - :external+boto3:py:meth:`S3.Client.put_object`
+
+        :param bytes_data: bytes to set as content for the key.
+        :param key: S3 key that will point to the file
+        :param bucket_name: Name of the bucket in which to store the file
+        :param replace: A flag to decide whether or not to overwrite the key
+            if it already exists
+        :param encrypt: If True, the file will be encrypted on the server-side
+            by S3 and will be stored in an encrypted form while at rest in S3.
+        :param acl_policy: The string to specify the canned ACL policy for the
+            object to be uploaded
+        """
+        async with await self.get_async_conn() as client:
+            if not replace and await self.get_head_object_async(client, key, bucket_name):
+                raise ValueError(f"The key {key} already exists.")
+
+            # A copy, so the hook's own extra_args keep no per-call settings.
+            extra_args = dict(self.extra_args)
+            if encrypt:
+                extra_args["ServerSideEncryption"] = "AES256"
+            if acl_policy:
+                extra_args["ACL"] = acl_policy
+            if self._requester_pays:
+                extra_args["RequestPayer"] = "requester"
+
+            await client.put_object(Bucket=bucket_name, Key=key, Body=bytes_data, **extra_args)
+
+        get_hook_lineage_collector().add_output_asset(
+            context=self, scheme="s3", asset_kwargs={"bucket": bucket_name, "key": key}
+        )
+
+    @unify_bucket_name_and_key
+    @provide_bucket_name
     def load_file_obj(
         self,
         file_obj: BytesIO,
@@ -1502,7 +1561,13 @@ class S3Hook(AwsBaseHook):
             for retry in range(max_retries):
                 bucket_keys = self.list_keys(bucket_name=bucket_name)
                 if not bucket_keys:
-                    break
+                    try:
+                        self.conn.delete_bucket(Bucket=bucket_name)
+                        return
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] != "BucketNotEmpty":
+                            raise
+                        continue
                 if retry:  # Avoid first loop
                     time.sleep(500)
 
@@ -1621,12 +1686,18 @@ class S3Hook(AwsBaseHook):
         extra_args = {**self.extra_args}
         if self._requester_pays:
             extra_args["RequestPayer"] = "requester"
-        s3_obj.download_fileobj(
-            file,
-            ExtraArgs=extra_args,
-            Config=self.transfer_config,
-        )
-        file.flush()
+        try:
+            s3_obj.download_fileobj(
+                file,
+                ExtraArgs=extra_args,
+                Config=self.transfer_config,
+            )
+            file.flush()
+        finally:
+            # The file is created with delete=False / opened by us, so closing the
+            # handle keeps the data on disk while releasing the descriptor even when
+            # the download raises.
+            file.close()
         get_hook_lineage_collector().add_input_asset(
             context=self, scheme="s3", asset_kwargs={"bucket": bucket_name, "key": key}
         )
@@ -1796,6 +1867,7 @@ class S3Hook(AwsBaseHook):
         """Download S3 files from the S3 bucket to the local directory."""
         self.log.debug("Downloading data from s3://%s/%s to %s", bucket_name, s3_prefix, local_dir)
 
+        local_dir_resolved = local_dir.resolve()
         local_s3_objects = []
         s3_bucket = self.get_bucket(bucket_name)
         for obj in s3_bucket.objects.filter(Prefix=s3_prefix):
@@ -1803,6 +1875,14 @@ class S3Hook(AwsBaseHook):
                 continue
             obj_path = Path(obj.key)
             local_target_path = local_dir.joinpath(obj_path.relative_to(s3_prefix))
+            try:
+                resolved_relative_path = local_target_path.resolve().relative_to(local_dir_resolved)
+            except ValueError:
+                raise S3HookPathTraversalError(
+                    f"S3 object key {obj.key!r} resolves outside local directory {local_dir}"
+                ) from None
+            if resolved_relative_path == Path(".") or obj.key.endswith(("/.", "/..")):
+                continue
             if not local_target_path.parent.exists():
                 local_target_path.parent.mkdir(parents=True, exist_ok=True)
                 self.log.debug("Created local directory: %s", local_target_path.parent)

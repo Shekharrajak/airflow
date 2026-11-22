@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -31,17 +31,25 @@ from pydantic import (
     computed_field,
     field_serializer,
     field_validator,
+    model_validator,
 )
 
+from airflow._shared.module_loading import qualname
 from airflow.api_fastapi.core_api.base import BaseModel, StrictBaseModel, make_partial_model
+from airflow.api_fastapi.core_api.datamodels.common import MaybeAssetExpression
 from airflow.api_fastapi.core_api.datamodels.dag_tags import DagTagResponse
 from airflow.api_fastapi.core_api.datamodels.dag_versions import DagVersionResponse
 from airflow.configuration import conf
-from airflow.models.dag_version import DagVersion
+from airflow.utils.state import DagSchedulingState
 from airflow.utils.types import DagRunType
 
 if TYPE_CHECKING:
     from airflow.serialization.definitions.param import SerializedParamsDict
+
+
+def _is_response_safe_pod_override(value: Any) -> bool:
+    """Whether a pod_override value is already safe to preserve in the response."""
+    return value is None or isinstance(value, str | int | float | Mapping | list)
 
 
 @cache
@@ -66,7 +74,7 @@ DAG_ALIAS_MAPPING: dict[str, str] = {
 
 
 class DAGResponse(BaseModel):
-    """DAG serializer for responses."""
+    """Dag serializer for responses."""
 
     model_config = ConfigDict(
         alias_generator=AliasGenerator(
@@ -77,6 +85,7 @@ class DAGResponse(BaseModel):
     dag_id: str
     dag_display_name: str
     is_paused: bool
+    scheduling_state: DagSchedulingState = DagSchedulingState.ACTIVE
     is_stale: bool
     last_parsed_time: datetime | None
     last_parse_duration: float | None
@@ -84,11 +93,12 @@ class DAGResponse(BaseModel):
     bundle_name: str | None
     bundle_version: str | None
     relative_fileloc: str | None
-    fileloc: str
+    fileloc: str | None
     description: str | None
     timetable_summary: str | None
     timetable_description: str | None
     timetable_partitioned: bool
+    timetable_periodic: bool
     tags: list[DagTagResponse]
     max_active_tasks: int
     max_active_runs: int | None
@@ -110,7 +120,7 @@ class DAGResponse(BaseModel):
     @field_validator("owners", mode="before")
     @classmethod
     def get_owners(cls, v: Any) -> list[str] | None:
-        """Convert owners attribute to DAG representation."""
+        """Convert owners attribute to Dag representation."""
         if not (v is None or isinstance(v, str)):
             return v
 
@@ -131,6 +141,17 @@ class DAGResponse(BaseModel):
     # Mypy issue https://github.com/python/mypy/issues/1362
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def is_backfillable(self) -> bool:
+        """Whether this Dag's schedule supports backfilling."""
+        if not self.timetable_periodic:
+            return False
+        if self.allowed_run_types is not None and DagRunType.BACKFILL_JOB not in self.allowed_run_types:
+            return False
+        return True
+
+    # Mypy issue https://github.com/python/mypy/issues/1362
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def file_token(self) -> str:
         """Return file token."""
         payload = {
@@ -143,21 +164,38 @@ class DAGResponse(BaseModel):
 class DAGPatchBody(StrictBaseModel):
     """Dag Serializer for updatable bodies."""
 
-    is_paused: bool
+    is_paused: bool | None = None
+    scheduling_state: DagSchedulingState | None = None
+
+    @model_validator(mode="after")
+    def validate_single_state_update(self) -> DAGPatchBody:
+        """Require exactly one scheduling-state representation."""
+        # Generated clients serialize the whole model, so the field they are not
+        # setting arrives as an explicit null rather than being absent.
+        provided = [name for name in ("is_paused", "scheduling_state") if getattr(self, name) is not None]
+        if len(provided) != 1:
+            raise ValueError("Exactly one of `is_paused` or `scheduling_state` must be provided")
+        return self
 
 
 DAGPatchBodyPartial = make_partial_model(DAGPatchBody)
 
 
-class DAGCollectionResponse(BaseModel):
-    """DAG Collection serializer for responses."""
+class BulkDAGBody(DAGPatchBody):
+    """Request body for bulk update of Dags."""
 
-    dags: Iterable[DAGResponse]
+    dag_id: str
+
+
+class DAGCollectionResponse(BaseModel):
+    """Dag Collection serializer for responses."""
+
+    dags: list[DAGResponse]
     total_entries: int
 
 
 class DAGDetailsResponse(DAGResponse):
-    """Specific serializer for DAG Details responses."""
+    """Specific serializer for Dag Details responses."""
 
     model_config = ConfigDict(
         from_attributes=True,
@@ -173,7 +211,7 @@ class DAGDetailsResponse(DAGResponse):
 
     catchup: bool
     dag_run_timeout: timedelta | None
-    asset_expression: dict | None
+    asset_expression: MaybeAssetExpression
     doc_md: str | None
     start_date: datetime | None
     end_date: datetime | None
@@ -184,9 +222,12 @@ class DAGDetailsResponse(DAGResponse):
     timezone: str | None
     last_parsed: datetime | None
     default_args: Mapping | None
+    rerun_with_latest_version: bool | None = None
     owner_links: dict[str, str] | None = None
     is_favorite: bool = False
     active_runs_count: int = 0
+    team_name: str | None = None
+    latest_dag_version: DagVersionResponse | None
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -203,6 +244,37 @@ class DAGDetailsResponse(DAGResponse):
         if doc_md is None:
             return None
         return inspect.cleandoc(doc_md)
+
+    @field_validator("default_args", mode="before")
+    @classmethod
+    def get_default_args(cls, default_args: Mapping | None) -> Mapping | None:
+        """
+        Sanitize default_args for the API response.
+
+        Targets the common case where ``executor_config["pod_override"]`` is a
+        Kubernetes ``V1Pod``: when the value is not a JSON primitive
+        (``None``/``str``/``int``/``float``) or a ``Mapping``/``list``, it is
+        rewritten to a fully-qualified type-name string so the response stays
+        valid JSON. The container check is shallow — a ``Mapping`` or ``list``
+        whose contents are themselves non-serializable (e.g. nested ``V1Pod``)
+        will still raise during response serialization, as will any other
+        non-JSON values elsewhere in ``default_args``.
+        """
+        if default_args is None:
+            return None
+        executor_config = default_args.get("executor_config")
+        if not (isinstance(executor_config, Mapping) and "pod_override" in executor_config):
+            return default_args
+
+        pod_override = executor_config["pod_override"]
+        if _is_response_safe_pod_override(pod_override):
+            return default_args
+
+        sanitized_executor_config = dict(executor_config)
+        sanitized_executor_config["pod_override"] = qualname(pod_override)
+        result = dict(default_args)
+        result["executor_config"] = sanitized_executor_config
+        return result
 
     @field_validator("params", mode="before")
     @classmethod
@@ -222,15 +294,3 @@ class DAGDetailsResponse(DAGResponse):
         Deprecated: Use max_active_tasks instead.
         """
         return self.max_active_tasks
-
-    # Mypy issue https://github.com/python/mypy/issues/1362
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def latest_dag_version(self) -> DagVersionResponse | None:
-        """Return the latest DagVersion."""
-        latest_dag_version = DagVersion.get_latest_version(
-            self.dag_id, load_dag_model=True, load_bundle_model=True
-        )
-        if latest_dag_version is None:
-            return latest_dag_version
-        return DagVersionResponse.model_validate(latest_dag_version)

@@ -16,27 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import "@testing-library/jest-dom";
+import "@testing-library/jest-dom/vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import { setupServer, type SetupServerApi } from "msw/node";
-import { afterEach, describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect } from "vitest";
 
 import type { DAGDetailsResponse } from "openapi/requests/types.gen";
-import { handlers } from "src/mocks/handlers";
+
 import { MOCK_DAG } from "src/mocks/handlers/dag";
 import { Wrapper } from "src/utils/Wrapper";
 
 import { Header } from "./Header";
-
-let server: SetupServerApi;
-
-beforeAll(() => {
-  server = setupServer(...handlers);
-  server.listen({ onUnhandledRequest: "bypass" });
-});
-
-afterEach(() => server.resetHandlers());
-afterAll(() => server.close());
 
 describe("Dag Documentation Modal", () => {
   it("Display documentation button when doc_md is present", async () => {
@@ -56,7 +45,6 @@ describe("Dag Documentation Modal", () => {
   it("Do not display documentation button only doc_md is not present", () => {
     render(
       <Wrapper>
-        {/* eslint-disable-next-line unicorn/no-null */}
         <Header dag={{ ...MOCK_DAG, doc_md: null } as unknown as DAGDetailsResponse} />
       </Wrapper>,
     );
